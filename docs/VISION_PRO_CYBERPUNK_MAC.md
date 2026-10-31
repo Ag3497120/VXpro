@@ -222,6 +222,7 @@ Pass them at launch, `tools/vxmac_cyberpunk.py launch --env NAME=VALUE` (repeata
 | `VXMAC_VR_ZOOM` | 1.0 | the frame's angular size against the game's FOV |
 | `VXMAC_STICK_PITCH=1` | off | keep the right stick's up / down in head control |
 | `VXMAC_GPU_WORKING_SET_MB` | 4096 | the GPU memory the game is told it has |
+| `VXMAC_AUTO_SCREEN=0` | on | cutscenes (the game ignoring your head) stay in VR instead of switching to Screen: the picture stays world-locked and nothing is sent to the game until it follows again. Also remembered from the headset: switch to **VR** with the both-hands pinch while a cutscene's Screen shows (label "VR: cutscenes stay in VR"); switch to **Screen** in VR to turn the automatic switch on again |
 
 Other `VXMAC_*` variables in the sources are debugging switches; see [`DESIGN.md`](DESIGN.md).
 
@@ -229,6 +230,8 @@ Other `VXMAC_*` variables in the sources are debugging switches; see [`DESIGN.md
 
 Each item is independent; fixed ones will be removed from this list.
 
+- **Game 2.5.0 (when supported): English voice only** (subtitles and menus in every language work): its other voice
+  languages are Apple-hosted downloads that only the App Store app itself can fetch.
 - **Quit with the both-hands 3 s pinch** (see "Quitting safely"): closing the app pauses the game and asks it to quit after
   10 s, which may not complete in the background.
 - **1600x900 runs at about 40 Hz on M2**: use the recommended 1280x720 (see "Recommended settings").
