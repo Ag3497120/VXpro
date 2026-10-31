@@ -12,6 +12,8 @@ VXpro 讓 **Mac App Store 版 Cyberpunk 2077** 在 **Vision Pro 單機** 上執�
 
 ## 需要
 
+> **遊戲版本：** 目前只支援 Cyberpunk 2077 **2.3.2**（2025 年的 Mac App Store 版本）。最新的 Mac App Store 更新（App Store 版本 1.0.4，2026 年 10 月 22 日發布）**尚未支援，近期將會支援。** 如果你的遊戲已經更新，工具會在 `doctor` / `prepare` 階段停止，不做任何變更。
+
 - 已開啟開發者模式並與 Mac 配對的 **Apple Vision Pro**，約 **160 GB 可用空間**；
 - **Apple 晶片的 Mac**、含 visionOS SDK 的 **Xcode 26**、`xcodegen`、Python 3；
 - 你**自己的付費 Apple Developer Program 帳號**（用你自己的團隊簽署）；

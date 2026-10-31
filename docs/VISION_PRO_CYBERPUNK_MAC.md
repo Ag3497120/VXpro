@@ -40,6 +40,8 @@ team. Nothing of the game is distributed by VXpro. Technical background and hist
 
 ## What it needs
 
+> **Game version:** right now only Cyberpunk 2077 **2.3.2** (the Mac App Store build from 2025) is supported. The latest Mac App Store update (App Store version 1.0.4, released 2026-10-22) is **not supported yet — support is coming soon.** If your copy has already updated, the tool stops at `doctor` / `prepare` without changing anything.
+
 - **Apple Vision Pro** with **Developer Mode** on (Settings > Privacy & Security > Developer Mode), paired with the
   Mac in Xcode (Window > Devices and Simulators). The app targets visionOS 26.0 and later; tested on an M2 Vision Pro.
 - **About 160 GB free on the headset**: the game's data is 158.5 GB (decimal; Phantom Liberty and all voice

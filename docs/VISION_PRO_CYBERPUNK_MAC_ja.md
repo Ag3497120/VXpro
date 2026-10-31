@@ -38,6 +38,8 @@ VXRuntime で動かす）は [VeRantyx](https://github.com/Ag3497120/VeRantyx) �
 
 ## 必要なもの
 
+> **ゲームの版について：** 現在対応しているのは Cyberpunk 2077 **2.3.2**（2025 年の Mac App Store 版）だけです。最新の Mac App Store の更新（App Store の版 1.0.4、2026 年 10 月 22 日公開）には **まだ対応していません。近日中に対応予定です。** すでに更新されている場合、ツールは `doctor` / `prepare` の段階で何も変更せずに止まります。
+
 - **Apple Vision Pro**：**デベロッパモード** をオン（設定 > プライバシーとセキュリティ > デベロッパモード）にし、
   Xcode（Window > Devices and Simulators）で Mac とペアリング済みであること。アプリの対象は visionOS 26.0 以降。
   M2 の Vision Pro で確認しています。

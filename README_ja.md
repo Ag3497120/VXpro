@@ -19,6 +19,8 @@ VXRuntime は VeRantyx 側にあります）。
 
 ## 必要なもの
 
+> **ゲームの版について：** 現在対応しているのは Cyberpunk 2077 **2.3.2**（2025 年の Mac App Store 版）だけです。最新の Mac App Store の更新（App Store の版 1.0.4、2026 年 10 月 22 日公開）には **まだ対応していません。近日中に対応予定です。** すでに更新されている場合、ツールは `doctor` / `prepare` の段階で何も変更せずに止まります。
+
 - **Apple Vision Pro**（デベロッパモード、Mac とペアリング済み、空き容量 **約 160 GB**）
 - **Apple シリコンの Mac**、**Xcode 26**（visionOS SDK）、`xcodegen`、Python 3
 - **自分の有料 Apple Developer Program アカウント**（アプリには Increased Memory Limit と Extended Virtual

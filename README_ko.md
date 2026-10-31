@@ -12,6 +12,8 @@ VXpro는 **Mac App Store 버전 Cyberpunk 2077**을 **Vision Pro 단독**으로 
 
 ## 필요한 것
 
+> **게임 버전:** 현재는 Cyberpunk 2077 **2.3.2**(2025년 Mac App Store 빌드)만 지원합니다. 최신 Mac App Store 업데이트(App Store 버전 1.0.4, 2026년 10월 22일 공개)는 **아직 지원하지 않으며, 곧 지원할 예정입니다.** 이미 업데이트된 경우 도구는 `doctor` / `prepare` 단계에서 아무것도 바꾸지 않고 멈춥니다.
+
 - 개발자 모드가 켜져 있고 Mac과 페어링된 **Apple Vision Pro**, 약 **160 GB의 여유 공간**;
 - **Apple 실리콘 Mac**, visionOS SDK가 포함된 **Xcode 26**, `xcodegen`, Python 3;
 - **본인의 유료 Apple Developer Program 계정** (본인 팀으로 서명);

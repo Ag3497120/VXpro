@@ -19,6 +19,8 @@ VXpro is the Mac App Store route of [VeRantyx](https://github.com/Ag3497120/VeRa
 
 ## You need
 
+> **Game version:** right now only Cyberpunk 2077 **2.3.2** (the Mac App Store build from 2025) is supported. The latest Mac App Store update (App Store version 1.0.4, released 2026-10-22) is **not supported yet — support is coming soon.** If your copy has already updated, the tool stops at `doctor` / `prepare` without changing anything.
+
 - an **Apple Vision Pro** in Developer Mode, paired with your Mac, with about **160 GB free**;
 - a **Mac with Apple silicon**, **Xcode 26** with the visionOS SDK, `xcodegen`, Python 3;
 - your **own paid Apple Developer Program account** (the app needs the Increased Memory Limit and Extended Virtual
