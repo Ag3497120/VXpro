@@ -1,0 +1,65 @@
+# VX Mac Host (your bundle id): a macOS program run natively on Vision Pro (docs/DESIGN.md). Not VX Runtime
+# (VeRantyx's VX Runtime host, the Windows route, is a separate app). Signing: Signing.xcconfig. Build first:
+#   make -C ../shims                       the shims -> ../build/xros
+#   ../tools/prepare_test.sh               the test program -> ../build/xros_images   (or VXMAC_IMAGES=<dirs>)
+#   xcodegen && xcodebuild -scheme VXMacHost -destination generic/platform=visionOS -allowProvisioningUpdates build
+name: VXMacHost
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    visionOS: "26.0"
+settings:
+  base:
+    CODE_SIGN_STYLE: Automatic
+    XROS_DEPLOYMENT_TARGET: "26.0"
+    TARGETED_DEVICE_FAMILY: "7"
+    SUPPORTED_PLATFORMS: "xros xrsimulator"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  VXMacHost:
+    type: application
+    platform: visionOS
+    sources:
+      - path: Sources
+      - path: Assets.xcassets
+      - path: ../vr/xros_vr.m
+      - path: ../vr/warp_core.m
+      - path: ../vr/vxmac_vr_glue.m
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(VXMAC_BUNDLE_ID)"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        PRODUCT_NAME: VXMacHost
+        INFOPLIST_FILE: Sources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/VXMacHost.entitlements
+        CLANG_ENABLE_OBJC_ARC: YES
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/VXMacHost-Bridging-Header.h
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/../vr $(SRCROOT)/../shims"
+        OTHER_LDFLAGS: "-L$(SRCROOT)/../build/xros -lvxkit -lvxmtl -lvxmtlfx"
+        "OTHER_LDFLAGS[sdk=xrsimulator*]": "-L$(SRCROOT)/../build/xrsim -lvxkit -lvxmtl -lvxmtlfx"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+        ENABLE_BITCODE: NO
+        DEAD_CODE_STRIPPING: NO
+        ENABLE_DEBUG_DYLIB: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    postBuildScripts:
+      - name: Embed shims and program images
+        script: "\"$SRCROOT/embed_images.sh\""
+        basedOnDependencyAnalysis: false
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: SwiftUI.framework
+      - sdk: CompositorServices.framework
+      - sdk: ARKit.framework
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreText.framework
+      - sdk: GameController.framework
+      - sdk: Vision.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreML.framework

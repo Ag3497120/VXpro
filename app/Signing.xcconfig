@@ -1,0 +1,7 @@
+// Signing for VX Mac Host. Leave this file as it is: put your own values in Local.xcconfig next to it (git-ignored),
+//   DEVELOPMENT_TEAM = <your 10-character Team ID>
+//   VXMAC_BUNDLE_ID = com.yourname.VXMacHost
+// or let tools/vxmac_cyberpunk.py pass them to xcodebuild (prepare --team ... / $VXMAC_TEAM, $VXMAC_BUNDLE_ID).
+DEVELOPMENT_TEAM =
+VXMAC_BUNDLE_ID = com.example.VXMacHost
+#include? "Local.xcconfig"

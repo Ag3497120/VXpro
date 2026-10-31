@@ -1,0 +1,11 @@
+# build products, work copies of the game's images, the FSR model, logs and settings backups (build/cyberpunk/)
+build/
+app/VXMacHost.xcodeproj/
+app/Local.xcconfig
+*.mlmodelc/
+*.mlpackage/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+__pycache__/
+*.pyc
