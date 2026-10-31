@@ -55,7 +55,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - 종료는 양손 집기(3초 + 다시) 또는 앱 창의 **Quit game** 버튼으로 하세요. 앱을 직접 닫으면 게임이 일시 정지되고 10초 후 종료를 요청하지만, 백그라운드에서는 종료가 끝나지 않을 수 있습니다.
 - 1600x900은 M2에서 약 40 Hz: 1280x720, MetalFX 성능, FOV 110을 사용하세요 (가이드의 "Recommended settings").
 - 게임 데이터의 첫 복사는 용량이 크고 오래 걸립니다 (158 GB).
-- 무료 Apple 계정의 서명은 7일 후 만료됩니다 (필요한 권한도 없어 유료 개발자 팀이 필요합니다).
+- 유료 Apple Developer Program 멤버십이 필요합니다 (무료 계정으로는 앱에 필요한 권한을 부여할 수 없습니다).
 
 ## 고지
 

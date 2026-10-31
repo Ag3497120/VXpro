@@ -55,7 +55,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - 请用双手捏合（3 秒＋再次）或应用窗口的 **Quit game** 按钮退出。若直接关闭应用，游戏会暂停，并在 10 秒后被要求退出，但在后台可能无法完成退出。
 - 1600x900 在 M2 上约 40 Hz：请使用 1280x720、MetalFX 性能、FOV 110（见指南“Recommended settings”）。
 - 首次复制游戏数据量大且耗时（158 GB）。
-- 免费 Apple 账号的签名 7 天后过期（且无法获得所需权限：需要付费开发者团队）。
+- 需要付费的 Apple Developer Program 会员资格（免费账号无法授予应用所需的权限）。
 
 ## 声明
 

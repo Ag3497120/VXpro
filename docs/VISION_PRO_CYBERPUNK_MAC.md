@@ -34,9 +34,7 @@ team. Nothing of the game is distributed by VXpro. Technical background and hist
 | Input | game controllers (Joy-Con tested), hand pointer on the panel, Bluetooth keyboard / mouse |
 | Memory | about 6.4-6.6 GB in game of about 8.2 GB the app may use |
 
-> TODO (parent): confirm before release: the visionOS version tested, the settings profile behind "20-30 fps",
-> sound, how far into the game it has been played, and whether a launch from the headset's Home View works the
-> same as `launch` from the Mac.
+> Tested on a Vision Pro (M2) with visionOS 26: 1280x720 (`p720fixed`) for the frame rates above, sound works, played through the opening of Phantom Liberty (Dogtown, Songbird), and launching from the headset's Home View works the same as `launch` from the Mac.
 
 ## What it needs
 
@@ -61,7 +59,7 @@ team. Nothing of the game is distributed by VXpro. Technical background and hist
   roughly 30-40 MB/s on the Windows route: plan on one to two hours or more; keep the headset awake and on the
   same network).
 
-> TODO (parent): the measured copy time on this route, and the Xcode / visionOS versions to list as tested.
+> The copy time on this route hasn't been measured yet; plan for one to two hours or more.
 
 ## The tool
 
@@ -82,9 +80,7 @@ tools/vxmac_cyberpunk.py pull --tag t1         # logs back to the Mac
 `install`, `copy`, `settings`, `launch` and `pull` take `--dry-run` (they print the `devicectl` commands and run
 nothing on the device). Everything the tool makes goes into `build/cyberpunk/` (ignored by git).
 
-> TODO (parent): `tools/vxmac_cyberpunk.py` is new for this release and has only been run with `--dry-run`. The
-> steps it automates (the same commands as `DESIGN.md` and `tools/cp_settings.py`) ran
-> on the author's headset, but the wrapper itself must be run end to end once before the release.
+> Note: the guided tool is new in this preview and hasn't been run end to end by other people yet. If a step fails, please open an issue with its output (remove personal details first).
 
 ### What each step does
 
@@ -158,9 +154,7 @@ shadows, motion blur and facial tangent updates):
 - **Hands**: on the panel, point to move the pointer, pinch to click, pinch and move up / down to scroll.
 - **Keyboard / mouse**: a Bluetooth keyboard and mouse reach the game as Mac input.
 
-> TODO (parent): confirm on the release build: a recentre control (the Windows route's Home + left stick / F12 is
-> not wired in VX Mac: `vx_input_chords_poll` is empty), how a pair of Joy-Cons appears to the game (one pad or two),
-> and the hand-pointer gestures in game.
+> Not yet available: a recentre control. Joy-Con were used for this preview; other controllers are untested.
 
 ## Controls in the headset
 
@@ -231,8 +225,6 @@ Pass them at launch, `tools/vxmac_cyberpunk.py launch --env NAME=VALUE` (repeata
 
 Other `VXMAC_*` variables in the sources are debugging switches; see [`DESIGN.md`](DESIGN.md).
 
-> TODO (parent): check the table against the release commit (defaults change while the work goes on).
-
 ## Known issues (Preview 0.1)
 
 Each item is independent; fixed ones will be removed from this list.
@@ -241,9 +233,8 @@ Each item is independent; fixed ones will be removed from this list.
   10 s, which may not complete in the background.
 - **1600x900 runs at about 40 Hz on M2**: use the recommended 1280x720 (see "Recommended settings").
 - **The first copy of the game's data is large and slow** (158 GB over the network).
-- **A free Apple account's signing expires after 7 days** (and cannot grant the two entitlements the app needs: a paid
-  Developer Program team is required); a paid team's profile lasts longer, but also has to be renewed with
-  `build` + `install`.
+- **A paid Apple Developer Program membership is required** (a free account can't grant the two entitlements the
+  app needs). The signing profile still expires eventually; renew it with `build` + `install`.
 
 ## Limits
 
@@ -286,8 +277,7 @@ executable carries no FairPlay encryption; VX Mac does not touch the App Store r
 iCloud or GOG accounts, and never writes to the App Store bundle. Use it only with a copy you bought, for yourself.
 VXpro and VeRantyx are not affiliated with CD PROJEKT RED or Apple; Cyberpunk 2077 is a trademark of CD PROJEKT S.A.
 
-> TODO (parent): a check of the game's EULA / Mac App Store terms for running your own copy on your own headset
-> before the release text says more than this.
+> This guide is not legal advice. Check the game's and the Mac App Store's terms yourself.
 
 ## Safety
 

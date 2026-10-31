@@ -63,7 +63,7 @@ its own path (as Cmd+Q on a Mac) and the app closes. See "Controls in the headse
   the game and asks it to quit after 10 s, which may not complete in the background; do not force-quit it while it saves.
 - 1600x900 is about 40 Hz on M2: use 1280x720 MetalFX Performance, FOV 110 (see the guide's "Recommended settings").
 - The first copy of the game's data is large and slow (158 GB).
-- A free Apple account's signing expires after 7 days (and lacks the entitlements: a paid team is needed).
+- A paid Apple Developer Program membership is required (a free account can't grant the app's entitlements).
 
 ## Known limitations
 
