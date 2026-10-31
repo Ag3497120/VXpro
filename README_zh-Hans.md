@@ -52,7 +52,6 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 
 ## 已知问题（Preview 0.1）
 
-- 游玩时请使用 60 W 或以上的充电器：功率较低的充电器会在一两分钟后降到约 45 Hz。
 - 请用双手捏合（3 秒＋再次）或应用窗口的 **Quit game** 按钮退出。若直接关闭应用，游戏会暂停，并在 10 秒后被要求退出，但在后台可能无法完成退出。
 - 1600x900 在 M2 上约 40 Hz：请使用 1280x720、MetalFX 性能、FOV 110（见指南“Recommended settings”）。
 - 首次复制游戏数据量大且耗时（158 GB）。

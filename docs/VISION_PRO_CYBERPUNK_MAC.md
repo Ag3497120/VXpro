@@ -230,8 +230,6 @@ Other `VXMAC_*` variables in the sources are debugging switches; see [`DESIGN.md
 
 Each item is independent; fixed ones will be removed from this list.
 
-- **Use a 60 W or stronger charger while playing.** With a weaker one (35 W) the headset is power-limited under this load
-  and drops to about 45 Hz after a minute or two, with judder; a 60 W charger keeps it at 90-100 Hz.
 - **Game 2.5.0 (when supported): English voice only** (subtitles and menus in every language work): its other voice
   languages are Apple-hosted downloads that only the App Store app itself can fetch.
 - **Quit with the both-hands 3 s pinch** (see "Quitting safely"): closing the app pauses the game and asks it to quit after
