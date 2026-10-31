@@ -38,7 +38,7 @@ team. Nothing of the game is distributed by VXpro. Technical background and hist
 
 ## What it needs
 
-> **Game versions:** Cyberpunk 2077 **2.5.0** (the latest Mac App Store update) and **2.3.2**, both tested on the headset. English voice is included; other voice languages need their voice archives, which are not supported yet for 2.5.0 (its other voices are Apple-hosted downloads). Subtitles and menus work in every language.
+> **Game versions:** Cyberpunk 2077 **2.5.0** (the latest Mac App Store update; the App Store lists it as version **1.0.4**, which is its own numbering — the game inside is 2.5.0) and **2.3.2**, both tested on the headset. English voice is included; other voice languages need their voice archives, which are not supported yet for 2.5.0 (its other voices are Apple-hosted downloads). Subtitles and menus work in every language.
 
 - **Apple Vision Pro** with **Developer Mode** on (Settings > Privacy & Security > Developer Mode), paired with the
   Mac in Xcode (Window > Devices and Simulators). The app targets visionOS 26.0 and later; tested on an M2 Vision Pro.

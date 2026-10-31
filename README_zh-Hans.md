@@ -12,7 +12,7 @@ VXpro 让 **Mac App Store 版 Cyberpunk 2077** 在 **Vision Pro 单机** 上运�
 
 ## 需要
 
-> **游戏版本：** 支持 Cyberpunk 2077 **2.5.0**（Mac App Store 最新更新）和 **2.3.2**，均已在头显上测试。包含英语语音；其他语言的语音需要对应的语音档案，2.5.0 暂不支持（其其他语言语音为 Apple 托管的下载内容）。字幕和菜单支持所有语言。
+> **游戏版本：** 支持 Cyberpunk 2077 **2.5.0**（Mac App Store 最新更新；App Store 显示的版本号为 **1.0.4**，这是 App Store 自己的编号，其中的游戏为 2.5.0）和 **2.3.2**，均已在头显上测试。包含英语语音；其他语言的语音需要对应的语音档案，2.5.0 暂不支持（其其他语言语音为 Apple 托管的下载内容）。字幕和菜单支持所有语言。
 
 - 已开启开发者模式并与 Mac 配对的 **Apple Vision Pro**，约 **160 GB 可用空间**；
 - **Apple 芯片的 Mac**、带 visionOS SDK 的 **Xcode 26**、`xcodegen`、Python 3；

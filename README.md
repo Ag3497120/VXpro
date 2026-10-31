@@ -19,7 +19,7 @@ VXpro is the Mac App Store route of [VeRantyx](https://github.com/Ag3497120/VeRa
 
 ## You need
 
-> **Game versions:** Cyberpunk 2077 **2.5.0** (the latest Mac App Store update) and **2.3.2**, both tested on the headset. English voice is included; other voice languages need their voice archives, which are not supported yet for 2.5.0 (its other voices are Apple-hosted downloads). Subtitles and menus work in every language.
+> **Game versions:** Cyberpunk 2077 **2.5.0** (the latest Mac App Store update; the App Store lists it as version **1.0.4**, which is its own numbering — the game inside is 2.5.0) and **2.3.2**, both tested on the headset. English voice is included; other voice languages need their voice archives, which are not supported yet for 2.5.0 (its other voices are Apple-hosted downloads). Subtitles and menus work in every language.
 
 - an **Apple Vision Pro** in Developer Mode, paired with your Mac, with about **160 GB free**;
 - a **Mac with Apple silicon**, **Xcode 26** with the visionOS SDK, `xcodegen`, Python 3;
