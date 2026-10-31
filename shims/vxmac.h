@@ -30,7 +30,8 @@ int vxkit_cursor_hidden(void);
 void vxkit_set_active(int active);
 // The calling thread is the program's "main thread": the observers it registers are called there (host: before main).
 void vxkit_set_program_thread(void);
-void vxkit_request_quit(void);   // (h53: [NSApp terminate:] on the program's thread - the program's own quit path)
+void vxkit_request_quit(void);
+void vxmtl_pacing_report(int missed);   // (h60f: the compositor's missed deadlines each 5 s -> the game's GPU cap)   // (h53: [NSApp terminate:] on the program's thread - the program's own quit path)
 // The program presented its first frame (host): GameController notifications held until then are delivered.
 void vxkit_set_program_ready(void);
 // The program's key window's content size in points (0 before it has one) and its CAMetalLayer (or NULL).

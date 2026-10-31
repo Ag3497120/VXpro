@@ -40,7 +40,12 @@ struct VXMacLayerConfiguration: CompositorLayerConfiguration {
         // (VXMAC_FOVEATE=1: CompositorServices' foveation (rasterization rate maps: the centre denser than without, the
         //  edges coarser); the warp and every eye pass draw through the maps (xros_vr.m eye_encoder, warp_core.m). Off
         //  by default until verified on the device)
-        let fov = getenv("VXMAC_FOVEATE").map { String(cString: $0) == "1" } ?? false   // (off by default again (h31): with it the compositor fell to 45 Hz in vr mode, h28 and h31, the guard's steps did not help; =1 on)
+        // (h60e: on by default again - the eyes' warp is a gather over 2 x 1888x1792 (5.5-6.5 ms on M2 beside the game,
+        //  4-29 deadlines missed a 5 s in h60c); the rate maps shade the periphery coarser. h28/h31's 45 Hz with it had other
+        //  causes then (the GPU share uncapped). VXMAC_FOVEATE=0: off)
+        // (h60f: off again - with it the warp worked on the rate map's logical screen (4493x3604 for 1856x1792 physical,
+        //  h60e) and its GPU time did not fall; the warp at a lower internal size instead (xros_vr.m, VXMAC_WARP_SCALE))
+        let fov = getenv("VXMAC_FOVEATE").map { String(cString: $0) == "1" } ?? false
         configuration.isFoveationEnabled = fov && capabilities.supportsFoveation
         let colors = capabilities.supportedColorFormats(options: [])
         if colors.contains(.bgra8Unorm_srgb) { configuration.colorFormat = .bgra8Unorm_srgb }

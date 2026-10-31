@@ -7,7 +7,7 @@
 
 // (struct W: vxw_params, then the output's size, B's block grid (the map), the output's block grid (the keys) and the
 //  key's index bits)
-typedef struct { vxw_params p; uint32_t ow, oh, mw, mh, kw, kh, bits, flags2, kbs; float dr[4]; float hr[16]; uint32_t hn; } vxw_gpu_params;
+typedef struct { vxw_params p; uint32_t ow, oh, mw, mh, kw, kh, bits, flags2, kbs; float dr[4]; float hr[16]; uint32_t hn; float vig[4]; } vxw_gpu_params;
 // (kbs: output pixels per key block, 2 or more: a block of B (2 x 2) must cover a key block's neighbours, or holes stay
 //  unresolved (a black-edged grid) when the output is more than twice B's density - foveation's logical screen)
 // (flags2: 2 = a detail texture over the centre: dr its rectangle in B's UV (x, y, w, h), vxw_set_detail)
@@ -18,7 +18,7 @@ static const char *g_vxw_msl =
     "using namespace metal;\n"
     "struct W { uint w, h, flags; float t, sx, sy, tx, ty, za, zb; float rot[9]; float pos[3];\n"
     "           float eye, S, pop, zc, conv, thr; float dt[4]; float dnear; float cam[9];\n"
-    "           uint ow, oh, mw, mh, kw, kh, bits, flags2, kbs; float dr[4]; float hr[16]; uint hn; };\n"
+    "           uint ow, oh, mw, mh, kw, kh, bits, flags2, kbs; float dr[4]; float hr[16]; uint hn; float vig[4]; };\n"
     // the distance of a depth value (FSR2: view depth = z_a / (d - z_b), its sign the view space's handedness)
     "static float vxw_dist(float d, constant W &p) {\n"
     "    if (p.flags & 16) d = 1 - d;\n"
@@ -163,11 +163,27 @@ static const char *g_vxw_msl =
     //  to 20 % 40 % of the frame further out), not a black band: in vr mode half of the eye's view lies outside the
     //  game's frame (eye tangents up 1.0 / down 1.19 against the game's 0.67 at FOV 100), and the hard dark border
     //  read as a black frame below the picture, h16)
-    "static float3 vxw_edge(float3 c, float2 uv) {\n"
-    "    float2 o = max(-uv, uv - 1);\n"
+    // (h57g: the frame's edge as the 2.3.2-era builds had it hidden - its own last 3 degrees darken to 35 %, the fill
+    //  outside starts there (35 %) and fades to black within ~10 degrees, losing its colour; in degrees from the frame's
+    //  tangents, so FOV 90's smaller frame is treated the same. h57e's fill was full at the edge and read as a white band)
+    "static float3 vxw_edge(float3 c, float2 uv, constant W &p) {\n"
+    "    float2 deg = float2(2 * atan(p.tx), 2 * atan(p.ty)) * 57.2958f;\n"
+    "    float2 o = max(-uv, uv - 1) * deg;\n"
     "    float d = max(o.x, o.y);\n"
-    // (h44: outside the frame no darkening - only a gentle falloff far out (beyond ~0.25 of the frame: ~15 deg) to 0.85)
-    "    return d <= 0.25f ? c : c * mix(1.0f, 0.85f, saturate((d - 0.25f) * 2.0f));\n"
+    "    if (d <= 0) return c;\n"   // (h57h: no darkening in the frame's own space - its outline read as a moving screen)
+    "    float l = dot(c, float3(0.2126f, 0.7152f, 0.0722f));\n"
+    "    float f = 1 - smoothstep(0.0f, 10.0f, d);\n"
+    "    return mix(float3(l), c, f) * f;\n"
+    "}\n"
+    // (h57h: a head-locked soft elliptical vignette (a VR comfort vignette) instead of darkening in the frame's space: its
+    //  opening the frame's coverage (the game's tangents) less a margin, feathered over vig[1] degrees, dark outside; it stays
+    //  with the eyes, so the frame's rectangular edge lies under the dark periphery and never reads as a moving screen)
+    "static float3 vxw_visor(float3 c, float2 su, float2 ouv, constant W &p) {\n"
+    "    if (p.vig[2] <= 1) return c;\n"
+    "    float l = p.dt[0] > 0 ? p.dt[0] : p.tx, r = p.dt[1] > 0 ? p.dt[1] : p.tx, up = p.dt[2] > 0 ? p.dt[2] : p.ty, dn = p.dt[3] > 0 ? p.dt[3] : p.ty;\n"
+    "    float2 t = float2(mix(-l, r, ouv.x), mix(up, -dn, ouv.y));\n"
+    "    float e = length(t / float2(p.vig[0], p.vig[1]));\n"
+    "    return c * (1 - smoothstep(1.0f, p.vig[2], e));\n"
     "}\n"
     // (VX Mac, h27: outside the frame the picture mirrored at its edge (continuous, scene-like) rather than its edge
     //  pixels stretched into streaks; with vxw_edge's gentle darkening it reads as more scene, not as a frame)
@@ -185,7 +201,7 @@ static const char *g_vxw_msl =
     "    { float2 o = max(-su, su - 1); float dd = max(o.x, o.y);\n"
     "      if (dd > 0) { float r = 0.004f + min(dd * 0.6f, 0.12f);\n"
     "        constexpr sampler sm(filter::linear, mip_filter::linear, address::clamp_to_edge);\n"
-    "        float lod = log2(max(1.0f, r * float(max(p.w, p.h))));\n"   // (h44: the mip level as wide as the blur; levels clamp)
+    "        float lod = min(log2(max(1.0f, r * float(max(p.w, p.h)))), 4.0f);\n"   // (h57e: at most level 4 - coarser ones smeared a coloured band (a rainbow at the frame's side))   // (h44: the mip level as wide as the blur; levels clamp)
     "        c = b.sample(sm, saturate(su), level(lod)).rgb; } }\n"
     // (h30: the HUD rectangles drawn again as panels: their originals darkened to 25 % with a soft edge)
     "    for (uint k = 0; k < p.hn; k++) {\n"
@@ -208,7 +224,7 @@ static const char *g_vxw_msl =
     "        float e = min(min(q.x, 1 - q.x), min(q.y, 1 - q.y));\n"
     "        if (e > 0) c = mix(c, dt.sample(s, q, level(0)).rgb, 0.8f * smoothstep(0.0f, 0.35f, e));\n"   // (h37: a wide ring (35 %), 80 % at most: no visible edge)
     "    }\n"
-    "    return vxw_edge(c, su);\n"
+    "    return vxw_edge(c, su, p);\n"
     "}\n"
     // (VX Mac, h29: the displacement between the key blocks' centres, bilinear over the neighbours at about the same
     //  distance (within 8 %): no 2 x 2 steps on surfaces, edges still sharp; holes (1e9) and other depths left out)
@@ -235,7 +251,7 @@ static const char *g_vxw_msl =
     "    float4 v = vxw_dispf(disp, float2(g) + 0.5f, p);\n"
     "    float2 pb = (float2(g) + 0.5f) * float2(p.w, p.h) / float2(p.ow, p.oh);\n"
     "    float2 su = (pb - v.xy) / float2(p.w, p.h);\n"
-    "    o.write(float4(vxw_col(b, dt, hm, su, p), 1), g);\n"
+    "    o.write(float4(vxw_visor(vxw_col(b, dt, hm, su, p), su, (float2(g) + 0.5f) / float2(p.ow, p.oh), p), 1), g);\n"
     "    if (p.flags2 & 1) od.write(float4(vxw_out_depth(v.z, p)), g);\n"
     "}\n"
     "struct VO { float4 pos [[position]]; float2 uv; };\n"
@@ -249,7 +265,7 @@ static const char *g_vxw_msl =
     "    uint2 g = min(uint2(in.uv * float2(p.ow, p.oh)), uint2(p.ow, p.oh) - 1);\n"
     "    float2 v = vxw_dispf(disp, in.uv * float2(p.ow, p.oh), p).xy;\n"
     "    float2 su = in.uv - v / float2(p.w, p.h);\n"
-    "    return float4(vxw_col(b, dt, hm, su, p), 1);\n"
+    "    return float4(vxw_visor(vxw_col(b, dt, hm, su, p), su, in.uv, p), 1);\n"
     "}\n"
     // (with a depth attachment: the depth out as the fragment's depth)
     "struct FD { float4 c [[color(0)]]; float d [[depth(any)]]; };\n"
@@ -259,7 +275,7 @@ static const char *g_vxw_msl =
     "    uint2 g = min(uint2(in.uv * float2(p.ow, p.oh)), uint2(p.ow, p.oh) - 1);\n"
     "    float4 v = vxw_dispf(disp, in.uv * float2(p.ow, p.oh), p);\n"
     "    float2 su = in.uv - v.xy / float2(p.w, p.h);\n"
-    "    FD o; o.c = float4(vxw_col(b, dt, hm, su, p), 1); o.d = vxw_out_depth(v.z, p); return o;\n"
+    "    FD o; o.c = float4(vxw_visor(vxw_col(b, dt, hm, su, p), su, in.uv, p), 1); o.d = vxw_out_depth(v.z, p); return o;\n"
     "}\n"
     // the stereo screen plane: the pct-th of 16x16 samples of inverse depth (z_a / z), smoothed in st[0]; st[1] this frame's
     "kernel void vxw_conv(texture2d<float> dp [[texture(0)]], constant W &p [[buffer(1)]], device float *st [[buffer(2)]],\n"
@@ -410,6 +426,17 @@ int vxw_encode_eye(vxw_core *c, void *command_buffer, const vxw_params *p, void 
     vxw_gpu_params P = { *p, ow, oh, c->mw, c->mh, c->kw, c->kh, c->bits, (od ? VXW2_DEPTH_OUT : 0) | (dt ? VXW2_DETAIL : 0) | (hm ? VXW2_HUD_MASK : 0), c->kbs,
                          { c->drect[0], c->drect[1], c->drect[2], c->drect[3] }, { 0 }, c->hud_n };
     memcpy(P.hr, c->hud_rects, sizeof P.hr);
+    {   // (h57h: the head-locked vignette - margin inside the frame's coverage and feather, degrees; VXMAC_VIGNETTE=0 off)
+        static float m = -1, f = 8; static int on = 1;   // (6 deg inside the frame, 8 deg feather: ~85 % dark at the frame's edge)
+        if (m < 0) { const char *e = getenv("VXMAC_VIGNETTE_MARGIN"); m = e && *e ? (float)atof(e) : 6; e = getenv("VXMAC_VIGNETTE_FEATHER"); if (e && *e) f = (float)atof(e);
+                     e = getenv("VXMAC_VIGNETTE"); on = !(e && !strcmp(e, "0")); }
+        // (h59: in tangents, worked out here once per encode - the opening's half-tangents and the feather's outer edge
+        //  as a ratio; the shader does a length and a smoothstep a pixel, no atan (h57h: two a pixel over 2 x 1888x1792))
+        float ax = atanf(p->tan_x), ay = atanf(p->tan_y), d2r = (float)M_PI / 180;
+        float ix = tanf(fmaxf(ax - m * d2r, 5 * d2r)), iy = tanf(fmaxf(ay - m * d2r, 5 * d2r));
+        float oy = tanf(fminf(fmaxf(ay - m * d2r, 5 * d2r) + f * d2r, 85 * d2r));
+        P.vig[0] = ix; P.vig[1] = iy; P.vig[2] = on && f > 0 ? oy / iy : 0; P.vig[3] = 0;
+    }
     if (!a) { a = b; P.p.flags &= ~(uint32_t)VXW_STILL; }
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
     [blit fillBuffer:c->keys range:NSMakeRange(0, c->keys.length) value:0];

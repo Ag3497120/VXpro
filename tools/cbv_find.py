@@ -59,5 +59,10 @@ for key,d in data.items():
                     R=math.hypot(C,S)
                     if R>best: best=R; bsg=sg
                 res.append((best+abs(cp),best,bsg,cp,sc,key,o,ax,up,len(fs)))
-res.sort(reverse=True)
+res.sort(key=lambda r: (round(r[0], 2), r[9], -int(r[5][2][1:].split("@")[0]), -r[6]), reverse=True)
+if res:
+    b = next((r for r in res if r[5][0] == 0 and r[5][1] == 'vert'), res[0]); key, o = b[5], b[6]   # (the runtime reads the first G-buffer pass's vertex stage)
+    if '@' in key[2]:
+        q, at = key[2][1:].split('@')
+        print('best: %s float %d -> VXMAC_CAM_PATH=%s:%s:%d (the rotation rows from byte %d; axis %d up %d)' % (key, o, q, at, o * 4, o * 4, b[7], b[8]))
 for r in res[:25]: print('score %.3f yawR %.3f sign %d pitchCorr %.3f pitchScale %.2f key %s off %d (bytes %d) axis %d up %d n %d'%(r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[6]*4,r[7],r[8],r[9]))

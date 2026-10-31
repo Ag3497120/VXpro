@@ -127,19 +127,64 @@ void vxmtl_set_foreground(int fg) {
 //  stats period, against the wall time; the compositor's own queue is left out)
 static pthread_mutex_t g_gpu_lock = PTHREAD_MUTEX_INITIALIZER;
 static double g_gpu_busy, g_gpu_last_end, g_gpu_since; static unsigned long g_gpu_cbs;
+// (h55: the game's GPU time over the last 250 ms, for the pacing below: its command buffers' intervals, merged)
+static double g_win_t[1024], g_win_d[1024]; static unsigned g_win_n;
+static double win_busy(double now) {   // (with g_gpu_lock held: the share of the last 250 ms the game's work kept the GPU)
+    double b = 0; unsigned n = g_win_n < 1024 ? g_win_n : 1024;
+    for (unsigned i = 0; i < n; i++) { unsigned k = (g_win_n - 1 - i) % 1024; if (now - g_win_t[k] > 0.25) break; b += g_win_d[k]; }
+    return b / 0.25;
+}
 static void gpu_account(id<MTLCommandBuffer> c) {
     double a = c.GPUStartTime, b = c.GPUEndTime;
     if (!(b > a)) return;
     pthread_mutex_lock(&g_gpu_lock);
+    { double a2 = a < g_gpu_last_end ? g_gpu_last_end : a; if (b > a2) { g_win_t[g_win_n % 1024] = b; g_win_d[g_win_n % 1024] = b - a2; g_win_n++; } }
     if (a < g_gpu_last_end) a = g_gpu_last_end;
     if (b > a) g_gpu_busy += b - a;
     if (b > g_gpu_last_end) g_gpu_last_end = b;
     g_gpu_cbs++;
     pthread_mutex_unlock(&g_gpu_lock);
 }
+// (h55: the presenter keeps the display rate only if the GPU has room for its warp every 11 ms; the game alone kept it
+//  96 % busy (2.5.0 native 1600x900) and the compositor fell to 44 Hz. Two paces on the game's commits, off the GPU:
+//  - the game's own GPU share held under VXMAC_GPU_CAP (default 0.80 of the last 250 ms; 0 off): a commit waits (1 ms
+//    steps, 12 ms at most) while the share is over it, so the GPU idles between the game's command buffers;
+//  - while a warp's command buffer is on the GPU (vxmtl_warp_begin / _end, the presenter), the game's commits wait
+//    (VXMAC_WARP_HOLD=0 off; 8 ms at most), so its work does not pile up in front of the warp.
+//  Waits counted in stats: pace_waits, pace_ms)
+static double g_gpu_cap = -1; static int g_warp_hold = -1; static _Atomic int g_warps_in_flight;
+static _Atomic unsigned long g_pace_waits, g_pace_us;
+// (h60f: the cap follows the compositor's misses - VXMacImmersive.swift reports each 5 s window's missed deadlines: over
+//  3 -> the cap 0.05 lower (to 0.55 at least), six clean windows in a row -> 0.05 back up to its start; logged)
+void vxmtl_pacing_report(int missed) {
+    static double base = -1; static int clean;
+    if (g_gpu_cap <= 0) return;
+    if (base < 0) base = g_gpu_cap;
+    double was = g_gpu_cap;
+    if (missed > 3) { clean = 0; if (g_gpu_cap > 0.55) g_gpu_cap -= 0.05; }
+    else if (missed == 0 && ++clean >= 6) { clean = 0; if (g_gpu_cap < base - 1e-6) g_gpu_cap += 0.05; }
+    if (g_gpu_cap != was) vxmac_log("Metal: the game's GPU share capped at %.2f (%d deadlines missed in 5 s)", g_gpu_cap, missed);
+}
+void vxmtl_warp_begin(void) { atomic_fetch_add(&g_warps_in_flight, 1); }
+void vxmtl_warp_end(void) { if (atomic_fetch_sub(&g_warps_in_flight, 1) <= 0) atomic_store(&g_warps_in_flight, 0); }
+static void pace(void) {
+    if (g_gpu_cap < 0) { const char *e = getenv("VXMAC_GPU_CAP"); g_gpu_cap = e && *e ? atof(e) : 0.70; const char *h = getenv("VXMAC_WARP_HOLD"); g_warp_hold = !(h && !strcmp(h, "0"));
+        vxmac_log("Metal: the game's commits paced: GPU share under %.2f, held while a warp runs: %d", g_gpu_cap, g_warp_hold); }
+    double t0 = CACurrentMediaTime(), now = t0;
+    while (now - t0 < 0.012) {
+        int wait = 0;
+        if (g_warp_hold && atomic_load(&g_warps_in_flight) > 0 && now - t0 < 0.008) wait = 1;
+        if (!wait && g_gpu_cap > 0) { pthread_mutex_lock(&g_gpu_lock); double b = win_busy(now); pthread_mutex_unlock(&g_gpu_lock); wait = b > g_gpu_cap; }
+        if (!wait) break;
+        usleep(1000); now = CACurrentMediaTime();
+    }
+    if (now > t0 + 0.0005) { g_pace_waits++; g_pace_us += (unsigned long)((now - t0) * 1e6); }
+}
 static void h_commit(id self, SEL s) {
-    if (![((id<MTLCommandBuffer>)self).commandQueue.label hasPrefix:@"VX Mac"])
+    if (![((id<MTLCommandBuffer>)self).commandQueue.label hasPrefix:@"VX Mac"]) {
         [(id<MTLCommandBuffer>)self addCompletedHandler:^(id<MTLCommandBuffer> c) { gpu_account(c); }];
+        if (g_fg) pace();
+    }
     if (!g_fg) {
         g_held_commits++;
         pthread_mutex_lock(&g_fg_lock); while (!g_fg) pthread_cond_wait(&g_fg_cond, &g_fg_lock); pthread_mutex_unlock(&g_fg_lock);
@@ -389,6 +434,7 @@ static MTLRenderPassDescriptor *hud_redirect(MTLRenderPassDescriptor *pd) {
 // frame goes to the centred menu panel (vxmtl_ui_menu). VXMAC_UI_CAPTURE=0: off; VXMAC_UI_CLEAR=0: not cleared.
 static const void *kUI = &kUI, *kUIcb = &kUIcb, *kUIhit = &kUIhit;
 static int g_ui_capture = -1;
+int vxpipe_ui_replay(id enc, id cbo, id tex, NSUInteger slice); void vxpipe_ui_rec_begin(id e, int masking, void *tex);
 static unsigned long g_hud_filled_frame = (unsigned long)-1;   // (the frame whose first UI layer cleared the HUD texture)
 static id<MTLRenderPipelineState> g_ui_blend[2];               // (a layer composited over the HUD texture: 2D, 2D array)
 static __thread int g_ui_busy;                                 // (our own passes are not candidates)
@@ -414,8 +460,17 @@ static void ui_note(id e, MTLRenderPassDescriptor *pd) {
     if (!t || !dt || t == dt || t.width != dt.width || t.height != dt.height || pd.colorAttachments[0].level != 0 || t.mipmapLevelCount < 2 ||
         !(t.textureType == MTLTextureType2D || (t.textureType == MTLTextureType2DArray && t.arrayLength == 1))) return;
     objc_setAssociatedObject(e, kUI, @[ t, @(pd.colorAttachments[0].slice) ], OBJC_ASSOCIATION_RETAIN);
+    if (g_ui_capture < 0) { const char *v = getenv("VXMAC_UI_CAPTURE"); g_ui_capture = !(v && !strcmp(v, "0")); }
+    vxpipe_ui_rec_begin(e, g_ui_capture && atomic_load(&g_hud_want) && !vxkit_cursor_associated(), (__bridge void *)t);   // (h58: the world UI's draws recorded, masked while the HUD is captured)
 }
-static void ui_end(id enc, id cbo) {
+static void ui_end_inner(id enc, id cbo);
+static void ui_end(id enc, id cbo) {   // (h58: then the world UI drawn again into the layer, after the HUD's capture and clear)
+    NSArray *u = objc_getAssociatedObject(enc, kUI);
+    id t = u ? u[0] : nil; NSUInteger slice = u ? [u[1] unsignedIntegerValue] : 0;
+    ui_end_inner(enc, cbo);
+    if (t && cbo) { g_ui_busy = 1; vxpipe_ui_replay(enc, cbo, t, slice); g_ui_busy = 0; }
+}
+static void ui_end_inner(id enc, id cbo) {
     NSArray *u = objc_getAssociatedObject(enc, kUI);
     if (!u || !cbo) return;
     int hit = objc_getAssociatedObject(enc, kUIhit) != nil;
@@ -455,8 +510,12 @@ static void ui_end(id enc, id cbo) {
         NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
             "struct V { float4 p [[position]]; float2 uv; };\n"
             "vertex V bv(uint i [[vertex_id]]) { float2 q = float2((i << 1) & 2, i & 2); V o; o.p = float4(q * 2 - 1, 0, 1); o.uv = float2(q.x, 1 - q.y); return o; }\n"
-            "fragment float4 bf(V i [[stage_in]], texture2d<float> t [[texture(0)]]) { constexpr sampler s(filter::nearest); return t.sample(s, i.uv); }\n"
-            "fragment float4 bfa(V i [[stage_in]], texture2d_array<float> t [[texture(0)]]) { constexpr sampler s(filter::nearest); return t.sample(s, i.uv, 0); }\n";
+            // (h57d: each layer taken as premultiplied and in range - colour at most its alpha, 0..1: the RGBA16F layer (2.5.0's
+            //  second) carries HDR / unpremultiplied full-screen effects (a vehicle's mount transition, screen-edge glows)
+            //  whose colour above its alpha came out as a white haze / a white frame on the head-locked panel)
+            "static float4 pm(float4 c) { c = clamp(c, 0.0f, 1.0f); c.rgb = min(c.rgb, float3(c.a)); return c; }\n"
+            "fragment float4 bf(V i [[stage_in]], texture2d<float> t [[texture(0)]]) { constexpr sampler s(filter::nearest); return pm(t.sample(s, i.uv)); }\n"
+            "fragment float4 bfa(V i [[stage_in]], texture2d_array<float> t [[texture(0)]]) { constexpr sampler s(filter::nearest); return pm(t.sample(s, i.uv, 0)); }\n";
         NSError *err = nil;
         id<MTLLibrary> lib = [cb.device newLibraryWithSource:src options:nil error:&err];
         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
@@ -482,6 +541,27 @@ static void ui_end(id enc, id cbo) {
         g_ui_busy = 1; [[cb renderCommandEncoderWithDescriptor:rc] endEncoding]; g_ui_busy = 0;
     }
     atomic_store(&g_hud_this_frame, 1);
+    {   // (h57f: what the HUD panel shows, for diagnosis - every 15 s the HUD texture (after this layer) saved raw as
+        //  Documents/hud_<n>.rgba (8-byte header: width, height; RGBA8 sRGB premultiplied), 6 at most; VXMAC_HUD_SNAP=0 off)
+        static double last; static int n, on = -1;
+        if (on < 0) { const char *v = getenv("VXMAC_HUD_SNAP"); on = !(v && !strcmp(v, "0")); }
+        double tn = CACurrentMediaTime();
+        if (on && n < 6 && tn - last > 15) {
+            last = tn; int k = n++;
+            NSUInteger W = h.width, H = h.height;
+            id<MTLBuffer> buf = [cb.device newBufferWithLength:W * H * 4 options:MTLResourceStorageModeShared];
+            id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+            [be copyFromTexture:h sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(W, H, 1) toBuffer:buf destinationOffset:0 destinationBytesPerRow:W * 4 destinationBytesPerImage:W * H * 4];
+            [be endEncoding];
+            unsigned long fmt = t.pixelFormat;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { (void)c;
+                NSString *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+                NSMutableData *m = [NSMutableData dataWithCapacity:W * H * 4 + 8]; uint32_t hd[2] = { (uint32_t)W, (uint32_t)H };
+                [m appendBytes:hd length:8]; [m appendBytes:buf.contents length:W * H * 4];
+                [m writeToFile:[d stringByAppendingPathComponent:[NSString stringWithFormat:@"hud_%d.rgba", k]] atomically:YES];
+                vxmac_log("Metal: HUD texture saved as hud_%d.rgba (after a format %lu layer)", k, fmt); }];
+        }
+    }
 }
 // (h51: a menu / full-screen UI = the game's cursor associated (its mouse look off): the whole frame on the centred
 //  panel - the game's own signal, not a coverage share)
@@ -829,8 +909,10 @@ void vxmtl_stats(char *out, unsigned size) {
     if (g_gpu_since > 0 && now > g_gpu_since) busy_pct = 100.0 * g_gpu_busy / (now - g_gpu_since);
     cbs = g_gpu_cbs; g_gpu_busy = 0; g_gpu_cbs = 0; g_gpu_since = now;
     pthread_mutex_unlock(&g_gpu_lock);
-    char head[96]; snprintf(head, sizeof head, "\"game_gpu_busy_pct\":%.0f,\"game_cbs\":%lu,", busy_pct, cbs);
+    char head[160]; snprintf(head, sizeof head, "\"game_gpu_busy_pct\":%.0f,\"game_cbs\":%lu,\"pace_waits\":%lu,\"pace_ms\":%.0f,", busy_pct, cbs,
+                             atomic_exchange(&g_pace_waits, 0), atomic_exchange(&g_pace_us, 0) / 1e3);
     size_t hl = strlen(head); if (hl < size) { memcpy(out, head, hl + 1); out += hl; size -= (unsigned)hl; }
+    { void vxpipe_ui_stats(char *, unsigned); char w[200]; vxpipe_ui_stats(w, sizeof w); size_t wl = strlen(w); if (wl + 1 < size) { memcpy(out, w, wl); out[wl] = ','; out += wl + 1; size -= (unsigned)(wl + 1); } }
     snprintf(out, size, "\"inflight\":%ld,\"inflight_waits\":%lu,\"inflight_timeouts\":%lu,\"held_commits\":%lu,\"presents\":%lu,\"drawable_presents\":%lu,\"dropped\":%lu,\"displaylink_calls\":%lu,\"displaylink\":\"%s\"",
              g_inflight_n, (unsigned long)g_inflight_waits, (unsigned long)g_inflight_timeouts, (unsigned long)g_held_commits, (unsigned long)g_presents, (unsigned long)g_drawable_presents, (unsigned long)g_dropped, (unsigned long)g_link_calls,
              g_fake_link ? "stand-in" : "system");

@@ -423,6 +423,26 @@ static double kTitlebar = 0;                     // (no title bar on visionOS: c
 @end
 
 // ---- NSWindow --------------------------------------------------------------------------------------------------------
+// (2.5.0: a small native window of the game's (its crash / mod.io text panel, NSTextViewDelegate) names these; nothing
+//  is drawn on visionOS: model objects with the catch-all, the views as NSViews)
+NSString *const NSFontAttributeName = @"NSFont";
+NSString *const NSForegroundColorAttributeName = @"NSColor";
+void NSRectFill(NSRect r) { (void)r; }
+@interface NSColor : NSObject @end
+@implementation NSColor VX_CATCHALL @end
+@interface NSFont : NSObject @end
+@implementation NSFont VX_CATCHALL @end
+@interface NSBezierPath : NSObject @end
+@implementation NSBezierPath VX_CATCHALL @end
+@interface NSButton : NSView @end
+@implementation NSButton VX_CATCHALL @end
+@interface NSScroller : NSView @end
+@implementation NSScroller VX_CATCHALL @end
+@interface NSScrollView : NSView @end
+@implementation NSScrollView VX_CATCHALL @end
+@interface NSTextView : NSView @end
+@implementation NSTextView VX_CATCHALL @end
+
 @implementation NSWindow
 - (instancetype)initWithContentRect:(NSRect)r styleMask:(NSUInteger)style backing:(NSUInteger)b defer:(BOOL)d {
     if ((self = [super init])) {
@@ -991,4 +1011,119 @@ __attribute__((constructor)) static void vxkit_notes_init(void) {
     o_add_block = (add_block_imp)method_setImplementation(class_getInstanceMethod(c, @selector(addObserverForName:object:queue:usingBlock:)), (IMP)h_add_block);
     o_remove = (remove_imp)method_setImplementation(class_getInstanceMethod(c, @selector(removeObserver:)), (IMP)h_remove);
     o_remove3 = (remove3_imp)method_setImplementation(class_getInstanceMethod(c, @selector(removeObserver:name:object:)), (IMP)h_remove3);
+}
+
+// ---- (2.5.0) BackgroundAssets' asset packs, read from the game's own data -------------------------------------------
+// 2.5.0 keeps its non-English voices in Apple-hosted asset packs (Info.plist BAUsesAppleHosting): the game asks
+// BAAssetPackManager for a pack (getAssetPackWithIdentifier: "lang_<code>" / "bg-lang--<code>"), makes it local
+// (ensureLocalAvailabilityOfAssetPack:) and opens content/<lang>_voice.archive and ep1/<lang>_voice.archive through
+// fileDescriptorForPath:searchingInAssetPackWithIdentifier:. Those packs are served only to the App Store app itself, so
+// +[BAAssetPackManager sharedManager] answers with this stand-in: the pack root is the game's archive folder
+// (Documents/Cyberpunk2077.app/Contents/Data/archive/mac), a pack is present when its language's voice archives are
+// there (a pack copied from the Mac, or the 2.3.2 one still on the headset), nothing is downloaded. Every call logged
+// once. VXMAC_ASSET_PACKS=0: the system's manager.
+#include <fcntl.h>
+#include <dlfcn.h>
+@interface VXAssetPack : NSObject
+@property (copy) NSString *identifier; @property NSInteger downloadSize, version; @property (copy) NSData *userInfo;
+@end
+@implementation VXAssetPack
+VX_CATCHALL
+@end
+@interface VXAssetPackManager : NSObject
+@property (weak) id delegate;
+@end
+static NSString *ap_root(void) {
+    static NSString *root;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("VXMAC_EXECUTABLE_PATH");   // (.../Cyberpunk2077.app/Contents/MacOS/Cyberpunk2077)
+        NSString *c = e ? [[@(e) stringByDeletingLastPathComponent] stringByDeletingLastPathComponent] : nil;
+        for (NSString *a in @[ @"Data/archive/mac", @"Data/archive/Mac" ]) {
+            NSString *p = [c stringByAppendingPathComponent:a];
+            BOOL d = NO; if (p && [[NSFileManager defaultManager] fileExistsAtPath:p isDirectory:&d] && d) { root = p; break; }
+        }
+        vxmac_log("BackgroundAssets: asset packs read from %s", root ? root.UTF8String : "(no archive folder)");
+    });
+    return root;
+}
+static NSString *ap_lang(NSString *ident) {   // ("lang_ja" / "bg-lang--ja" / "...ja_voice" -> "ja")
+    NSString *s = ident;
+    for (NSString *p in @[ @"bg-lang--", @"lang_", @"lang-" ]) if ([s hasPrefix:p]) s = [s substringFromIndex:p.length];
+    if ([s hasSuffix:@"_voice"]) s = [s substringToIndex:s.length - 6];
+    return s;
+}
+static BOOL ap_present(NSString *ident) {
+    NSString *r = ap_root(), *l = ap_lang(ident);
+    if (!r || !l.length) return NO;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    return [fm fileExistsAtPath:[r stringByAppendingFormat:@"/content/lang_%@_voice.archive", l]] ||
+           [fm fileExistsAtPath:[r stringByAppendingFormat:@"/content/%@_voice.archive", l]];
+}
+static NSError *ap_err(NSString *what) { return [NSError errorWithDomain:@"BAManagedErrorDomain" code:0 userInfo:@{ NSLocalizedDescriptionKey: what }]; }
+static void ap_note(const char *what, NSString *arg, int r) {
+    static NSMutableSet *seen; static pthread_mutex_t l = PTHREAD_MUTEX_INITIALIZER;
+    NSString *k = [NSString stringWithFormat:@"%s %@ %d", what, arg ?: @"-", r];
+    pthread_mutex_lock(&l); if (!seen) seen = [NSMutableSet set]; BOOL fresh = ![seen containsObject:k]; [seen addObject:k]; pthread_mutex_unlock(&l);
+    if (fresh) vxmac_log("BackgroundAssets: %s %s -> %d", what, arg ? arg.UTF8String : "-", r);
+}
+static VXAssetPack *ap_make(NSString *ident) { VXAssetPack *p = [VXAssetPack new]; p.identifier = ident; p.version = 1; return p; }
+@implementation VXAssetPackManager
+VX_CATCHALL
+- (void)getAllAssetPacksWithCompletionHandler:(void (^)(NSSet *, NSError *))h {
+    NSMutableSet *s = [NSMutableSet set];
+    NSString *r = ap_root();
+    for (NSString *f in r ? [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[r stringByAppendingPathComponent:@"content"] error:nil] : @[])
+        if ([f hasPrefix:@"lang_"] && [f hasSuffix:@"_voice.archive"]) [s addObject:ap_make([f stringByDeletingPathExtension])];
+    ap_note("getAllAssetPacks", nil, (int)s.count);
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h(s, nil); });
+}
+- (void)getAssetPackWithIdentifier:(NSString *)i completionHandler:(void (^)(id, NSError *))h {
+    BOOL ok = ap_present(i); ap_note("getAssetPack", i, ok);
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h(ok ? ap_make(i) : nil, ok ? nil : ap_err(@"not on this device")); });
+}
+- (void)getStatusOfAssetPackWithIdentifier:(NSString *)i completionHandler:(void (^)(NSUInteger, NSError *))h {
+    BOOL ok = ap_present(i); ap_note("getStatus", i, ok);
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h(ok ? (1u << 2) : 0, ok ? nil : ap_err(@"not on this device")); });
+}
+- (void)ensureLocalAvailabilityOfAssetPack:(id)p completionHandler:(void (^)(NSError *))h {
+    NSString *i = [p respondsToSelector:@selector(identifier)] ? [p identifier] : nil;
+    BOOL ok = i && ap_present(i); ap_note("ensureLocalAvailability", i, ok);
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h(ok ? nil : ap_err(@"not on this device (nothing is downloaded)")); });
+}
+- (void)checkForUpdatesWithCompletionHandler:(void (^)(NSSet *, NSSet *, NSError *))h {
+    ap_note("checkForUpdates", nil, 0);
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h([NSSet set], [NSSet set], nil); });
+}
+- (void)removeAssetPackWithIdentifier:(NSString *)i completionHandler:(void (^)(NSError *))h {
+    ap_note("removeAssetPack (kept)", i, 0);
+    if (h) dispatch_async(dispatch_get_global_queue(0, 0), ^{ h(nil); });
+}
+- (int)fileDescriptorForPath:(NSString *)path searchingInAssetPackWithIdentifier:(NSString *)i error:(NSError **)err {
+    NSString *r = ap_root(); int fd = r ? open([r stringByAppendingPathComponent:path].fileSystemRepresentation, O_RDONLY) : -1;
+    ap_note("fileDescriptorForPath", path, fd >= 0);
+    if (fd < 0 && err) *err = ap_err(@"no such file in the asset packs");
+    return fd;
+}
+- (NSData *)contentsAtPath:(NSString *)path searchingInAssetPackWithIdentifier:(NSString *)i options:(NSDataReadingOptions)o error:(NSError **)err {
+    NSString *r = ap_root(); NSData *d = r ? [NSData dataWithContentsOfFile:[r stringByAppendingPathComponent:path] options:o error:err] : nil;
+    ap_note("contentsAtPath", path, d != nil);
+    return d;
+}
+- (NSURL *)URLForPath:(NSString *)path error:(NSError **)err {
+    NSString *r = ap_root(); ap_note("URLForPath", path, r != nil);
+    return r ? [NSURL fileURLWithPath:[r stringByAppendingPathComponent:path]] : nil;
+}
+@end
+static id g_apm;
+static id h_ap_shared(id self, SEL s) { (void)self; (void)s; return g_apm; }
+__attribute__((constructor)) static void vxkit_assetpacks_init(void) {
+    const char *e = getenv("VXMAC_ASSET_PACKS"); if (e && !strcmp(e, "0")) return;
+    dlopen("/System/Library/Frameworks/BackgroundAssets.framework/BackgroundAssets", RTLD_LAZY);   // (the game links it; loaded here so its class can be answered for)
+    Class c = objc_getClass("BAAssetPackManager");
+    if (!c) return;
+    g_apm = [VXAssetPackManager new];
+    Method m = class_getClassMethod(c, sel_registerName("sharedManager"));
+    if (m) method_setImplementation(m, (IMP)h_ap_shared); else class_addMethod(object_getClass(c), sel_registerName("sharedManager"), (IMP)h_ap_shared, "@@:");
+    vxmac_log("BackgroundAssets: +[BAAssetPackManager sharedManager] answered by VX Mac (asset packs from the game's archive folder)");
 }

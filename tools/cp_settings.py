@@ -47,6 +47,8 @@ PROFILES = {
     'p900perf': {('/video/display', 'Resolution'): '1600x900', ('/graphics/presets', 'DynamicResolutionScaling'): False,
                  ('/graphics/presets', 'ResolutionScaling'): 'MetalFX', ('/graphics/presets', 'MetalFX'): 'Performance',
                  ('/interface/hudSafezones', 'HudSafezoneHor'): 0.0, ('/video/display', 'MaximumFPS_OnOff'): False},
+    # (h56: nothing but the NAME=VALUE arguments - e.g. `cp_settings.py none FieldOfView=110.0`, the rest as the game has it)
+    'none': {},
     'p720fixed': {('/video/display', 'Resolution'): '1280x720', ('/graphics/presets', 'DynamicResolutionScaling'): False,
                   ('/graphics/presets', 'ResolutionScaling'): 'MetalFX', ('/graphics/presets', 'MetalFX'): 'Performance'},
 }
@@ -71,7 +73,7 @@ def main():
     r = dc('device', 'copy', 'from', '--device', DEV, '--domain-type', 'appDataContainer', '--domain-identifier', APP, '--source', PATH, '--destination', old)
     if r.returncode: sys.exit('copy from failed: ' + r.stderr[-300:])
     d = json.load(open(old))
-    ch = dict(CHEAP); ch.update(PROFILES[prof])
+    ch = {} if prof == 'none' else dict(CHEAP); ch.update(PROFILES[prof])
     for g in d['data']:
         for o in g['options']:
             k = (g['group_name'], o['name'])

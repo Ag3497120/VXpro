@@ -19,6 +19,15 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
     private var hands = false
     private var lastReport = CACurrentMediaTime()
     private var cleared = 0
+    // (h60c: the compositor's pacing, every 5 s - how late the frame starts against its optimal input time, how long from
+    //  there to the commit, the GPU's end against the frame's rendering deadline (misses), the presentation interval (11 ms
+    //  at 90 Hz, 22 at 45): does the system drop us to half rate because our frames miss their deadline?)
+    private let pace = PaceStats()
+    final class PaceStats: @unchecked Sendable {
+        let lock = NSLock()
+        var n = 0, misses = 0, gpuN = 0, lastPres = 0.0, presSum = 0.0, presN = 0, presMax = 0.0
+        var late = 0.0, lateMax = 0.0, sub = 0.0, subMax = 0.0, margin = 0.0, marginMin = 1e9, gpu = 0.0, last = CACurrentMediaTime()
+    }
     private static let near: Float = 0.1, far: Float = 10000
 
     static func start(_ layerRenderer: LayerRenderer) {
@@ -96,7 +105,10 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
         frame.startUpdate()
         frame.endUpdate()
         guard let timing = frame.predictTiming() else { return }
+        let tq = CACurrentMediaTime()
         LayerRenderer.Clock().wait(until: timing.optimalInputTime)
+        let toi = Self.seconds(timing.optimalInputTime), tdl = Self.seconds(timing.renderingDeadline), tpr = Self.seconds(timing.presentationTime)
+        let tw = CACurrentMediaTime()
         frame.startSubmission()
         let drawables = frame.queryDrawables()
         // (no drawables: the system cancelled this frame; ending its submission would abort the app)
@@ -143,8 +155,34 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
             d.encodePresent(commandBuffer: cb)
         }
         vx_xros_vr_end_frame(cbp)
+        let ps = pace
+        cb.addCompletedHandler { c in
+            ps.lock.lock()
+            ps.gpuN += 1; ps.gpu += (c.gpuEndTime - c.gpuStartTime) * 1e3
+            let m = (tdl - c.gpuEndTime) * 1e3; ps.margin += m; if m < ps.marginMin { ps.marginMin = m }; if m < 0 { ps.misses += 1 }
+            ps.lock.unlock()
+        }
         cb.commit()
         frame.endSubmission()
+        do {
+            let tc = CACurrentMediaTime()
+            pace.lock.lock()
+            pace.n += 1
+            let lt = (tw - toi) * 1e3; pace.late += lt; if lt > pace.lateMax { pace.lateMax = lt }
+            let sb = (tc - tw) * 1e3; pace.sub += sb; if sb > pace.subMax { pace.subMax = sb }
+            if pace.lastPres > 0 { let d = (tpr - pace.lastPres) * 1e3; if d > 0 && d < 200 { pace.presSum += d; pace.presN += 1; if d > pace.presMax { pace.presMax = d } } }
+            pace.lastPres = tpr
+            if tc - pace.last >= 5 {
+                let f = String(format: "\"frames\":%d,\"present_interval_ms\":%.2f,\"present_interval_max_ms\":%.1f,\"start_late_ms\":%.2f,\"start_late_max_ms\":%.1f,\"input_to_commit_ms\":%.2f,\"input_to_commit_max_ms\":%.1f,\"gpu_ms\":%.2f,\"deadline_margin_ms\":%.2f,\"deadline_margin_min_ms\":%.1f,\"missed\":%d,\"query_to_input_ms\":%.1f",
+                                   pace.n, pace.presN > 0 ? pace.presSum / Double(pace.presN) : 0, pace.presMax, pace.late / Double(pace.n), pace.lateMax, pace.sub / Double(pace.n), pace.subMax,
+                                   pace.gpuN > 0 ? pace.gpu / Double(pace.gpuN) : 0, pace.gpuN > 0 ? pace.margin / Double(pace.gpuN) : 0, pace.marginMin, pace.misses, (toi - tq) * 1e3)
+                vxmtl_pacing_report(Int32(pace.misses))
+                pace.n = 0; pace.misses = 0; pace.gpuN = 0; pace.presSum = 0; pace.presN = 0; pace.presMax = 0; pace.late = 0; pace.lateMax = 0
+                pace.sub = 0; pace.subMax = 0; pace.margin = 0; pace.marginMin = 1e9; pace.gpu = 0; pace.last = tc
+                pace.lock.unlock()
+                vxmac_jlog("compositor_pacing", f)
+            } else { pace.lock.unlock() }
+        }
         // (the hands after the frame is submitted, from the provider's latest anchors: a query here never delays a
         // frame; with handAnchors(at:) before the submission the compositor fell to 45 Hz, h2b)
         if hands { feedHands(head) }

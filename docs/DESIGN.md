@@ -319,3 +319,26 @@ blocks now grow with the output's density over the frame's (`kbs`): above 2x, ho
 lines; found in a Mac test at 4x); at today's 1.28x it is unchanged (kbs 2). Centre density: game frame 1280 over
 FOV 100 = 9.4 px/deg; the eye texture without foveation is 12 px/deg at the centre, so x2 SR reaches 12 px/deg (the
 eye texture's cap) plus edge sharpness until compositor foveation (rate maps in warp_core) raises the cap.
+
+## A new game build (checklist; 2.3.2 is the tested one)
+
+2.3.2's code images are kept in `build/cyberpunk/game_2.3.2_code/` (SHA256SUMS, Info.plist) with its data
+manifest `data_manifest_2.3.2.json` (the headset holds 2.3.2's data), so 2.3.2 can always be prepared again.
+
+1. `tools/new_build.py <Cyberpunk2077.app> <outdir>` (read only): version, SHA-256, the pool patterns
+   (`macho_prepare.py --pool-check`: the three large pools, the linear pools, the pool-kind descriptor, the constructor
+   reserving itself; exact counts or refused; 2.3.2 reproduces its 15 sites exactly), each image's libraries against
+   2.3.2's, new MetalFX / BackgroundAssets / Metal 4 names, the data delta, the four images prepared and check_imports.
+2. Missing symbols: MetalFX frame interpolation (`MTLFXFrameInterpolator*`) and denoised scalers -> libvxmtlfx (the real
+   class where visionOS has it, else a stand-in that reports unsupported so the game takes its other path); a new
+   framework (BackgroundAssets...) -> its visionOS version if the SDK has it, else a shim in `shims/`.
+3. Data: where the build keeps its data (Contents/Data, or assets downloaded in the background into its container's
+   Application Support); `tools/data_manifest.py DATA new.json` and `--delta old new` give the files to copy to the
+   headset (only those, archive/Mac -> archive/mac).
+4. Per-build Metal identities (a Mac or headset run with `VXMAC_PIPE_DUMP`):
+   - UI layers' vertex shaders: `tools/ui_hashes.py DUMP` -> `VXMAC_UI_VS=<h>,<h>` (2.3.2: 9659c847a5663c68,
+     dd2ffa0fee62e619; defaults in vxpipe.m);
+   - the camera: `tools/cbv_find.py DUMP` -> `VXMAC_CAM_PATH=<word>:<table byte>:<matrix byte>` (2.3.2: 0:24:320);
+   - then make them the defaults for that build (keyed by the executable's SHA-256 from `<image>.vxmac.plist`).
+5. Settings: the build's UserSettings.json keys (FieldOfView, resolution, MetalFX modes) for `tools/cp_settings.py`
+   and `patch_fov.py`.

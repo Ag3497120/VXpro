@@ -223,6 +223,7 @@ void vxmac_vel_target(void *cb, void *tex, int index);
 float vx_xros_vr_tan_y(void);
 void vx_xros_vr_seen_turn2(uint64_t pseq, float seen, float seen_y);
 void vx_xros_vr_cam_candidates(uint64_t pseq, const void *cands, int n);
+int vxmac_stick_active(void) { return stick_active(); }   // (h57b: for the presenter's yaw offset)
 static void follow_sample(const float *prof, float yaw_sent, float pitch_sent, int stick, const float *vel_mean, uint64_t pseq) {
     if (!vx_xros_vr_driving()) { g_have_prev = 0; g_win_start = 0; return; }
     double now = CACurrentMediaTime();
@@ -504,10 +505,15 @@ static void vm_line(char *out, size_t n) {
              i.virtual_size / 1073741824.0, (unsigned long long)(i.compressed >> 20), (unsigned long long)(i.internal >> 20), big);
 }
 static void stats_tick(void) {
-    char vr[1400] = "", mt[300] = "", fx[300] = "", unk[1200] = "", npu[1100] = "";
+    char vr[1400] = "", mt[900] = "", fx[300] = "", unk[1200] = "", npu[1100] = "";
     vxmac_npu_stats(npu, sizeof npu);
     { void vxmac_fsr_stats(char *, unsigned); char fs[400]; vxmac_fsr_stats(fs, sizeof fs);
       size_t l = strlen(npu); snprintf(npu + l, sizeof npu - l, ",%s", fs); }
+    {   // (h59: the device's thermal state - the display fell to 44 Hz for good 60-90 s into each heavy head-look run with
+        //  nothing else changing: is it the system's thermal mitigation? Logged in stats and on each change)
+        static long last = -1; long th = (long)[NSProcessInfo processInfo].thermalState;
+        if (th != last) { jlog("thermal", "\"state\":%ld", th); last = th; }
+        size_t l = strlen(npu); snprintf(npu + l, sizeof npu - l, ",\"thermal\":%ld", th); }
     { unsigned long pe, pt; void vx_xros_vr_pred_stats(unsigned long *, unsigned long *); vx_xros_vr_pred_stats(&pe, &pt);
       size_t l = strlen(npu); snprintf(npu + l, sizeof npu - l, ",\"pred_eyes\":%lu,\"eyes\":%lu,\"stick_y_zeroed\":%lu", pe, pt, (unsigned long)g_stick_y_zeroed); }
     if (g_vr) vx_xros_vr_stats(vr, sizeof vr);

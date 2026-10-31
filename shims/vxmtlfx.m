@@ -173,7 +173,57 @@ __attribute__((ns_returns_retained)) static id h_new(id self, SEL s, id dev) {
     return ours;
 }
 
+// (2.5.0: MetalFX frame interpolation ("FrameGeneration": Off / FSR3 / MetalFX; the game then presents through its own
+//  "MetalFX PresentQueue" with a replacement back buffer and injected frames). Generated frames would reach the presenter
+//  as real ones with no camera of their own, and the presenter makes its own frames at 90 Hz from each real one: so
+//  frame interpolation is reported unsupported (+supportsDevice: NO, new... nil, logged) and the game keeps its normal
+//  present. VXMAC_FX_INTERP=1: the system's answer (study only). The denoised scaler: logged, passed through)
+typedef BOOL (*fi_sup_imp)(id, SEL, id);
+typedef id (*fi_new_imp)(id, SEL, id) __attribute__((ns_returns_retained));
+typedef id (*fi_new2_imp)(id, SEL, id, id) __attribute__((ns_returns_retained));
+static fi_sup_imp o_fi_sup[2]; static fi_new_imp o_fi_new[2]; static fi_new2_imp o_fi_new2[2]; static int g_fi_allow;
+static BOOL fi_sup(int k, id self, SEL s, id dev) {
+    BOOL r = g_fi_allow && o_fi_sup[k] ? o_fi_sup[k](self, s, dev) : NO;
+    static int n; if (n++ < 4) vxmac_log("MetalFX: %s +supportsDevice: -> %d%s", class_getName(self), r, g_fi_allow ? "" : " (frame interpolation off)");
+    return r;
+}
+static BOOL h_fi_sup0(id self, SEL s, id d) { return fi_sup(0, self, s, d); }
+static BOOL h_fi_sup1(id self, SEL s, id d) { return fi_sup(1, self, s, d); }
+__attribute__((ns_returns_retained)) static id fi_new(int k, id self, SEL s, id dev, id comp, int two) {
+    id r = !g_fi_allow ? nil : two ? (o_fi_new2[k] ? o_fi_new2[k](self, s, dev, comp) : nil) : (o_fi_new[k] ? o_fi_new[k](self, s, dev) : nil);
+    vxmac_log("MetalFX: %s -%s -> %s", class_getName(object_getClass(self)), sel_getName(s), r ? "an interpolator" : "nil (frame interpolation off)");
+    return r;
+}
+__attribute__((ns_returns_retained)) static id h_fi_new0(id self, SEL s, id d) { return fi_new(0, self, s, d, nil, 0); }
+__attribute__((ns_returns_retained)) static id h_fi_new1(id self, SEL s, id d) { return fi_new(1, self, s, d, nil, 0); }
+__attribute__((ns_returns_retained)) static id h_fi_new20(id self, SEL s, id d, id c) { return fi_new(0, self, s, d, c, 1); }
+__attribute__((ns_returns_retained)) static id h_fi_new21(id self, SEL s, id d, id c) { return fi_new(1, self, s, d, c, 1); }
+typedef id (*dn_new_imp)(id, SEL, id) __attribute__((ns_returns_retained));
+static dn_new_imp o_dn_new;
+__attribute__((ns_returns_retained)) static id h_dn_new(id self, SEL s, id d) {
+    id r = o_dn_new ? o_dn_new(self, s, d) : nil;
+    static int n; if (n++ < 4) vxmac_log("MetalFX: newTemporalDenoisedScalerWithDevice: -> %s (passed through, not captured)", r ? "a scaler" : "nil");
+    return r;
+}
+static void fi_init(void) {
+    const char *e = getenv("VXMAC_FX_INTERP"); g_fi_allow = e && !strcmp(e, "1");
+    const char *names[2] = { "MTLFXFrameInterpolatorDescriptor", "MTL4FXFrameInterpolatorDescriptor" };
+    IMP sup[2] = { (IMP)h_fi_sup0, (IMP)h_fi_sup1 }, nw[2] = { (IMP)h_fi_new0, (IMP)h_fi_new1 }, nw2[2] = { (IMP)h_fi_new20, (IMP)h_fi_new21 };
+    for (int k = 0; k < 2; k++) {
+        Class c = objc_getClass(names[k]);
+        vxmac_log("MetalFX: %s %s on this system", names[k], c ? "present" : "absent");
+        if (!c) continue;
+        Method m = class_getClassMethod(c, @selector(supportsDevice:));
+        if (m) o_fi_sup[k] = (fi_sup_imp)method_setImplementation(m, sup[k]); else class_addMethod(object_getClass(c), @selector(supportsDevice:), sup[k], "c@:@");
+        if ((m = class_getInstanceMethod(c, @selector(newFrameInterpolatorWithDevice:)))) o_fi_new[k] = (fi_new_imp)method_setImplementation(m, nw[k]);
+        if ((m = class_getInstanceMethod(c, sel_registerName("newFrameInterpolatorWithDevice:compiler:")))) o_fi_new2[k] = (fi_new2_imp)method_setImplementation(m, nw2[k]);
+    }
+    Class dn = objc_getClass("MTLFXTemporalDenoisedScalerDescriptor");
+    Method m = dn ? class_getInstanceMethod(dn, sel_registerName("newTemporalDenoisedScalerWithDevice:")) : NULL;
+    if (m) o_dn_new = (dn_new_imp)method_setImplementation(m, (IMP)h_dn_new);
+}
 __attribute__((constructor)) static void vxfx_init(void) {
+    fi_init();
     const char *e = getenv("VXMAC_FX_FALLBACK"); g_allow_fallback = !e || strcmp(e, "0");
     e = getenv("VXMAC_FX_FORCE_FALLBACK"); g_force_fallback = e && !strcmp(e, "1");
     Class d = objc_getClass("MTLFXTemporalScalerDescriptor");
