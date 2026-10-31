@@ -46,6 +46,16 @@ def supported_sha():
     return macho_prepare.POOL_PATCH_SHA256
 
 
+def pool_sites_ok(exe):
+    """Another build than 2.3.2: are the pool-size patterns found as expected (macho_prepare.find_pool_sites)?"""
+    import macho_prepare
+    try:
+        return len(macho_prepare.find_pool_sites(open(exe, 'rb').read()))
+    except SystemExit as e:
+        say('       pool patterns: %s' % e)
+        return 0
+
+
 def say(*a): print(*a, flush=True)
 
 
@@ -130,7 +140,13 @@ def cmd_doctor(a):
         line(os.path.exists(exe), 'Cyberpunk2077.app', game)
         if os.path.exists(exe):
             digest = sha256(exe)
-            line(digest == supported_sha(), 'executable SHA-256 %s' % digest[:16], 'supported: 2.3.2 (Mac App Store) only')
+            if digest == supported_sha():
+                line(True, 'executable SHA-256 %s' % digest[:16], '2.3.2 (Mac App Store): tested')
+            else:
+                n = pool_sites_ok(exe)
+                line(n > 0, 'executable SHA-256 %s' % digest[:16],
+                     ('another build: %d pool sites found by pattern - UNTESTED, prepare will warn' % n) if n else
+                     'another build and its pool patterns are not found: not supported')
             for src, _, _ in IMAGES[1:]:
                 line(os.path.exists(os.path.join(game, src)), os.path.basename(src))
             data = os.path.join(game, 'Contents/Data')
@@ -150,7 +166,10 @@ def cmd_prepare(a):
     if not os.path.exists(exe): sys.exit('no %s' % exe)
     digest = sha256(exe)
     if digest != supported_sha():
-        sys.exit('this executable (%s) is not Cyberpunk 2077 2.3.2 from the Mac App Store: not supported' % digest)
+        if not pool_sites_ok(exe):
+            sys.exit('this executable (%s) is not Cyberpunk 2077 2.3.2 and its pool patterns are not found: not supported' % digest)
+        say('WARNING: this executable (%s) is not the tested 2.3.2 build; its pool sites were found by pattern. It is '
+            'untested on the headset: keep your 2.3.2 data and saves backed up.' % digest[:16])
     team = a.team or os.environ.get('VXMAC_TEAM', '')
     if len(team) != 10 or not team.isalnum(): sys.exit('--team (or $VXMAC_TEAM): your 10-character Apple Developer Team ID')
     bundle = a.bundle_id or os.environ.get('VXMAC_BUNDLE_ID') or 'com.%s.VXMacHost' % team.lower()

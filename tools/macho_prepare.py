@@ -50,7 +50,9 @@ SHIM_SYSTEM = '@rpath/libvxsystem.dylib'    # (libSystem + syslog$DARWIN_EXTSN: 
 # (avp-port VXRuntime/src/game_patch.h, cyberpunk_pools): 16->8, 64->16, 32->8 GB, every 4 GB pool -> 1 GB. Pools
 # commit from their start up (bump allocators), so a smaller range holds what the game uses.
 # Each entry: (file offset, the 4-byte instruction expected there, the instruction written, what). Only these size
-# instructions are recorded (no other byte of the game). Any expected word not found, or another SHA-256: refused.
+# instructions are recorded (no other byte of the game). The sites are found by pattern (find_pool_sites: each family
+# in its instruction context, exact counts); on 2.3.2 the finder must reproduce this table exactly (a fixture), another
+# build is patched only when every family is found, with a warning (untested). Check without writing: --pool-check EXE.
 #   0x10000fdc0  builds the three large pools' descriptors (Windows exe+0x260dc48)
 #   0x100013398  DynamicLinearAllocator constructor: descriptor {allocator, granularity, flags, size}; all its 12
 #                call sites pass 4 GB (0x1015fcbd0 makes three: Windows exe+0x68bd5d)
@@ -73,20 +75,156 @@ POOL_PATCHES = [
 POOL_CORE = (0x0000fde8, 0x0000fe28, 0x0000fe6c, 0x015fcbfc)   # (--pool-patch-set core: the large three and the three linear pools, the Windows route's verified sites)
 
 
+def _text_range(buf):
+    """(file offset, vm address, size) of __TEXT,__text."""
+    ncmds = struct.unpack_from('<I', buf, 16)[0]; off = 32
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from('<II', buf, off)
+        if cmd == LC_SEGMENT_64:
+            nsect = struct.unpack_from('<I', buf, off + 64)[0]
+            for i in range(nsect):
+                so = off + 72 + i * 80
+                sect, seg = buf[so:so + 16].rstrip(b'\0'), buf[so + 16:so + 32].rstrip(b'\0')
+                if seg == b'__TEXT' and sect == b'__text':
+                    addr, sz, fo = struct.unpack_from('<QQI', buf, so + 32)
+                    return fo, addr, sz
+        off += size
+    raise SystemExit('--pool-patch: no __TEXT,__text')
+
+
+def _bl_target(w, va):
+    if (w & 0xfc000000) != 0x94000000:
+        return None
+    imm = w & 0x03ffffff
+    if imm & 0x02000000:
+        imm -= 0x04000000
+    return va + imm * 4
+
+
+def _word_sites(buf, words, lo, hi):
+    """Every 4-byte-aligned file offset in [lo, hi) holding one of words."""
+    out = []
+    for w in words:
+        pat = struct.pack('<I', w); i = buf.find(pat, lo, hi)
+        while i >= 0:
+            if (i - lo) % 4 == 0:
+                out.append((i, w))
+            i = buf.find(pat, i + 1, hi)
+    return sorted(out)
+
+
+def find_pool_sites(buf):
+    """The pool-size instructions found by their context, for any build (2.3.2's 15 sites reproduced exactly).
+    Families (each must be found exactly as described, or the build is refused):
+      large   one function with movz #4 lsl 32 (16 GB), then #0x10 lsl 32 (64 GB), then #8 lsl 32 (32 GB), 64 instructions
+              at most apart, each stored to the stack; P = the call right after the 32 GB one (a pool constructor)
+      linear  movz xR, #1 lsl 32 (4 GB) followed by `str xR, [sp, #..]` and, within 8 instructions, a call to T: the
+              function most such sites call (the DynamicLinearAllocator constructor; at least twice as many as any other)
+      kind    a 4 GB movz followed within 6 instructions by a call to P (exactly one)
+      ctor    `movz x1, #1 lsl 32; bl R` where T itself calls R (the page allocator's reserve; exactly one)
+    Returns [(file offset, old word, new word, what)]."""
+    fo, va0, sz = _text_range(buf)
+    lo, hi = fo, fo + sz
+    word = lambda o: struct.unpack_from('<I', buf, o)[0]
+    vaof = lambda o: va0 + (o - fo)
+    def movz_rd(w, imm, hw):
+        return w & 0x1f if (w & ~0x1f) == (_movz(0, imm, hw)) else None
+    def is_stack_store(w, rd):   # (str xRd, [sp, #..] or stp .., xRd / xRd, .., [sp, #..])
+        if (w & 0xffc003ff) == (0xf9000000 | (31 << 5) | rd):
+            return True
+        return (w & 0xffc003e0) == (0xa9000000 | (31 << 5)) and (w & 0x1f == rd or (w >> 10) & 0x1f == rd)
+    def next_bl(o, n):
+        for k in range(1, n + 1):
+            t = _bl_target(word(o + 4 * k), vaof(o + 4 * k))
+            if t is not None:
+                return t
+        return None
+    G = lambda imm: [_movz(r, imm, 2) for r in range(31)]
+    s16, s64, s32 = _word_sites(buf, G(4), lo, hi), _word_sites(buf, G(0x10), lo, hi), _word_sites(buf, G(8), lo, hi)
+    trios = []
+    for o64, w64 in s64:
+        a = [x for x in s16 if 0 < o64 - x[0] <= 256 and is_stack_store(word(x[0] + 4), x[1] & 0x1f)]
+        c = [x for x in s32 if 0 < x[0] - o64 <= 256 and is_stack_store(word(x[0] + 4), x[1] & 0x1f)]
+        if a and c and is_stack_store(word(o64 + 4), w64 & 0x1f):
+            trios.append((a[-1], (o64, w64), c[0]))
+    if len(trios) != 1:
+        raise SystemExit('--pool-patch: the three large pools found %d times (expected 1): refused' % len(trios))
+    (o16, w16), (o64, w64), (o32, w32) = trios[0]
+    P = next_bl(o32, 12)
+    sites = [(o16, w16, _movz(w16 & 0x1f, 2, 2), 'large pool 16 GB -> 8 GB'),
+             (o64, w64, _movz(w64 & 0x1f, 4, 2), 'large pool 64 GB -> 16 GB'),
+             (o32, w32, _movz(w32 & 0x1f, 2, 2), 'large pool 32 GB -> 8 GB')]
+    g4 = _word_sites(buf, [_movz(r, *_G4) for r in range(31)], lo, hi)
+    cand = []   # (a 4 GB size stored to the stack, then the first call within 8 instructions: a descriptor passed on)
+    for o, w in g4:
+        rd = w & 0x1f; wn = word(o + 4)
+        if (wn & 0xffc003ff) == (0xf9000000 | (31 << 5) | rd):
+            cand.append((o, w, next_bl(o, 8)))
+    from collections import Counter
+    cnt = Counter(t for _, _, t in cand if t is not None)
+    if not cnt:
+        raise SystemExit('--pool-patch: no linear pool sites: refused')
+    (T, n), *rest = cnt.most_common()
+    if rest and rest[0][1] * 2 > n:
+        raise SystemExit('--pool-patch: the linear pools\' constructor is ambiguous (%s): refused' % cnt.most_common(3))
+    lin = [(o, w, t) for o, w, t in cand if t == T]
+    sites += [(o, w, _movz(w & 0x1f, *_G1), 'linear pool 4 GB -> 1 GB') for o, w, _ in lin]
+    kind = [(o, w) for o, w in g4 if P is not None and next_bl(o, 6) == P and o not in [x[0] for x in lin]]
+    if len(kind) != 1:
+        raise SystemExit('--pool-patch: 4 GB descriptors for the pool kind %s found %d times (expected 1): refused' % (hex(P or 0), len(kind)))
+    sites.append((kind[0][0], kind[0][1], _movz(kind[0][1] & 0x1f, *_G1), 'pool (descriptor for %#x) 4 GB -> 1 GB' % P))
+    to = fo + (T - va0); called = set()
+    for k in range(256):
+        t = _bl_target(word(to + 4 * k), T + 4 * k)
+        if t is not None:
+            called.add(t)
+    ctor = [(o, w) for o, w in g4 if (w & 0x1f) == 1 and _bl_target(word(o + 4), vaof(o + 4)) in called]
+    if len(ctor) != 1:
+        raise SystemExit('--pool-patch: a pool constructor reserving 4 GB itself found %d times (expected 1): refused' % len(ctor))
+    sites.append((ctor[0][0], ctor[0][1], _movz(1, *_G1), 'pool (ctor reserving itself) 4 GB -> 1 GB'))
+    return sorted(sites)
+
+
 def pool_patch(buf, digest, which='all'):
-    if digest != POOL_PATCH_SHA256:
-        raise SystemExit('--pool-patch: SHA-256 %s is not Cyberpunk2077 2.3.2 (Mac App Store) %s: refused'
-                         % (digest, POOL_PATCH_SHA256))
-    patches = [p for p in POOL_PATCHES if which == 'all' or p[0] in POOL_CORE]
-    for off, old, new, what in patches:
+    """The pool sizes, found by pattern (find_pool_sites). 2.3.2 (POOL_PATCH_SHA256) is the known-good fixture: there the
+    finder must give exactly POOL_PATCHES. Another build is patched only when every family is found as expected, with
+    a warning (untested on the headset)."""
+    sites = find_pool_sites(buf)
+    known = digest == POOL_PATCH_SHA256
+    if known:
+        want = sorted((o, old, new) for o, old, new, _ in POOL_PATCHES)
+        if [(o, old, new) for o, old, new, _ in sites] != want:
+            raise SystemExit('--pool-patch: the pattern finder does not reproduce the 2.3.2 table: refused')
+    else:
+        sys.stderr.write('--pool-patch: WARNING: SHA-256 %s is not the tested 2.3.2 build; %d pool sites found by pattern '
+                         '(untested on the headset)\n' % (digest[:16], len(sites)))
+    if which == 'core':   # (an A/B: 2.3.2's POOL_CORE; another build: the large three and the linear pools)
+        sites = [x for x in sites if x[0] in POOL_CORE] if known else [x for x in sites if x[3].startswith(('large', 'linear'))]
+    out = []
+    for off, old, new, what in sites:
         got = struct.unpack_from('<I', buf, off)[0]
         if got != old:
             raise SystemExit('--pool-patch: %#x holds %#010x, not %#010x: refused' % (off, got, old))
-    out = []
-    for off, old, new, what in patches:
+    for off, old, new, what in sites:
         struct.pack_into('<I', buf, off, new)
-        out.append({'cmd': 'pool_patch', 'off': hex(off), 'what': what})
+        out.append({'cmd': 'pool_patch', 'off': hex(off), 'what': what, 'known_build': known})
     return out
+
+
+def pool_check(path):
+    """--pool-check: the sites the finder gives for an executable (no output file); 0 when every family is found."""
+    buf = open(path, 'rb').read()
+    sites = find_pool_sites(buf)
+    d = sha256(path)
+    for o, old, new, what in sites:
+        print('%#010x %#010x -> %#010x %s' % (o, old, new, what))
+    known = d == POOL_PATCH_SHA256
+    if known:
+        same = sorted((o, a, b) for o, a, b, _ in POOL_PATCHES) == [(o, a, b) for o, a, b, _ in sites]
+        print('2.3.2 fixture: %s (%d sites)' % ('reproduced exactly' if same else 'MISMATCH', len(sites)))
+        return 0 if same else 1
+    print('untested build %s: %d sites found by pattern' % (d[:16], len(sites)))
+    return 0
 
 
 def map_path(p, image):
@@ -236,6 +374,8 @@ def main():
     ap.add_argument('--as-dylib', metavar='INSTALL_NAME', help='the main executable as a dylib (e.g. @rpath/Cyberpunk2077.dylib)')
     ap.add_argument('--platform', choices=['xros', 'xrsim', 'macos'], default='xros')
     ap.add_argument('--json'); ap.add_argument('--check', action='store_true')
+    if len(sys.argv) == 3 and sys.argv[1] == '--pool-check':
+        raise SystemExit(pool_check(sys.argv[2]))
     a = ap.parse_args()
     if os.path.realpath(a.src) == os.path.realpath(a.dst):
         raise SystemExit('refusing to write the source')
