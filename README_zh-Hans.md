@@ -8,16 +8,16 @@
 
 VXpro 让 **Mac App Store 版 Cyberpunk 2077** 在 **Vision Pro 单机** 上运行。游戏的 Mac 版是 arm64 Metal 代码，与 visionOS 相同，因此可以原生运行：没有模拟、没有转译、没有串流、不需要 PC。宿主应用（VX Mac Host）加载游戏代码，把它用到的 macOS 专用库替换为小型兼容层，并在沉浸空间中显示画面。
 
-**状态：Preview 0.1**（实验性，2026-10-31）。
+**状态：Preview 0.2**（实验性，2026-11-01）。
 
 ## 需要
 
-> **游戏版本：** 目前只支持 Cyberpunk 2077 **2.3.2**（2025 年的 Mac App Store 版本）。最新的 Mac App Store 更新（App Store 版本 1.0.4，2026 年 10 月 22 日发布）**暂不支持，近期将会支持。** 如果你的游戏已经更新，工具会在 `doctor` / `prepare` 阶段停止，不做任何更改。
+> **游戏版本：** 支持 Cyberpunk 2077 **2.5.0**（Mac App Store 最新更新）和 **2.3.2**，均已在头显上测试。包含英语语音；其他语言的语音需要对应的语音档案，2.5.0 暂不支持（其其他语言语音为 Apple 托管的下载内容）。字幕和菜单支持所有语言。
 
 - 已开启开发者模式并与 Mac 配对的 **Apple Vision Pro**，约 **160 GB 可用空间**；
 - **Apple 芯片的 Mac**、带 visionOS SDK 的 **Xcode 26**、`xcodegen`、Python 3；
 - 你**自己的付费 Apple Developer Program 账号**（用你自己的团队签名）；
-- 你**自己从 Mac App Store 购买的 Cyberpunk 2077（版本 2.3.2）**，已安装在 Mac 上。
+- 你**自己从 Mac App Store 购买的 Cyberpunk 2077（版本 2.5.0 或 2.3.2）**，已安装在 Mac 上。
 
 ## 安装概要
 
@@ -50,10 +50,11 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 
 驾驶载具时请使用游戏的**第一人称驾驶视角**。
 
-## 已知问题（Preview 0.1）
+## 已知问题（Preview 0.2）
 
 - 请用双手捏合（3 秒＋再次）或应用窗口的 **Quit game** 按钮退出。若直接关闭应用，游戏会暂停，并在 10 秒后被要求退出，但在后台可能无法完成退出。
-- 1600x900 在 M2 上约 40 Hz：请使用 1280x720、MetalFX 性能、FOV 110（见指南“Recommended settings”）。
+- 头显变热或画面变形（warp）赶不上帧时，显示可能锁定在约 45 Hz：请让头显冷却后再继续。
+- 推荐：16:9，1600x900 原生或 1280x720，FOV 110（`fov --max 110` 和 `settings`，见指南）。
 - 首次复制游戏数据量大且耗时（158 GB）。
 - 需要付费的 Apple Developer Program 会员资格（免费账号无法授予应用所需的权限）。
 

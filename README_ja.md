@@ -11,7 +11,7 @@ arm64 の Metal コードなので、ネイティブに動きます（エミュ�
 イマーシブ空間に表示します。3D のゲームプレイ中は頭の向きでゲームのカメラが回り、各目の映像はゲームの深度から 90 Hz で
 再投影されます。メニュー、ムービー、ロード画面は部屋に固定されたパネルに出ます。
 
-**状態：Preview 0.1**（実験的、2026-10-31）。M2 の Vision Pro で、設定を下げた状態で、メインメニュー、キャラクター作成、
+**状態：Preview 0.2**（実験的、2026-11-01）。M2 の Vision Pro で、設定を下げた状態で、メインメニュー、キャラクター作成、
 ゲーム冒頭が動いています。ゲームは約 20〜30 fps、表示は 90 Hz の再投影です。
 
 VXpro は [VeRantyx](https://github.com/Ag3497120/VeRantyx) の Mac App Store ルートです（Windows / Steam ルートの
@@ -19,13 +19,13 @@ VXRuntime は VeRantyx 側にあります）。
 
 ## 必要なもの
 
-> **ゲームの版について：** 現在対応しているのは Cyberpunk 2077 **2.3.2**（2025 年の Mac App Store 版）だけです。最新の Mac App Store の更新（App Store の版 1.0.4、2026 年 10 月 22 日公開）には **まだ対応していません。近日中に対応予定です。** すでに更新されている場合、ツールは `doctor` / `prepare` の段階で何も変更せずに止まります。
+> **ゲームの版について：** Cyberpunk 2077 **2.5.0**（Mac App Store の最新の更新）と **2.3.2** に対応しています（どちらもヘッドセットで確認済み）。英語音声は含まれます。ほかの言語の音声にはその音声アーカイブが必要で、2.5.0 ではまだ対応していません（2.5.0 のほかの言語の音声は Apple がホストするダウンロードです）。字幕とメニューは全言語で動きます。
 
 - **Apple Vision Pro**（デベロッパモード、Mac とペアリング済み、空き容量 **約 160 GB**）
 - **Apple シリコンの Mac**、**Xcode 26**（visionOS SDK）、`xcodegen`、Python 3
 - **自分の有料 Apple Developer Program アカウント**（アプリには Increased Memory Limit と Extended Virtual
   Addressing のエンタイトルメントが必要で、自分のチームで署名します）
-- **自分で購入した Mac App Store 版 Cyberpunk 2077 バージョン 2.3.2**（Mac にインストール済み）
+- **自分で購入した Mac App Store 版 Cyberpunk 2077 バージョン 2.5.0 または 2.3.2**（Mac にインストール済み）
 
 ## はじめかた
 
@@ -57,11 +57,14 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - **CD PROJEKT RED とも Apple とも無関係です。** Cyberpunk 2077 は CD PROJEKT S.A. の商標です。Apple Vision Pro、
   visionOS、Mac App Store は Apple Inc. の商標です。
 
-## 既知の問題（Preview 0.1）
+## 既知の問題（Preview 0.2）
 
 - 終了は両手ピンチ（3 秒＋もう一度）か、アプリのウインドウの **Quit game** ボタンで。アプリを直接閉じるとゲームは
   一時停止し、10 秒後に終了を求めますが、バックグラウンドでは終了しきれないことがあります。セーブ中に強制終了はしないでください。
-- 1600x900 は M2 で約 40 Hz：1280x720 MetalFX パフォーマンス、FOV 110 を使ってください（ガイドの「推奨設定」）。
+- ヘッドセットが熱くなったり、ワープがフレームに間に合わないと、表示が約 45 Hz に固定されることがあります：ヘッドセットを
+  冷ましてください。
+- 2.5.0 のほかの言語の音声はまだ対応していません（英語音声は動きます。字幕とメニューは全言語）。
+- 推奨：16:9、1600x900 ネイティブまたは 1280x720、FOV 110（`fov --max 110` と `settings`。ガイド参照）。
 - ゲームデータの最初の複製は大きく時間がかかる（158 GB）。
 - 有料の Apple Developer Program が必要（無料のアカウントではアプリに必要な権限を付与できない）。
 
@@ -74,7 +77,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - **下の縁**：ゲームのフレームは目の視野より狭く、残り（主に下側）はシーンの少し古いパノラマを暗くしたもの
   （`VXMAC_VR_CACHE`）で埋めています。ライブの映像ではありません。
 - **メモリ**：アプリが使える約 8.2 GB のうち約 6.5 GB。設定を上げるとアプリが終了することがあります。
-- **対応ビルドは 1 つ**（2.3.2、ハッシュで確認）。オフラインのみ（Game Center、iCloud セーブ、GOG なし）。Mod、
+- **確認済みのビルド** 2.5.0 と 2.3.2（ハッシュで確認）。オフラインのみ（Game Center、iCloud セーブ、GOG なし）。Mod、
   レイトレーシング、HDR は不可。プロファイルの期限が切れたら開発用署名をやり直します。
 - Neural Engine の機能は組み込み済みですが **既定ではオフ** です：`VXMAC_FSR=1`（中心窩の超解像）、
   `VXMAC_FOVEATE=1`（コンポジタのフォビエーション）。ほか：`VXMAC_VEL`、`VXMAC_NPU`、`VXMAC_VR_CACHE`、

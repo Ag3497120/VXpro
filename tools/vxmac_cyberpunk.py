@@ -41,6 +41,11 @@ IMAGES = [
 sys.path.insert(0, TOOLS)
 
 
+# (the executables run on the headset: their pool sites are found by pattern, macho_prepare.find_pool_sites)
+TESTED = {'3907f316f6adf9dd8188be82aeea9ae161445b2e1f6d25cf08c87b8a3ae6b421': '2.3.2',
+          '8f4a88ad201f360772b3747f51701944f39b98b4ecbf7edc6271c1cc24932844': '2.5.0'}
+
+
 def supported_sha():
     import macho_prepare
     return macho_prepare.POOL_PATCH_SHA256
@@ -140,8 +145,8 @@ def cmd_doctor(a):
         line(os.path.exists(exe), 'Cyberpunk2077.app', game)
         if os.path.exists(exe):
             digest = sha256(exe)
-            if digest == supported_sha():
-                line(True, 'executable SHA-256 %s' % digest[:16], '2.3.2 (Mac App Store): tested')
+            if digest in TESTED and (digest == supported_sha() or pool_sites_ok(exe)):
+                line(True, 'executable SHA-256 %s' % digest[:16], '%s (Mac App Store): tested' % TESTED[digest])
             else:
                 n = pool_sites_ok(exe)
                 line(n > 0, 'executable SHA-256 %s' % digest[:16],
@@ -165,10 +170,12 @@ def cmd_prepare(a):
     exe = os.path.join(game, 'Contents/MacOS/Cyberpunk2077')
     if not os.path.exists(exe): sys.exit('no %s' % exe)
     digest = sha256(exe)
-    if digest != supported_sha():
+    if digest in TESTED and digest != supported_sha() and not pool_sites_ok(exe):
+        sys.exit('the pool patterns of %s were not found: report this' % TESTED[digest])
+    if digest not in TESTED:
         if not pool_sites_ok(exe):
             sys.exit('this executable (%s) is not Cyberpunk 2077 2.3.2 and its pool patterns are not found: not supported' % digest)
-        say('WARNING: this executable (%s) is not the tested 2.3.2 build; its pool sites were found by pattern. It is '
+        say('WARNING: this executable (%s) is not a tested build (2.3.2, 2.5.0); its pool sites were found by pattern. It is '
             'untested on the headset: keep your 2.3.2 data and saves backed up.' % digest[:16])
     team = a.team or os.environ.get('VXMAC_TEAM', '')
     if len(team) != 10 or not team.isalnum(): sys.exit('--team (or $VXMAC_TEAM): your 10-character Apple Developer Team ID')
@@ -329,10 +336,18 @@ def game_running(c):
     return 'VXMacHost.app/VXMacHost' in r.stdout
 
 
+# (profiles of this tool besides tools/cp_settings.py's: 1600x900 rendered natively, no upscaler)
+EXTRA_PROFILES = {
+    'p900native': {('/video/display', 'Resolution'): '1600x900', ('/graphics/presets', 'DynamicResolutionScaling'): False,
+                   ('/graphics/presets', 'ResolutionScaling'): 'Off'},
+}
+
+
 def cmd_settings(a):
     import cp_settings
+    profiles = dict(cp_settings.PROFILES); profiles.update(EXTRA_PROFILES)
     c = load_config(); dev = need_device(c)
-    if a.profile not in cp_settings.PROFILES: sys.exit('profiles: ' + ', '.join(cp_settings.PROFILES))
+    if a.profile not in profiles: sys.exit('profiles: ' + ', '.join(profiles))
     if not a.dry_run and game_running(c): sys.exit('the game is running: quit it first (its own save would overwrite the file)')
     keep = os.path.join(WORK, 'settings'); os.makedirs(keep, exist_ok=True)
     old = os.path.join(keep, time.strftime('%Y%m%d-%H%M%S') + '.json')
@@ -342,7 +357,7 @@ def cmd_settings(a):
     if r.returncode or not os.path.exists(old):
         sys.exit('no UserSettings.json on the headset yet: launch the game once (to the main menu), quit, run settings again')
     d = json.load(open(old))
-    ch = dict(cp_settings.CHEAP); ch.update(cp_settings.PROFILES[a.profile])
+    ch = {} if a.profile == 'none' else dict(cp_settings.CHEAP); ch.update(profiles[a.profile])
     extra = dict(kv.split('=', 1) for kv in a.set if '=' in kv)   # (any other option by its name, e.g. HudSafezoneHor=0.5)
     for g in d['data']:
         for o in g['options']:

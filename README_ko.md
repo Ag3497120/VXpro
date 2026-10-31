@@ -8,16 +8,16 @@ Apple Vision Pro에서 Mac App Store 게임(Cyberpunk 2077)을 VR로 실행합�
 
 VXpro는 **Mac App Store 버전 Cyberpunk 2077**을 **Vision Pro 단독**으로 실행합니다. 게임의 Mac 빌드는 visionOS와 같은 arm64 Metal 코드이므로 네이티브로 실행됩니다: 에뮬레이션, 변환, 스트리밍, PC가 필요 없습니다. 호스트 앱(VX Mac Host)이 게임 코드를 불러오고, 게임이 사용하는 macOS 전용 라이브러리를 작은 호환 계층으로 바꾸고, 몰입형 공간에 화면을 표시합니다.
 
-**상태: Preview 0.1** (실험적, 2026-10-31).
+**상태: Preview 0.2** (실험적, 2026-11-01).
 
 ## 필요한 것
 
-> **게임 버전:** 현재는 Cyberpunk 2077 **2.3.2**(2025년 Mac App Store 빌드)만 지원합니다. 최신 Mac App Store 업데이트(App Store 버전 1.0.4, 2026년 10월 22일 공개)는 **아직 지원하지 않으며, 곧 지원할 예정입니다.** 이미 업데이트된 경우 도구는 `doctor` / `prepare` 단계에서 아무것도 바꾸지 않고 멈춥니다.
+> **게임 버전:** Cyberpunk 2077 **2.5.0**(Mac App Store 최신 업데이트)과 **2.3.2**를 지원하며, 둘 다 헤드셋에서 테스트했습니다. 영어 음성이 포함됩니다. 다른 언어의 음성에는 해당 음성 아카이브가 필요하며, 2.5.0에서는 아직 지원하지 않습니다(2.5.0의 다른 언어 음성은 Apple이 호스팅하는 다운로드입니다). 자막과 메뉴는 모든 언어에서 작동합니다.
 
 - 개발자 모드가 켜져 있고 Mac과 페어링된 **Apple Vision Pro**, 약 **160 GB의 여유 공간**;
 - **Apple 실리콘 Mac**, visionOS SDK가 포함된 **Xcode 26**, `xcodegen`, Python 3;
 - **본인의 유료 Apple Developer Program 계정** (본인 팀으로 서명);
-- **Mac App Store에서 직접 구매한 Cyberpunk 2077 (버전 2.3.2)**, Mac에 설치되어 있어야 합니다.
+- **Mac App Store에서 직접 구매한 Cyberpunk 2077 (버전 2.5.0 또는 2.3.2)**, Mac에 설치되어 있어야 합니다.
 
 ## 설치 요약
 
@@ -50,10 +50,11 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 
 탈것을 운전할 때는 게임의 **1인칭 운전 시점**을 사용하세요.
 
-## 알려진 문제 (Preview 0.1)
+## 알려진 문제 (Preview 0.2)
 
 - 종료는 양손 집기(3초 + 다시) 또는 앱 창의 **Quit game** 버튼으로 하세요. 앱을 직접 닫으면 게임이 일시 정지되고 10초 후 종료를 요청하지만, 백그라운드에서는 종료가 끝나지 않을 수 있습니다.
-- 1600x900은 M2에서 약 40 Hz: 1280x720, MetalFX 성능, FOV 110을 사용하세요 (가이드의 "Recommended settings").
+- 헤드셋이 뜨거워지거나 워프가 프레임을 놓치면 화면이 약 45 Hz로 고정될 수 있습니다: 헤드셋을 식힌 뒤 계속하세요.
+- 권장: 16:9, 1600x900 네이티브 또는 1280x720, FOV 110 (`fov --max 110`과 `settings`, 가이드 참조).
 - 게임 데이터의 첫 복사는 용량이 크고 오래 걸립니다 (158 GB).
 - 유료 Apple Developer Program 멤버십이 필요합니다 (무료 계정으로는 앱에 필요한 권한을 부여할 수 없습니다).
 

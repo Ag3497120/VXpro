@@ -1,4 +1,4 @@
-# Cyberpunk 2077 standalone on Apple Vision Pro: the Mac App Store route (Preview 0.1)
+# Cyberpunk 2077 standalone on Apple Vision Pro: the Mac App Store route (Preview 0.2)
 
 [日本語](VISION_PRO_CYBERPUNK_MAC_ja.md)
 
@@ -38,7 +38,7 @@ team. Nothing of the game is distributed by VXpro. Technical background and hist
 
 ## What it needs
 
-> **Game version:** right now only Cyberpunk 2077 **2.3.2** (the Mac App Store build from 2025) is supported. The latest Mac App Store update (App Store version 1.0.4, released 2026-10-22) is **not supported yet — support is coming soon.** If your copy has already updated, the tool stops at `doctor` / `prepare` without changing anything.
+> **Game versions:** Cyberpunk 2077 **2.5.0** (the latest Mac App Store update) and **2.3.2**, both tested on the headset. English voice is included; other voice languages need their voice archives, which are not supported yet for 2.5.0 (its other voices are Apple-hosted downloads). Subtitles and menus work in every language.
 
 - **Apple Vision Pro** with **Developer Mode** on (Settings > Privacy & Security > Developer Mode), paired with the
   Mac in Xcode (Window > Devices and Simulators). The app targets visionOS 26.0 and later; tested on an M2 Vision Pro.
@@ -51,10 +51,10 @@ team. Nothing of the game is distributed by VXpro. Technical background and hist
 - **A paid Apple Developer Program membership.** The app needs the *Increased Memory Limit* and *Extended Virtual
   Addressing* entitlements; Xcode's automatic signing adds them to your App ID, which a free personal team cannot do.
   The app is signed with **your** team and **your** bundle id.
-- **Cyberpunk 2077 from the Mac App Store, version 2.3.2**, that you bought, installed on the Mac (anywhere the Mac
-  can read, e.g. an external drive). Its executable `Contents/MacOS/Cyberpunk2077` must be exactly this build:
-  `sha256 3907f316f6adf9dd8188be82aeea9ae161445b2e1f6d25cf08c87b8a3ae6b421`. `doctor` checks it. Other versions
-  (other patches, Steam / GOG / Epic Mac builds) are refused.
+- **Cyberpunk 2077 from the Mac App Store, version 2.5.0 or 2.3.2**, that you bought, installed on the Mac (anywhere the
+  Mac can read, e.g. an external drive). `doctor` checks its executable `Contents/MacOS/Cyberpunk2077` against the tested
+  builds: 2.5.0 `sha256 8f4a88ad201f360772b3747f51701944f39b98b4ecbf7edc6271c1cc24932844`, 2.3.2 `sha256 3907f316f6adf9dd8188be82aeea9ae161445b2e1f6d25cf08c87b8a3ae6b421`. For
+  another build `prepare` works only when its memory-pool patterns are found, and warns that it is untested.
 - **Time**: the build takes minutes; copying 158 GB to the headset over the network takes longer (devicectl ran at
   roughly 30-40 MB/s on the Windows route: plan on one to two hours or more; keep the headset awake and on the
   same network).
@@ -118,28 +118,33 @@ nothing on the device). Everything the tool makes goes into `build/cyberpunk/` (
 | setting | value | why |
 |---|---|---|
 | aspect | 16:9 | the presenter's projection assumes the game's 16:9 frame |
-| resolution | **1280x720, MetalFX Performance**, dynamic resolution off | keeps the headset at 90 Hz; 1600x900 gives about 40 Hz on M2 |
+| resolution | **1600x900 native** (no upscaler) or **1280x720** (MetalFX Performance) | sharp at 1600x900; 1280x720 leaves more headroom when the headset is warm |
 | field of view | **110** | covers more of the eye's view; the game's slider stops lower, so raise its range first |
 
 ```sh
-tools/vxmac_cyberpunk.py fov --max 110                                  # patch_fov.py 110: the slider's range, in the headset's work copy only
-tools/vxmac_cyberpunk.py settings --profile p720fixed --set FieldOfView=110
+tools/vxmac_cyberpunk.py fov --max 110                                        # the slider's range, in the headset's work copy only
+tools/vxmac_cyberpunk.py settings --profile p900native --set FieldOfView=110  # or --profile p720fixed
 ```
 
-Both only while the game is not running. `fov` changes the FieldOfView slider's maximum in the work copy's
-`r6/config/settings/platform/mac/options.json` on the headset (never the App Store bundle); the file before is kept in
-`build/cyberpunk/settings/` and `tools/patch_fov.py restore <file>` puts it back.
+Both only while the game is not running. `fov` (`tools/patch_fov.py`) changes the FieldOfView slider's maximum in the
+work copy's `r6/config/settings/platform/mac/options.json` on the headset (never the App Store bundle); the file before is
+kept in `build/cyberpunk/settings/` and `tools/patch_fov.py restore <file>` puts it back.
 
-The `settings` profiles (`tools/cp_settings.py`; all of them also turn off ambient occlusion, local and contact
-shadows, motion blur and facial tangent updates):
+If the display drops to about 45 Hz after a while (the headset is hot, or the warp misses frames), take a break and let
+the headset cool down; 1280x720 keeps more headroom than 1600x900.
+
+The `settings` profiles (from `tools/cp_settings.py`, plus `p900native`; all but `none` also turn off ambient occlusion,
+local and contact shadows, motion blur and facial tangent updates):
 
 | profile | output | upscaling |
 |---|---|---|
+| `p900native` (recommended) | 1600x900 | none (native) |
 | `p720fixed` (recommended) | 1280x720 | MetalFX Performance, fixed |
 | `p720` | 1280x720 | dynamic resolution 50-65 % |
 | `p720b`, `p720q` | 1280x720 | MetalFX Balanced / Quality (heavier) |
-| `p900`, `p900perf` | 1600x900 | dynamic resolution / MetalFX Performance (about 40 Hz on M2) |
+| `p900`, `p900perf` | 1600x900 | dynamic resolution / MetalFX Performance |
 | `tall1040*` | 1040x1004 | experiments with a near-square frame (not recommended) |
+| `none` | as the game has it | only the `--set` options |
 
 `--set NAME=VALUE` sets any other option by its name, e.g. `HudSafezoneHor=0.5` (HUD further in), `HudScaling=110`.
 
@@ -226,23 +231,22 @@ Pass them at launch, `tools/vxmac_cyberpunk.py launch --env NAME=VALUE` (repeata
 
 Other `VXMAC_*` variables in the sources are debugging switches; see [`DESIGN.md`](DESIGN.md).
 
-## Known issues (Preview 0.1)
+## Known issues (Preview 0.2)
 
 Each item is independent; fixed ones will be removed from this list.
 
-- **Game 2.5.0 (when supported): English voice only** (subtitles and menus in every language work): its other voice
-  languages are Apple-hosted downloads that only the App Store app itself can fetch.
+- **Other voice languages on 2.5.0** are not supported yet: English voice works (subtitles and menus in every language).
 - **Quit with the both-hands 3 s pinch** (see "Quitting safely"): closing the app pauses the game and asks it to quit after
   10 s, which may not complete in the background.
-- **1600x900 runs at about 40 Hz on M2**: use the recommended 1280x720 (see "Recommended settings").
+- **The display can lock at about 45 Hz** when the headset gets hot or the warp misses frames: take a break and let the headset cool down, then continue.
 - **The first copy of the game's data is large and slow** (158 GB over the network).
 - **A paid Apple Developer Program membership is required** (a free account can't grant the two entitlements the
   app needs). The signing profile still expires eventually; renew it with `build` + `install`.
 
 ## Limits
 
-- **One exact build**: Cyberpunk 2077 2.3.2 from the Mac App Store (the hash above). A game update changes the
-  executable: `prepare` then refuses it until VX Mac supports the new build. Keep the version you prepared.
+- **Tested builds**: Cyberpunk 2077 2.5.0 and 2.3.2 from the Mac App Store (the hashes above). A game update changes the
+  executable: run `prepare` (and `build`, `install`) again; keep your saves backed up before trying an untested build.
 - **Memory**: about 8.2 GB for the app, Metal included; the game uses about 6.4-6.6 GB in game at reduced settings
   (it is told a 4 GB GPU working set). Higher settings or busier areas can cross the limit and visionOS ends the app.
 - **Frame rate**: about 20-30 fps from the game; head motion stays smooth through reprojection, but fast turns and
@@ -296,7 +300,7 @@ VXpro and VeRantyx are not affiliated with CD PROJEKT RED or Apple; Cyberpunk 20
 | Symptom | What to do |
 |---|---|
 | The app closes during play | most likely visionOS's memory limit: load your last save, use `settings --profile p720fixed` (the recommended one), avoid long sessions without saving. `pull` and look at `footprint_mb` and `available_mb` in the last `stats` lines of `vxmac_host.jsonl` |
-| `prepare`: "not Cyberpunk 2077 2.3.2" | another build of the game: only 2.3.2 from the Mac App Store is supported |
+| `prepare`: "... its pool patterns are not found: not supported" | a build VX Mac cannot prepare: use 2.5.0 or 2.3.2 from the Mac App Store |
 | `build`: signing errors / missing entitlements | a paid team (`doctor`), a bundle id of your own (`prepare --bundle-id`), Xcode signed in to your account |
 | `copy` stops | run `copy` again: it resumes and re-checks every file; keep the headset awake and do not install meanwhile |
 | The game starts without its data (`game_data ... null` in `vxmac_host.jsonl`) | the copy is incomplete or in the wrong place: `copy` (it verifies) |
