@@ -56,7 +56,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - 헤드셋이 뜨거워지거나 워프가 프레임을 놓치면 화면이 약 45 Hz로 고정될 수 있습니다: 헤드셋을 식힌 뒤 계속하세요.
 - 권장: 16:9, 1600x900 네이티브 또는 1280x720, FOV 110 (`fov --max 110`과 `settings`, 가이드 참조).
 - 게임 데이터의 첫 복사는 용량이 크고 오래 걸립니다 (158 GB).
-- 유료 Apple Developer Program 멤버십이 필요합니다 (무료 계정으로는 앱에 필요한 권한을 부여할 수 없습니다).
+- App Store에 제출하지 않지만 유료 Apple Developer Program 멤버십이 필요합니다. 이유는 두 가지 권한(entitlement) 때문입니다. **Increased Memory Limit**이 없으면 visionOS가 앱을 약 5 GB로 제한하여, 6~8 GB를 사용하는 게임이 로딩 중에 종료됩니다. **Extended Virtual Addressing**은 게임이 처음에 매우 넓은 가상 주소 범위를 예약하기 때문에 필요합니다. 저희가 아는 한 무료(Personal Team) 계정으로는 이 두 권한에 서명할 수 없습니다(직접 확인하지는 않았으니 시도해 보신 분은 알려 주세요). 무료 서명은 7일마다 만료되기도 합니다.
 
 ## 고지
 

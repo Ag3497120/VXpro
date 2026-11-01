@@ -240,8 +240,11 @@ Each item is independent; fixed ones will be removed from this list.
   10 s, which may not complete in the background.
 - **The display can lock at about 45 Hz** when the headset gets hot or the warp misses frames: take a break and let the headset cool down, then continue.
 - **The first copy of the game's data is large and slow** (158 GB over the network).
-- **A paid Apple Developer Program membership is required** (a free account can't grant the two entitlements the
-  app needs). The signing profile still expires eventually; renew it with `build` + `install`.
+- **A paid Apple Developer Program membership is required**, even though nothing is submitted to the App Store.
+  Without *Increased Memory Limit* visionOS caps the app at about 5 GB and the game (6-8 GB) is shut down while
+  loading; *Extended Virtual Addressing* is needed because the game reserves a very large virtual address range up
+  front. As far as we know, free (Personal Team) accounts can't sign these two (not tested ourselves; reports welcome),
+  and free signing expires every 7 days. The signing profile still expires eventually; renew it with `build` + `install`.
 
 ## Limits
 

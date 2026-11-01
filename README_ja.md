@@ -66,7 +66,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - 2.5.0 のほかの言語の音声はまだ対応していません（英語音声は動きます。字幕とメニューは全言語）。
 - 推奨：16:9、1600x900 ネイティブまたは 1280x720、FOV 110（`fov --max 110` と `settings`。ガイド参照）。
 - ゲームデータの最初の複製は大きく時間がかかる（158 GB）。
-- 有料の Apple Developer Program が必要（無料のアカウントではアプリに必要な権限を付与できない）。
+- App Store には提出しませんが、有料の Apple Developer Program が必要です。理由は 2 つのエンタイトルメントです。**Increased Memory Limit** がないと visionOS がアプリを約 5 GB に制限し、6〜8 GB 使うゲームはロード中に止められます。**Extended Virtual Addressing** は、ゲームが最初にとても広い仮想メモリの範囲を確保するために必要です。私たちの知る限り、無料（Personal Team）のアカウントではこの 2 つに署名できません（自分たちでは未確認なので、試した方はぜひ教えてください）。無料の署名は 7 日ごとに期限も切れます。
 
 ## 既知の制限
 

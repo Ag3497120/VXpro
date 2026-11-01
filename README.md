@@ -65,7 +65,7 @@ its own path (as Cmd+Q on a Mac) and the app closes. See "Controls in the headse
 - Other voice languages on 2.5.0 are not supported yet (English voice works; subtitles and menus in every language).
 - Recommended: 16:9, 1600x900 native or 1280x720, FOV 110 (`fov --max 110` + `settings`; see the guide).
 - The first copy of the game's data is large and slow (158 GB).
-- A paid Apple Developer Program membership is required (a free account can't grant the app's entitlements).
+- A paid Apple Developer Program membership is required, even though nothing goes to the App Store. The reason is two entitlements: without **Increased Memory Limit**, visionOS caps the app at about 5 GB and the game (6-8 GB) is shut down while loading; **Extended Virtual Addressing** is needed because the game reserves a very large virtual address range up front. As far as we know, free (Personal Team) accounts can't sign these two (not tested ourselves; reports welcome). Free signing also expires every 7 days.
 
 ## Known limitations
 

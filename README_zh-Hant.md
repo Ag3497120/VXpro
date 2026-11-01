@@ -56,7 +56,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - 頭戴裝置變熱或畫面變形（warp）趕不上影格時，顯示可能鎖定在約 45 Hz：請讓頭戴裝置冷卻後再繼續。
 - 建議：16:9，1600x900 原生或 1280x720，FOV 110（`fov --max 110` 和 `settings`，見指南）。
 - 首次複製遊戲資料量大且耗時（158 GB）。
-- 需要付費的 Apple Developer Program 會員資格（免費帳號無法授予應用程式所需的權限）。
+- 雖然不提交到 App Store，但仍需要付費的 Apple Developer Program 會員資格。原因是兩項權限（entitlement）：沒有 **Increased Memory Limit**，visionOS 會把應用程式限制在約 5 GB，需要 6–8 GB 的遊戲會在載入時被終止；**Extended Virtual Addressing** 是因為遊戲一開始就會預留非常大的虛擬位址範圍。據我們所知，免費（Personal Team）帳號無法簽署這兩項權限（我們自己未驗證，歡迎回報）。免費簽署每 7 天也會過期。
 
 ## 聲明
 
