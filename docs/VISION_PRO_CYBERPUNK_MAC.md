@@ -1,4 +1,4 @@
-# Cyberpunk 2077 standalone on Apple Vision Pro: the Mac App Store route (Preview 0.2)
+# Cyberpunk 2077 standalone on Apple Vision Pro: the Mac App Store route (Preview 0.3)
 
 [日本語](VISION_PRO_CYBERPUNK_MAC_ja.md)
 
@@ -20,6 +20,18 @@ team. Nothing of the game is distributed by VXpro. Technical background and hist
 > **Save often.** The app runs close to visionOS's memory limit for one app (see "Limits"). If visionOS ends it,
 > everything since your last save is lost. Use the game's manual save before long sessions, at least as often as
 > you would on a handheld.
+
+## What's new in Preview 0.3
+
+- **Long-session crash fixed.** The audio HAL path is now off by default (`VXMAC_AUDIO_HAL=1` restores it). In an A/B on
+  the headset the app was near the 8 GB memory limit after 51 minutes before the fix; after it, memory stayed flat at
+  about 5.8 GB.
+- **Recommended resolution: 1280x720 native, FOV 110.** Noticeably smoother than 1600x900: about 11 -> 17 fps in fights
+  on M2.
+- **Aiming fixes**: no more false switches to the vehicle mode while aiming down sights or strafing; the pitch no longer
+  gets stuck (you can look down again); the pitch drift is reset; the head pose is held while tracking is lost.
+- **New experimental options** (off by default): `VXMAC_AIM=1` (warp mode 7), `VXMAC_GPU_CAP_HALF=0.85`,
+  `VXMAC_INTERP=vel` / `=1`, `VXMAC_PASS_PROFILE=1` (see "Options").
 
 ## What it does today
 
@@ -118,12 +130,12 @@ nothing on the device). Everything the tool makes goes into `build/cyberpunk/` (
 | setting | value | why |
 |---|---|---|
 | aspect | 16:9 | the presenter's projection assumes the game's 16:9 frame |
-| resolution | **1600x900 native** (no upscaler) or **1280x720** (MetalFX Performance) | sharp at 1600x900; 1280x720 leaves more headroom when the headset is warm |
+| resolution | **1280x720 native** (no upscaler) | noticeably smoother than 1600x900 (about 11 -> 17 fps in fights on M2) and more headroom when the headset is warm; 1600x900 native (`p900native`) is sharper but slower |
 | field of view | **110** | covers more of the eye's view; the game's slider stops lower, so raise its range first |
 
 ```sh
 tools/vxmac_cyberpunk.py fov --max 110                                        # the slider's range, in the headset's work copy only
-tools/vxmac_cyberpunk.py settings --profile p900native --set FieldOfView=110  # or --profile p720fixed
+tools/vxmac_cyberpunk.py settings --profile p720native --set FieldOfView=110  # or --profile p900native (1600x900)
 ```
 
 Both only while the game is not running. `fov` (`tools/patch_fov.py`) changes the FieldOfView slider's maximum in the
@@ -131,15 +143,16 @@ work copy's `r6/config/settings/platform/mac/options.json` on the headset (never
 kept in `build/cyberpunk/settings/` and `tools/patch_fov.py restore <file>` puts it back.
 
 If the display drops to about 45 Hz after a while (the headset is hot, or the warp misses frames), take a break and let
-the headset cool down; 1280x720 keeps more headroom than 1600x900.
+the headset cool down; 1280x720 native keeps more headroom than 1600x900.
 
-The `settings` profiles (from `tools/cp_settings.py`, plus `p900native`; all but `none` also turn off ambient occlusion,
+The `settings` profiles (from `tools/cp_settings.py`, plus `p720native` and `p900native`; all but `none` also turn off ambient occlusion,
 local and contact shadows, motion blur and facial tangent updates):
 
 | profile | output | upscaling |
 |---|---|---|
-| `p900native` (recommended) | 1600x900 | none (native) |
-| `p720fixed` (recommended) | 1280x720 | MetalFX Performance, fixed |
+| `p720native` (recommended) | 1280x720 | none (native) |
+| `p900native` | 1600x900 | none (native; sharper, slower) |
+| `p720fixed` | 1280x720 | MetalFX Performance, fixed |
 | `p720` | 1280x720 | dynamic resolution 50-65 % |
 | `p720b`, `p720q` | 1280x720 | MetalFX Balanced / Quality (heavier) |
 | `p900`, `p900perf` | 1600x900 | dynamic resolution / MetalFX Performance |
@@ -228,10 +241,15 @@ Pass them at launch, `tools/vxmac_cyberpunk.py launch --env NAME=VALUE` (repeata
 | `VXMAC_STICK_PITCH=1` | off | keep the right stick's up / down in head control |
 | `VXMAC_GPU_WORKING_SET_MB` | 4096 | the GPU memory the game is told it has |
 | `VXMAC_AUTO_SCREEN=0` | on | cutscenes (the game ignoring your head) stay in VR instead of switching to Screen: the picture stays world-locked and nothing is sent to the game until it follows again. Also remembered from the headset: switch to **VR** with the both-hands pinch while a cutscene's Screen shows (label "VR: cutscenes stay in VR"); switch to **Screen** in VR to turn the automatic switch on again |
+| `VXMAC_AUDIO_HAL=1` | off | the old audio path through Core Audio's HAL (before Preview 0.3; it made memory grow during long sessions) |
+| `VXMAC_AIM=1` | off | **experimental**: start in warp mode 7 - a free-look cone for your head plus controller aim (`VXMAC_AIM=cycle` only adds it to the one-hand-pinch cycle) |
+| `VXMAC_GPU_CAP_HALF=0.85` | off | **experimental**: while the display is locked at 45 Hz, give the game more of the GPU (the cap it is held under) |
+| `VXMAC_INTERP=vel` / `=1` | off | **experimental**: motion prediction between game frames, from the game's velocity buffer (`vel`) or the Neural Engine model (`1`; needs a model you build yourself with `tools/interp_model.py`, none is shipped). The measured gain is small so far |
+| `VXMAC_PASS_PROFILE=1` | off | **experimental**: per-pass GPU timing of the game's frames in the logs (`tools/pass_profile.py` reads them) |
 
 Other `VXMAC_*` variables in the sources are debugging switches; see [`DESIGN.md`](DESIGN.md).
 
-## Known issues (Preview 0.2)
+## Known issues (Preview 0.3)
 
 Each item is independent; fixed ones will be removed from this list.
 

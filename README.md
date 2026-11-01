@@ -11,8 +11,20 @@ arm64 Metal code, like visionOS, so it runs natively: no emulation, no translati
 an immersive space: in 3D gameplay your head turns the game's camera and each eye is reprojected at 90 Hz from the
 game's depth; menus, cutscenes and loading screens are on a panel fixed in your room.
 
-**Status: Preview 0.2** (experimental, 2026-11-01). Main menu, character creation and the opening of the game run on an M2
+**Status: Preview 0.3** (experimental, 2026-11-01). Main menu, character creation and the opening of the game run on an M2
 Vision Pro at reduced settings, about 20-30 fps from the game with 90 Hz reprojection.
+
+## What's new in Preview 0.3
+
+- **Long-session crash fixed.** The audio HAL path is now off by default (`VXMAC_AUDIO_HAL=1` restores it). In an A/B on
+  the headset the app was near the 8 GB memory limit after 51 minutes before the fix; after it, memory stayed flat at
+  about 5.8 GB.
+- **Recommended resolution: 1280x720 native, FOV 110.** Noticeably smoother than 1600x900: about 11 -> 17 fps in fights
+  on M2.
+- **Aiming fixes**: no more false switches to the vehicle mode while aiming down sights or strafing; the pitch no longer
+  gets stuck (you can look down again); the pitch drift is reset; the head pose is held while tracking is lost.
+- **New experimental options** (off by default): `VXMAC_AIM=1` (warp mode 7), `VXMAC_GPU_CAP_HALF=0.85`,
+  `VXMAC_INTERP=vel` / `=1`, `VXMAC_PASS_PROFILE=1` (see the guide's "Options").
 
 VXpro is the Mac App Store route of [VeRantyx](https://github.com/Ag3497120/VeRantyx), where the Windows/Steam route
 (VXRuntime) lives.
@@ -57,13 +69,13 @@ its own path (as Cmd+Q on a Mac) and the app closes. See "Controls in the headse
 - It is **not affiliated with CD PROJEKT RED or Apple**. Cyberpunk 2077 is a trademark of CD PROJEKT S.A.;
   Apple Vision Pro, visionOS and Mac App Store are trademarks of Apple Inc.
 
-## Known issues (Preview 0.2)
+## Known issues (Preview 0.3)
 
 - Quit with the both-hands pinch (3 s + again) or the app window's **Quit game** button. Closing the app instead pauses
   the game and asks it to quit after 10 s, which may not complete in the background; do not force-quit it while it saves.
 - The display can lock at about 45 Hz when the headset gets hot or the warp misses frames: let the headset cool down.
 - Other voice languages on 2.5.0 are not supported yet (English voice works; subtitles and menus in every language).
-- Recommended: 16:9, 1600x900 native or 1280x720, FOV 110 (`fov --max 110` + `settings`; see the guide).
+- Recommended: 16:9, **1280x720 native**, FOV 110 (`fov --max 110` + `settings`; see the guide).
 - The first copy of the game's data is large and slow (158 GB).
 - A paid Apple Developer Program membership is required, even though nothing goes to the App Store. The reason is two entitlements: without **Increased Memory Limit**, visionOS caps the app at about 5 GB and the game (6-8 GB) is shut down while loading; **Extended Virtual Addressing** is needed because the game reserves a very large virtual address range up front. As far as we know, free (Personal Team) accounts can't sign these two (not tested ourselves; reports welcome). Free signing also expires every 7 days.
 

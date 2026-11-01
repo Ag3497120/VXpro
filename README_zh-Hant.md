@@ -8,7 +8,14 @@
 
 VXpro 讓 **Mac App Store 版 Cyberpunk 2077** 在 **Vision Pro 單機** 上執行。遊戲的 Mac 版是 arm64 Metal 程式碼，與 visionOS 相同，因此可以原生執行：沒有模擬、沒有轉譯、沒有串流、不需要 PC。主機應用程式（VX Mac Host）載入遊戲程式碼，把它用到的 macOS 專用函式庫替換為小型相容層，並在沉浸空間中顯示畫面。
 
-**狀態：Preview 0.2**（實驗性，2026-11-01）。
+**狀態：Preview 0.3**（實驗性，2026-11-01）。
+
+## Preview 0.3 的更新
+
+- **修正長時間遊玩時的當機。** 音訊 HAL 路徑現在預設關閉（`VXMAC_AUDIO_HAL=1` 可恢復）。在頭戴裝置上的比較中，修正前應用程式在 51 分鐘時接近 8 GB 記憶體上限；修正後記憶體穩定在約 5.8 GB。
+- **建議解析度：1280x720 原生，FOV 110。** 明顯比 1600x900 流暢（M2 戰鬥中約 11 → 17 fps）。
+- **瞄準修正**：瞄準（ADS）或橫移時不再誤切換到載具模式；俯仰不再卡住（可以再次向下看）；俯仰漂移會被重設；追蹤遺失時保持頭部姿態。
+- **新的實驗性選項**（預設關閉）：`VXMAC_AIM=1`（變形模式 7：自由視角錐 + 手把瞄準）、`VXMAC_GPU_CAP_HALF=0.85`、`VXMAC_INTERP=vel` / `=1`（運動預測，NPU 模型；目前實測效益很小）、`VXMAC_PASS_PROFILE=1`。
 
 ## 需要
 
@@ -50,11 +57,11 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 
 駕駛載具時請使用遊戲的**第一人稱駕駛視角**。
 
-## 已知問題（Preview 0.2）
+## 已知問題（Preview 0.3）
 
 - 請用雙手捏合（3 秒＋再次）或應用程式視窗的 **Quit game** 按鈕結束。若直接關閉應用程式，遊戲會暫停，並在 10 秒後被要求結束，但在背景可能無法完成結束。
 - 頭戴裝置變熱或畫面變形（warp）趕不上影格時，顯示可能鎖定在約 45 Hz：請讓頭戴裝置冷卻後再繼續。
-- 建議：16:9，1600x900 原生或 1280x720，FOV 110（`fov --max 110` 和 `settings`，見指南）。
+- 建議：16:9，**1280x720 原生**，FOV 110（`fov --max 110` 和 `settings`，見指南）。
 - 首次複製遊戲資料量大且耗時（158 GB）。
 - 雖然不提交到 App Store，但仍需要付費的 Apple Developer Program 會員資格。原因是兩項權限（entitlement）：沒有 **Increased Memory Limit**，visionOS 會把應用程式限制在約 5 GB，需要 6–8 GB 的遊戲會在載入時被終止；**Extended Virtual Addressing** 是因為遊戲一開始就會預留非常大的虛擬位址範圍。據我們所知，免費（Personal Team）帳號無法簽署這兩項權限（我們自己未驗證，歡迎回報）。免費簽署每 7 天也會過期。
 

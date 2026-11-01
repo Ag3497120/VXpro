@@ -336,8 +336,10 @@ def game_running(c):
     return 'VXMacHost.app/VXMacHost' in r.stdout
 
 
-# (profiles of this tool besides tools/cp_settings.py's: 1600x900 rendered natively, no upscaler)
+# (profiles of this tool besides tools/cp_settings.py's: 1280x720 / 1600x900 rendered natively, no upscaler)
 EXTRA_PROFILES = {
+    'p720native': {('/video/display', 'Resolution'): '1280x720', ('/graphics/presets', 'DynamicResolutionScaling'): False,
+                   ('/graphics/presets', 'ResolutionScaling'): 'Off'},
     'p900native': {('/video/display', 'Resolution'): '1600x900', ('/graphics/presets', 'DynamicResolutionScaling'): False,
                    ('/graphics/presets', 'ResolutionScaling'): 'Off'},
 }
@@ -416,7 +418,7 @@ def main():
     for name in ('install', 'copy', 'settings', 'fov', 'launch', 'pull'):
         p = sp.add_parser(name); p.add_argument('--dry-run', action='store_true')
         if name == 'copy': p.add_argument('--tries', type=int, default=8)
-        if name == 'settings': p.add_argument('--profile', default='p720fixed'); p.add_argument('--set', action='append', default=[])
+        if name == 'settings': p.add_argument('--profile', default='p720native'); p.add_argument('--set', action='append', default=[])
         if name == 'launch':
             p.add_argument('--restart', action='store_true', help='end a running instance first (unsaved progress is lost)')
             p.add_argument('--env', action='append', default=[], help='NAME=VALUE for the app (e.g. VXMAC_FSR=1)')
