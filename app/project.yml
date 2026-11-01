@@ -63,3 +63,4 @@ targets:
       - sdk: Vision.framework
       - sdk: CoreVideo.framework
       - sdk: CoreML.framework
+      - sdk: libcompression.tbd

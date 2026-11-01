@@ -7,6 +7,8 @@
 #   p720       1280x720 output, dynamic resolution 50-65 %
 #   p720fixed  1280x720 output, no dynamic resolution, MetalFX Performance (a fixed 50 %: MetalFX temporal may run,
 #              which also gives the presenter the game's depth and motion vectors)
+#   native900 / drs / drs_mfx  (h63d) the per-pass profile's resolution A/B: today's native 1600x900, the game's own
+#              dynamic resolution 50-100 % at 30 fps target (plain / MetalFX Dynamic); p900perf = MetalFX Performance
 import json, os, subprocess, sys, time
 DEV = os.environ.get('VXMAC_DEVICE', ''); APP = os.environ.get('VXMAC_BUNDLE_ID', '')   # (or tools/vxmac_cyberpunk.py settings)
 PATH = 'Library/Application Support/CD Projekt Red/Cyberpunk 2077/UserSettings.json'
@@ -47,6 +49,23 @@ PROFILES = {
     'p900perf': {('/video/display', 'Resolution'): '1600x900', ('/graphics/presets', 'DynamicResolutionScaling'): False,
                  ('/graphics/presets', 'ResolutionScaling'): 'MetalFX', ('/graphics/presets', 'MetalFX'): 'Performance',
                  ('/interface/hudSafezones', 'HudSafezoneHor'): 0.0, ('/video/display', 'MaximumFPS_OnOff'): False},
+    # (h63d, game-side resolution levers for the per-pass profile's A/B (VXMAC_PASS_PROFILE=1): the game's own dynamic
+    #  resolution at 1600x900 output, 50-100 %, its target 30 fps (it lowers the render size while it misses it) -
+    #  plain (its own upscale; 2.3.2's h51/h52 ran this way at 1067x600-1600x900 with no MetalFX encode) and through
+    #  MetalFX's Dynamic mode (whether the game then calls MetalFX temporal: fx_encodes in the stats). HUD safe zone 0)
+    'drs': {('/video/display', 'Resolution'): '1600x900', ('/graphics/presets', 'ResolutionScaling'): 'Off',
+            ('/graphics/presets', 'DynamicResolutionScaling'): True, ('/graphics/presets', 'DRS_TargetFPS'): 30,
+            ('/graphics/presets', 'DRS_MinResolution'): 50, ('/graphics/presets', 'DRS_MaxResolution'): 100,
+            ('/interface/hudSafezones', 'HudSafezoneHor'): 0.0, ('/video/display', 'MaximumFPS_OnOff'): False},
+    'drs_mfx': {('/video/display', 'Resolution'): '1600x900', ('/graphics/presets', 'ResolutionScaling'): 'MetalFX',
+                ('/graphics/presets', 'MetalFX'): 'Dynamic', ('/graphics/presets', 'DynamicResolutionScaling'): True,
+                ('/graphics/presets', 'DRS_TargetFPS'): 30, ('/graphics/presets', 'DRS_MinResolution'): 50,
+                ('/graphics/presets', 'DRS_MaxResolution'): 100, ('/interface/hudSafezones', 'HudSafezoneHor'): 0.0,
+                ('/video/display', 'MaximumFPS_OnOff'): False},
+    # (h63d: today's headset settings - native 1600x900, no upscaling, no dynamic resolution: the profile's baseline)
+    'native900': {('/video/display', 'Resolution'): '1600x900', ('/graphics/presets', 'ResolutionScaling'): 'Off',
+                  ('/graphics/presets', 'DynamicResolutionScaling'): False, ('/interface/hudSafezones', 'HudSafezoneHor'): 0.0,
+                  ('/video/display', 'MaximumFPS_OnOff'): False},
     # (h56: nothing but the NAME=VALUE arguments - e.g. `cp_settings.py none FieldOfView=110.0`, the rest as the game has it)
     'none': {},
     'p720fixed': {('/video/display', 'Resolution'): '1280x720', ('/graphics/presets', 'DynamicResolutionScaling'): False,

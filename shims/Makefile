@@ -17,8 +17,8 @@ all: $(addprefix $(OUT)/,$(addsuffix .dylib,$(LIBS)))
 
 $(OUT):
 	mkdir -p $@
-$(OUT)/libvxkit.dylib: vxkit.m vxmac.h | $(OUT)
-	$(CC) $(CFLAGS) $(DY) vxkit.m -o $@ -framework Foundation -framework QuartzCore -framework CoreGraphics
+$(OUT)/libvxkit.dylib: vxkit.m vxaudio.m vxmac.h | $(OUT)
+	$(CC) $(CFLAGS) $(DY) vxkit.m vxaudio.m -o $@ -framework Foundation -framework QuartzCore -framework CoreGraphics
 $(OUT)/libvxcocoa.dylib: vxempty.c $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxempty.c -o $@ -Wl,-reexport_library,$(OUT)/libvxkit.dylib -Wl,-reexport_framework,Foundation
 $(OUT)/libvxaudiounit.dylib: vxempty.c | $(OUT)
@@ -35,12 +35,12 @@ $(OUT)/libvxgk.dylib: vxgk.m | $(OUT)
 	$(CC) $(CFLAGS) $(DY) vxgk.m -o $@ -Wl,-reexport_framework,GameKit -framework Foundation
 $(OUT)/libvxcurl.dylib: vxcurl.c $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxcurl.c -o $@ $(OUT)/libvxkit.dylib
-$(OUT)/libvxmtl.dylib: vxmtl.m vxpipe.m $(OUT)/libvxkit.dylib
-	$(CC) $(CFLAGS) $(DY) vxmtl.m vxpipe.m -o $@ -Wl,-reexport_framework,Metal -framework Foundation -framework QuartzCore $(OUT)/libvxkit.dylib
+$(OUT)/libvxmtl.dylib: vxmtl.m vxpipe.m vxprof.m vxprof.h $(OUT)/libvxkit.dylib
+	$(CC) $(CFLAGS) $(DY) vxmtl.m vxpipe.m vxprof.m -o $@ -Wl,-reexport_framework,Metal -framework Foundation -framework QuartzCore $(OUT)/libvxkit.dylib
 $(OUT)/libvxmtlfx.dylib: vxmtlfx.m $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxmtlfx.m -o $@ $(FXLINK) -framework Foundation -framework Metal -framework QuartzCore $(OUT)/libvxkit.dylib
-$(OUT)/libvxsystem.dylib: vxsystem.c | $(OUT)
-	$(CC) $(CFLAGS) $(DY) vxsystem.c -o $@ -Wl,-reexport-lSystem
+$(OUT)/libvxsystem.dylib: vxsystem.c vxmtrace.c | $(OUT)
+	$(CC) $(CFLAGS) $(DY) vxsystem.c vxmtrace.c -o $@ -Wl,-reexport-lSystem
 
 # (Mac tests of the Metal / MetalFX parts with DYLD_INSERT_LIBRARIES: they need vxmac_log, from a small log unit)
 mac: $(MOUT)/libvxmtl.dylib $(MOUT)/libvxmtlfx.dylib
@@ -48,8 +48,8 @@ $(MOUT):
 	mkdir -p $@
 $(MOUT)/libvxlog.dylib: vxlog_mac.c | $(MOUT)
 	$(MCC) $(MCFLAGS) $(DY) vxlog_mac.c -o $@
-$(MOUT)/libvxmtl.dylib: vxmtl.m vxpipe.m $(MOUT)/libvxlog.dylib
-	$(MCC) $(MCFLAGS) $(DY) vxmtl.m vxpipe.m -o $@ -framework Foundation -framework Metal -framework QuartzCore $(MOUT)/libvxlog.dylib -Wl,-rpath,@loader_path
+$(MOUT)/libvxmtl.dylib: vxmtl.m vxpipe.m vxprof.m vxprof.h $(MOUT)/libvxlog.dylib
+	$(MCC) $(MCFLAGS) $(DY) vxmtl.m vxpipe.m vxprof.m -o $@ -framework Foundation -framework Metal -framework QuartzCore $(MOUT)/libvxlog.dylib -Wl,-rpath,@loader_path
 $(MOUT)/libvxmtlfx.dylib: vxmtlfx.m $(MOUT)/libvxlog.dylib
 	$(MCC) $(MCFLAGS) $(DY) vxmtlfx.m -o $@ -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore $(MOUT)/libvxlog.dylib -Wl,-rpath,@loader_path
 

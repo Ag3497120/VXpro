@@ -31,3 +31,7 @@ IFS="$OLDIFS"
 # (the foveated SR's compiled Core ML models (tools/fsr_model.py -> ../build/fsr), made by tools/vxmac_cyberpunk.py build,
 #  into Resources when they are there)
 for m in "$SRCROOT/../build/fsr"/*.mlmodelc; do [ -d "$m" ] && rm -rf "$RES/$(basename "$m")" && cp -R "$m" "$RES/"; done
+# (method 3: the frame-prediction model the app loads with VXMAC_INTERP=1 (npu_model.m: vxinterp_416x240.mlmodelc in
+#  Resources), from VXMAC_INTERP_MODELS (default ../build/interp_app: the trained model copied there, e.g.
+#  build/interp_run1/vxinterp_416x240.mlmodelc), when it is there; none is committed)
+for m in "${VXMAC_INTERP_MODELS:-$SRCROOT/../build/interp_app}"/*.mlmodelc; do if [ -d "$m" ]; then rm -rf "$RES/$(basename "$m")"; cp -R "$m" "$RES/"; fi; done

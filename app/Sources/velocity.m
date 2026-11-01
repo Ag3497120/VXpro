@@ -126,3 +126,14 @@ int vxmac_vel_take(void **mv, float *mvs_x, float *mvs_y) {
     pthread_mutex_unlock(&g_l);
     return fresh;
 }
+
+// (method 3, interp_frame.h) The newest copy as it is, verified or not, with the verification's scale and correlation:
+// for the training capture and the model (they record or apply the scale themselves). Valid for this present.
+void *vxmac_vel_latest_tex(uint32_t *w, uint32_t *h, float k[2], float *corr, int *verified) {
+    pthread_mutex_lock(&g_l);
+    id<MTLTexture> t = g_latest;
+    if (t) { *w = (uint32_t)t.width; *h = (uint32_t)t.height; }
+    k[0] = g_kx; k[1] = g_ky; *corr = g_corr; *verified = g_ok;
+    pthread_mutex_unlock(&g_l);
+    return (__bridge void *)t;
+}

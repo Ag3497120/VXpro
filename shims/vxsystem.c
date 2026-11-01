@@ -75,7 +75,11 @@ struct dirent *readdir(DIR *d) {
 }
 
 // - sysctlbyname("hw.memsize"): the game's images ask it to size their memory budgets. VXMAC_MEMSIZE_MB reports that
-//   instead (off by default); each call's real figure is logged once.
+//   instead (off by default); each call's real figure is logged once. (h62: what it decides - Cyberpunk2077 +0x1b060, a
+//   "low-memory device" test (hw.memsize >> 30 < 10, kept after its first answer) that 39 sites read, e.g. a 1 MB
+//   buffer made 512 KB at start (+0x3426c); the engine's VM backend keeps it too (+0x14450). The headset reports
+//   15744 MB while the app may use ~8 GB: VXMAC_MEMSIZE_MB=8192 takes the game's own low-memory path. sysctl() with
+//   {CTL_HW, HW_MEMSIZE} is answered the same way; libvxkit's NSProcessInfo.physicalMemory too.)
 #include <sys/sysctl.h>
 int sysctlbyname(const char *name, void *old, size_t *oldlen, void *newp, size_t newlen) {
     static int (*real)(const char *, void *, size_t *, void *, size_t);
@@ -93,15 +97,38 @@ int sysctlbyname(const char *name, void *old, size_t *oldlen, void *newp, size_t
     return r;
 }
 
-// - mmap / mprotect / munmap of the game's images, watched (VXMAC_VM_WATCH=0: off): each reservation of 256 MB or
-//   more is logged with its caller, and how far into it the program has committed (mprotect to readable or writable,
+int sysctl(int *mib, u_int n, void *old, size_t *oldlen, void *newp, size_t newlen) {
+    static int (*real)(int *, u_int, void *, size_t *, void *, size_t);
+    if (!real) real = (int (*)(int *, u_int, void *, size_t *, void *, size_t))libsys("sysctl");
+    int r = real(mib, n, old, oldlen, newp, newlen);
+    if (r == 0 && mib && n == 2 && mib[0] == CTL_HW && mib[1] == HW_MEMSIZE && old && oldlen && *oldlen == 8) {
+        static int logged;
+        if (!logged++) fprintf(stderr, "vxmac: sysctl {hw, memsize} %llu MB%s\n", (unsigned long long)(*(uint64_t *)old >> 20), getenv("VXMAC_MEMSIZE_MB") ? " (reported differently: VXMAC_MEMSIZE_MB)" : "");
+        const char *e = getenv("VXMAC_MEMSIZE_MB");
+        if (e && *e) *(uint64_t *)old = strtoull(e, NULL, 10) << 20;
+    }
+    return r;
+}
+
+// - mmap / mprotect / munmap / madvise of the game's images, watched (VXMAC_VM_WATCH=0: off): each reservation of 256 MB
+//   or more is logged with its caller, and how far into it the program has committed (mprotect to readable or writable,
 //   or a MAP_FIXED map inside it) is logged as it passes 50, 75, 90 and 100 % of it: a pool the size patch made too
-//   small shows here before it overflows.
+//   small shows here before it overflows. (h62: a reservation mapped readable and writable at once - the engine's
+//   Darwin backend (Cyberpunk2077 +0x14700: mmap RW, commit = madvise MADV_FREE_REUSE, decommit = MADV_FREE_REUSABLE,
+//   release = munmap) - is not reported as "committed": its pages count only as the program writes them. munmap drops
+//   a reservation (logged with its own size, "vm: release"), so one reserved again at the same place is a new one.)
+//   Counters for the host's "mem" line (vxsys_vm_stats): the program's own mappings still mapped (MB), maps and
+//   unmaps, the bytes it decommitted (REUSABLE) and recommitted (REUSE) and its other madvise calls, mprotect to none,
+//   and the reservations that hold the most memory (dirty + compressed, from the VM itself).
 #include <sys/mman.h>
 #include <mach-o/dyld.h>
-typedef struct { uintptr_t base, size, hi; int step; } vx_res;
-static vx_res g_res[96]; static int g_nres;
+#include <mach/mach.h>
+#include <stdatomic.h>
+typedef struct { uintptr_t base, size, hi; int step, rw; char caller[48]; } vx_res;
+static vx_res g_res[128]; static int g_nres;
 static pthread_mutex_t g_res_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_map_live, g_maps, g_unmaps, g_adv_reusable, g_adv_reuse, g_adv_free, g_adv_dontneed, g_adv_other, g_adv_calls,
+                        g_prot_none;
 static int vm_watch(void) { static int w = -1; if (w < 0) { const char *e = getenv("VXMAC_VM_WATCH"); w = !e || strcmp(e, "0"); } return w; }
 static void caller_of(void *ra, char *out, size_t n) {
     Dl_info di;
@@ -113,6 +140,7 @@ static void commit_seen(uintptr_t a, size_t len, void *ra) {
     for (int i = 0; i < g_nres; i++) {
         vx_res *r = &g_res[i];
         if (a < r->base || a >= r->base + r->size) continue;
+        if (r->rw) break;   // (mapped writable from the start: nothing to learn from a commit)
         uintptr_t end = a + len - r->base; if (end > r->size) end = r->size;
         if (end > r->hi) {
             r->hi = end;
@@ -133,23 +161,99 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     if (!real) real = (void *(*)(void *, size_t, int, int, int, off_t))libsys("mmap");
     void *p = real(addr, len, prot, flags, fd, off);
     if (!vm_watch() || p == MAP_FAILED) return p;
+    if (!(flags & MAP_FIXED)) { g_map_live += len; g_maps++; }
     if ((flags & MAP_FIXED) && prot != PROT_NONE) commit_seen((uintptr_t)p, len, __builtin_return_address(0));
     else if (len >= (256u << 20) && !(flags & MAP_FIXED)) {
         char c[160]; caller_of(__builtin_return_address(0), c, sizeof c);
         fprintf(stderr, "vxmac: vm: reserve %lu MB prot %d at %p by %s\n", (unsigned long)(len >> 20), prot, p, c);
         pthread_mutex_lock(&g_res_lock);
-        if (g_nres < 96) { g_res[g_nres].base = (uintptr_t)p; g_res[g_nres].size = len; g_res[g_nres].hi = 0; g_res[g_nres].step = 0; g_nres++; }
+        if (g_nres < 128) {
+            vx_res *r = &g_res[g_nres++]; memset(r, 0, sizeof *r);
+            r->base = (uintptr_t)p; r->size = len; r->rw = (prot & PROT_WRITE) != 0; snprintf(r->caller, sizeof r->caller, "%s", c);
+        }
         pthread_mutex_unlock(&g_res_lock);
         if (prot != PROT_NONE) commit_seen((uintptr_t)p, len, __builtin_return_address(0));
     }
     return p;
 }
+int munmap(void *addr, size_t len) {
+    static int (*real)(void *, size_t);
+    if (!real) real = (int (*)(void *, size_t))libsys("munmap");
+    int r = real(addr, len);
+    if (r || !vm_watch()) return r;
+    g_unmaps++;
+    { uint64_t l = atomic_load(&g_map_live); while (!atomic_compare_exchange_weak(&g_map_live, &l, l > len ? l - len : 0)) {} }
+    uintptr_t a = (uintptr_t)addr, e = a + len;
+    pthread_mutex_lock(&g_res_lock);
+    for (int i = 0; i < g_nres; i++) {
+        vx_res *x = &g_res[i];
+        if (e <= x->base || a >= x->base + x->size) continue;
+        if (a <= x->base && e >= x->base + x->size) {   // (all of it: gone)
+            fprintf(stderr, "vxmac: vm: release %lu MB at %#lx (reserved by %s)\n", (unsigned long)(x->size >> 20), (unsigned long)x->base, x->caller);
+            g_res[i--] = g_res[--g_nres];
+        } else if (a <= x->base) { x->size -= e - x->base; x->base = e; }       // (its head trimmed)
+        else if (e >= x->base + x->size) x->size = a - x->base;                 // (its tail trimmed)
+    }
+    pthread_mutex_unlock(&g_res_lock);
+    return r;
+}
 int mprotect(void *addr, size_t len, int prot) {
     static int (*real)(void *, size_t, int);
     if (!real) real = (int (*)(void *, size_t, int))libsys("mprotect");
     int r = real(addr, len, prot);
-    if (r == 0 && vm_watch() && prot != PROT_NONE) commit_seen((uintptr_t)addr, len, __builtin_return_address(0));
+    if (r == 0 && vm_watch()) { if (prot != PROT_NONE) commit_seen((uintptr_t)addr, len, __builtin_return_address(0)); else g_prot_none += len; }
     return r;
+}
+int madvise(void *addr, size_t len, int adv) {
+    static int (*real)(void *, size_t, int);
+    if (!real) real = (int (*)(void *, size_t, int))libsys("madvise");
+    int r = real(addr, len, adv);
+    if (r == 0 && vm_watch()) {
+        g_adv_calls++;
+        switch (adv) {
+        case MADV_FREE_REUSABLE: g_adv_reusable += len; break;
+        case MADV_FREE_REUSE: g_adv_reuse += len; break;
+        case MADV_FREE: g_adv_free += len; break;
+        case MADV_DONTNEED: g_adv_dontneed += len; break;
+        default: g_adv_other += len;
+        }
+    }
+    return r;
+}
+// (the dirty + compressed memory of [a, a + n): its regions' pages - what the footprint has of it)
+static uint64_t held_bytes(uintptr_t a0, uintptr_t n) {
+    uint64_t pg = vm_page_size, sum = 0;
+    vm_address_t a = a0; uintptr_t end = a0 + n;
+    while (a < end) {
+        vm_size_t sz = 0; natural_t depth = 0; vm_region_submap_info_data_64_t ri; mach_msg_type_number_t c = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_64_t)&ri, &c) != KERN_SUCCESS || a >= end) break;
+        sum += ((uint64_t)ri.pages_dirtied + ri.pages_swapped_out) * pg;   // (reusable pages are not counted dirty)
+        a += sz;
+    }
+    return sum;
+}
+void vxsys_vm_stats(char *out, unsigned n) {
+    if (!vm_watch()) { snprintf(out, n, "\"game_vm\":null"); return; }
+    vx_res r[128]; int nr;
+    pthread_mutex_lock(&g_res_lock); nr = g_nres; memcpy(r, g_res, (size_t)nr * sizeof *r); pthread_mutex_unlock(&g_res_lock);
+    uint64_t held[128], total = 0;
+    for (int i = 0; i < nr; i++) { held[i] = held_bytes(r[i].base, r[i].size); total += held[i]; }
+    char top[700] = ""; size_t k = 0;
+    for (int t = 0; t < 8; t++) {   // (the eight that hold the most)
+        int best = -1; for (int i = 0; i < nr; i++) if (held[i] && (best < 0 || held[i] > held[best])) best = i;
+        if (best < 0) break;
+        const char *pl = strchr(r[best].caller, '+');
+        k += (size_t)snprintf(top + k, sizeof top - k, "%s[\"%#lx\",%lu,%llu,\"%s\"]", t ? "," : "", (unsigned long)r[best].base,
+                              (unsigned long)(r[best].size >> 20), (unsigned long long)(held[best] >> 20), pl ? pl + 1 : r[best].caller);
+        held[best] = 0; if (k >= sizeof top) break;
+    }
+#define MB(x) (unsigned long long)(atomic_load(&x) >> 20)
+    snprintf(out, n, "\"game_vm\":{\"mapped_mb\":%llu,\"maps\":%llu,\"unmaps\":%llu,\"reservations\":%d,\"res_held_mb\":%llu,"
+             "\"decommit_mb\":%llu,\"recommit_mb\":%llu,\"madv_free_mb\":%llu,\"madv_dontneed_mb\":%llu,\"madv_other_mb\":%llu,\"madvise_calls\":%llu,"
+             "\"prot_none_mb\":%llu,\"top\":[%s]}",
+             MB(g_map_live), (unsigned long long)g_maps, (unsigned long long)g_unmaps, nr, (unsigned long long)(total >> 20),
+             MB(g_adv_reusable), MB(g_adv_reuse), MB(g_adv_free), MB(g_adv_dontneed), MB(g_adv_other), (unsigned long long)g_adv_calls, MB(g_prot_none), top);
+#undef MB
 }
 
 // - popen: visionOS has no shell. The game asks `system_profiler SPDisplaysDataType | grep "Chipset Model:"` for its

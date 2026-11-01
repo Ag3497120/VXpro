@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <TargetConditionals.h>
 #include "vxmac.h"
+#include "vxprof.h"
 
 // ---- device observers --------------------------------------------------------------------------------------------
 #if TARGET_OS_VISION   // (macOS has its own)
@@ -103,13 +104,16 @@ static void drawable_frame_end(void) {
 static void cam_frame_end(void);
 static int hooked(id cb, id drawable) {
     g_presents++;
+    vxprof_frame();   // (VXMAC_PASS_PROFILE: the sampled frames run present to present)
     cam_frame_end();
     drawable_frame_end();
     inflight_release_after(cb, drawable);
     if (!g_hook || ![drawable conformsToProtocol:@protocol(CAMetalDrawable)]) return 1;
     id<MTLTexture> t = ((id<CAMetalDrawable>)drawable).texture;
     g_drawable_presents++;
+    if (vxprof_enabled) vxprof_ours(1);
     int keep = g_hook((__bridge void *)cb, (__bridge void *)t, (uint32_t)t.width, (uint32_t)t.height);
+    if (vxprof_enabled) vxprof_ours(-1);
     if (!keep) g_dropped++;
     return keep;
 }
@@ -122,6 +126,7 @@ static _Atomic unsigned long g_held_commits;
 void vxmtl_set_foreground(int fg) {
     pthread_mutex_lock(&g_fg_lock); g_fg = fg; pthread_cond_broadcast(&g_fg_cond); pthread_mutex_unlock(&g_fg_lock);
     vxmac_log("Metal: %s", fg ? "foreground: commits go through" : "background: the program's commits wait");
+    if (!fg) { void vxpipe_archive_flush(const char *); vxpipe_archive_flush("background"); }
 }
 // (GPU busy time of the program's command buffers - GPU-bound or CPU-bound: the union of their GPU intervals per
 //  stats period, against the wall time; the compositor's own queue is left out)
@@ -156,14 +161,38 @@ static double g_gpu_cap = -1; static int g_warp_hold = -1; static _Atomic int g_
 static _Atomic unsigned long g_pace_waits, g_pace_us;
 // (h60f: the cap follows the compositor's misses - VXMacImmersive.swift reports each 5 s window's missed deadlines: over
 //  3 -> the cap 0.05 lower (to 0.55 at least), six clean windows in a row -> 0.05 back up to its start; logged)
+// (h64: at half rate - VXMAC_GPU_CAP_HALF=<cap> (off when unset; e.g. 0.85): once the compositor has presented every
+//  22.2 ms (21-24 ms: visionOS's half rate, which it keeps for the session once it has locked there) for 3 windows in a
+//  row (15 s), the warp needs half the GPU time it had at 90 Hz and the cap's start becomes <cap>; back to VXMAC_GPU_CAP
+//  as soon as a window presents under 15 ms (90 Hz again). The misses rule above holds in both: over 3 -> 0.05 lower
+//  (to 0.55), six clean windows -> 0.05 up to the start of the rate it is at. Logged; stats gpu_cap, gpu_cap_half)
+static double g_cap_base = -1, g_cap_half_v = -1; static int g_half_windows, g_half_on; static double g_present_ms;
+static void cap_init(void) {
+    if (g_cap_half_v >= 0) return;
+    const char *e = getenv("VXMAC_GPU_CAP_HALF"); g_cap_half_v = e && *e ? atof(e) : 0;
+    if (g_cap_half_v > 0.95) g_cap_half_v = 0.95;
+    if (g_cap_half_v > 0) vxmac_log("Metal: at the compositor's half rate the game's GPU share may rise to %.2f (VXMAC_GPU_CAP_HALF)", g_cap_half_v);
+}
+void vxmtl_compositor_interval(double ms) {   // (VXMacImmersive.swift: each 5 s window's mean present interval, before its misses)
+    cap_init(); g_present_ms = ms;
+    if (g_gpu_cap <= 0 || g_cap_half_v <= 0) return;
+    if (g_cap_base < 0) g_cap_base = g_gpu_cap;
+    if (ms > 21 && ms < 24) g_half_windows++; else if (ms > 0) g_half_windows = 0;
+    double was = g_gpu_cap;
+    if (!g_half_on && g_half_windows >= 3) { g_half_on = 1; if (g_gpu_cap < g_cap_half_v) g_gpu_cap = g_cap_half_v; }
+    else if (g_half_on && ms > 0 && ms < 15) { g_half_on = 0; if (g_gpu_cap > g_cap_base) g_gpu_cap = g_cap_base; }
+    if (g_gpu_cap != was) vxmac_log("Metal: the compositor at %.1f ms a frame: the game's GPU share cap %.2f -> %.2f (%s)", ms, was, g_gpu_cap, g_half_on ? "half rate" : "full rate again");
+}
+double vxmtl_gpu_cap(int *half) { if (half) *half = g_half_on; return g_gpu_cap; }
 void vxmtl_pacing_report(int missed) {
-    static double base = -1; static int clean;
+    static int clean;
     if (g_gpu_cap <= 0) return;
-    if (base < 0) base = g_gpu_cap;
+    if (g_cap_base < 0) g_cap_base = g_gpu_cap;
+    double top = g_half_on && g_cap_half_v > g_cap_base ? g_cap_half_v : g_cap_base;
     double was = g_gpu_cap;
     if (missed > 3) { clean = 0; if (g_gpu_cap > 0.55) g_gpu_cap -= 0.05; }
-    else if (missed == 0 && ++clean >= 6) { clean = 0; if (g_gpu_cap < base - 1e-6) g_gpu_cap += 0.05; }
-    if (g_gpu_cap != was) vxmac_log("Metal: the game's GPU share capped at %.2f (%d deadlines missed in 5 s)", g_gpu_cap, missed);
+    else if (missed == 0 && ++clean >= 6) { clean = 0; if (g_gpu_cap < top - 1e-6) g_gpu_cap += 0.05; }
+    if (g_gpu_cap != was) vxmac_log("Metal: the game's GPU share capped at %.2f (%d deadlines missed in 5 s%s)", g_gpu_cap, missed, g_half_on ? ", half rate" : "");
 }
 void vxmtl_warp_begin(void) { atomic_fetch_add(&g_warps_in_flight, 1); }
 void vxmtl_warp_end(void) { if (atomic_fetch_sub(&g_warps_in_flight, 1) <= 0) atomic_store(&g_warps_in_flight, 0); }
@@ -227,18 +256,54 @@ static void pass_note(id d) {   // (each distinct depth attachment shape once: t
                       (unsigned long)t.pixelFormat, (unsigned long)t.textureType, (unsigned long)t.sampleCount, (unsigned long)t.arrayLength,
                       t.parentTexture ? " (a view)" : "");
 }
+// (h64: what we attach to the game's encoders, dropped when the encoder ends - nothing of ours is read after its
+//  endEncoding, and the objects go now rather than with the encoder's dealloc. ddgame63d's malloc grew ~16 blocks per
+//  game command buffer, steadily: if the device's encoders were freed without the runtime's association cleanup, each
+//  one's records would stay. A sampled probe (1 encoder in 16 we tag; never dropped) tells: "enc_probes_live" in the
+//  mem line stays small when the encoders' dealloc frees what is attached to them, and grows with the encoders if not.
+//  VXMAC_ENC_CLEAR=0: not dropped (as before))
+static const void *kScan, *kUI, *kUIcb, *kUIhit, *kProbe = &kProbe;
+static _Atomic long g_probe_made, g_probe_live, g_enc_cleared;
+@interface VXEncProbe : NSObject
+@end
+@implementation VXEncProbe
+- (void)dealloc { atomic_fetch_sub(&g_probe_live, 1); }
+@end
+static void enc_probe(id e) {
+    static _Atomic unsigned n;
+    if (!e || (atomic_fetch_add(&n, 1) & 15)) return;
+    atomic_fetch_add(&g_probe_made, 1); atomic_fetch_add(&g_probe_live, 1);
+    objc_setAssociatedObject(e, kProbe, [VXEncProbe new], OBJC_ASSOCIATION_RETAIN);
+}
+void vxpipe_enc_clear(id e);   // (vxpipe.m: its own key)
+static void enc_clear(id e) {
+    static int on = -1; if (on < 0) { const char *v = getenv("VXMAC_ENC_CLEAR"); on = !(v && !strcmp(v, "0")); }
+    if (!on || !e) return;
+    const void *keys[] = { kPassTargets, kPassCB, kPassDepth, kPassStore, kScan, kUI, kUIcb, kUIhit };
+    int any = 0;
+    for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++) if (objc_getAssociatedObject(e, keys[i])) { objc_setAssociatedObject(e, keys[i], nil, OBJC_ASSOCIATION_ASSIGN); any = 1; }
+    vxpipe_enc_clear(e);
+    if (any) atomic_fetch_add(&g_enc_cleared, 1);
+}
+void vxmtl_enc_stats(char *out, unsigned n) {
+    snprintf(out, n, "\"enc_probes\":%ld,\"enc_probes_live\":%ld,\"enc_cleared\":%ld", atomic_load(&g_probe_made), atomic_load(&g_probe_live), atomic_load(&g_enc_cleared));
+}
 static void h_pend(id self, SEL s) {   // (a parallel encoder: its pass ends with it)
     o_pend(self, s);
     targets_end(self);
-    if (!g_pass_hook) return;
-    id cb = objc_getAssociatedObject(self, kPassCB), d = objc_getAssociatedObject(self, kPassDepth);
-    if (cb && d) g_pass_hook((__bridge void *)cb, (__bridge void *)d, [objc_getAssociatedObject(self, kPassStore) intValue]);
+    if (g_pass_hook) {
+        id cb = objc_getAssociatedObject(self, kPassCB), d = objc_getAssociatedObject(self, kPassDepth);
+        if (cb && d) { if (vxprof_enabled) vxprof_ours(1); g_pass_hook((__bridge void *)cb, (__bridge void *)d, [objc_getAssociatedObject(self, kPassStore) intValue]); if (vxprof_enabled) vxprof_ours(-1); }
+    }
+    enc_clear(self);
 }
 static void targets_end(id enc) {
     if (!g_target_hook) return;
     NSArray *ts = objc_getAssociatedObject(enc, kPassTargets);
     id cb = objc_getAssociatedObject(enc, kPassCB);
+    if (vxprof_enabled) vxprof_ours(1);
     for (NSArray *e in ts) g_target_hook((__bridge void *)cb, (__bridge void *)e[0], [e[1] intValue]);
+    if (vxprof_enabled) vxprof_ours(-1);
 }
 static void targets_note(id enc, id cb, MTLRenderPassDescriptor *pd) {
     if (!g_target_hook || !pd.depthAttachment.texture) return;
@@ -253,20 +318,25 @@ static void targets_note(id enc, id cb, MTLRenderPassDescriptor *pd) {
     }
     if (ts) { objc_setAssociatedObject(enc, kPassTargets, ts, OBJC_ASSOCIATION_RETAIN); objc_setAssociatedObject(enc, kPassCB, cb, OBJC_ASSOCIATION_ASSIGN); }
 }
-static const void *kUI, *kUIcb; static void ui_end(id enc, id cbo);   // (h51, below)
+static void ui_end(id enc, id cbo);   // (h51, below)
 void vxpipe_install_device(Class dc); void vxpipe_install_encoders(Class rc, Class cc); int vxpipe_on(void);   // (vxpipe.m)
 void vxpipe_frame(void); void vxpipe_render_begin(id e, MTLRenderPassDescriptor *pd); void vxpipe_render_end(id e);
 static void h_end(id self, SEL s) {
+    if (vxprof_enabled) vxprof_end(self);   // (VXMAC_PASS_PROFILE's serial windows: the fence, before the pass ends)
     o_end(self, s);
     vxpipe_render_end(self);
     targets_end(self);
     { id cbu = objc_getAssociatedObject(self, kUI) ? objc_getAssociatedObject(self, kUIcb) : nil; if (cbu) ui_end(self, cbu); }
-    if (!g_pass_hook) return;
-    id cb = objc_getAssociatedObject(self, kPassCB), d = objc_getAssociatedObject(self, kPassDepth);
-    if (cb && d) g_pass_hook((__bridge void *)cb, (__bridge void *)d, [objc_getAssociatedObject(self, kPassStore) intValue]);
+    if (g_pass_hook) {
+        id cb = objc_getAssociatedObject(self, kPassCB), d = objc_getAssociatedObject(self, kPassDepth);
+        if (cb && d) { if (vxprof_enabled) vxprof_ours(1); g_pass_hook((__bridge void *)cb, (__bridge void *)d, [objc_getAssociatedObject(self, kPassStore) intValue]); if (vxprof_enabled) vxprof_ours(-1); }
+    }
+    enc_clear(self);
 }
 static id h_prce(id self, SEL s, MTLRenderPassDescriptor *pd) {
+    void *ppx = NULL; if (vxprof_live) pd = vxprof_render_pd(self, pd, &ppx, 1);
     id e = o_prce(self, s, pd);
+    if (ppx) vxprof_render_enc(e, ppx);
     if (e) targets_note(e, self, pd);
     if (e && g_pass_hook) drawable_pass_note(pd);
     if (e && g_pass_hook && pd.depthAttachment.texture) {
@@ -278,6 +348,7 @@ static id h_prce(id self, SEL s, MTLRenderPassDescriptor *pd) {
         objc_setAssociatedObject(e, kPassDepth, pd.depthAttachment.texture, OBJC_ASSOCIATION_RETAIN);
         MTLStoreAction sa = pd.depthAttachment.storeAction;
         objc_setAssociatedObject(e, kPassStore, @(sa == MTLStoreActionStore || sa == MTLStoreActionStoreAndMultisampleResolve), OBJC_ASSOCIATION_RETAIN);
+        enc_probe(e);
     }
     return e;
 }
@@ -465,10 +536,12 @@ static void ui_note(id e, MTLRenderPassDescriptor *pd) {
 }
 static void ui_end_inner(id enc, id cbo);
 static void ui_end(id enc, id cbo) {   // (h58: then the world UI drawn again into the layer, after the HUD's capture and clear)
+    if (vxprof_enabled) vxprof_ours(1);   // (VXMAC_PASS_PROFILE: the capture's passes are ours)
     NSArray *u = objc_getAssociatedObject(enc, kUI);
     id t = u ? u[0] : nil; NSUInteger slice = u ? [u[1] unsignedIntegerValue] : 0;
     ui_end_inner(enc, cbo);
     if (t && cbo) { g_ui_busy = 1; vxpipe_ui_replay(enc, cbo, t, slice); g_ui_busy = 0; }
+    if (vxprof_enabled) vxprof_ours(-1);
 }
 static void ui_end_inner(id enc, id cbo) {
     NSArray *u = objc_getAssociatedObject(enc, kUI);
@@ -578,7 +651,9 @@ static void ui_hook_end(id e) {   // (the endEncoding hook installed once on the
 }
 static id h_rce(id self, SEL s, MTLRenderPassDescriptor *pd) {
     if (g_hud_layer != 0) pd = hud_redirect(pd);
+    void *ppx = NULL; if (vxprof_live) pd = vxprof_render_pd(self, pd, &ppx, 0);   // (a sampled frame: a copy with the counters)
     id e = o_rce(self, s, pd);
+    if (ppx) vxprof_render_enc(e, ppx);
     if (e && g_pass_hook) { color_note(pd); drawable_pass_note(pd); cam_watch(e, pd); ui_note(e, pd); if (objc_getAssociatedObject(e, kUI)) { objc_setAssociatedObject(e, kUIcb, self, OBJC_ASSOCIATION_ASSIGN); ui_hook_end(e); } }
     if (e) targets_note(e, self, pd);
     if (e) vxpipe_render_begin(e, pd);
@@ -591,6 +666,7 @@ static id h_rce(id self, SEL s, MTLRenderPassDescriptor *pd) {
         objc_setAssociatedObject(e, kPassDepth, pd.depthAttachment.texture, OBJC_ASSOCIATION_RETAIN);
         MTLStoreAction sa = pd.depthAttachment.storeAction;
         objc_setAssociatedObject(e, kPassStore, @(sa == MTLStoreActionStore || sa == MTLStoreActionStoreAndMultisampleResolve), OBJC_ASSOCIATION_RETAIN);
+        enc_probe(e);
     }
     return e;
 }
@@ -610,6 +686,7 @@ static void hook_cb_class(Class c) {
         if (!o_rce) o_rce = (rce_imp)swap(c, @selector(renderCommandEncoderWithDescriptor:), (IMP)h_rce);
         if (!o_prce) o_prce = (rce_imp)swap(c, @selector(parallelRenderCommandEncoderWithDescriptor:), (IMP)h_prce);
         g_norig++;
+        vxprof_install_cb_class(c);
         vxmac_log("Metal: present hook on %s", k.UTF8String);
     }
     pthread_mutex_unlock(&lock);
@@ -838,7 +915,8 @@ __attribute__((ns_returns_retained)) static id h_arch(id self, SEL s, MTLBinaryA
     NSURL *u = d.url;
     if (off && u) { MTLBinaryArchiveDescriptor *empty = [MTLBinaryArchiveDescriptor new]; d = empty; }
     id r = o_arch(self, s, d, err);
-    vxmac_log("Metal: binary archive %s%s -> %s%s", u ? u.lastPathComponent.UTF8String : "(new)", off && u ? " replaced by an empty one" : "",
+    { void vxpipe_arch_note(id); vxpipe_arch_note(r); }   // (h64: its adds and writes counted)
+    vxmac_log("Metal: binary archive %s%s -> %s%s", u ? u.path.UTF8String : "(new)", off && u ? " replaced by an empty one" : "",
               r ? "ok" : "nil", (!r && err && *err) ? [(*err).localizedDescription UTF8String] : "");
     return r;
 }
@@ -899,6 +977,7 @@ static void macos_only_methods(void) {
         //  the render encoder's endEncoding through h_end)
         vxpipe_install_encoders(object_getClass(re), object_getClass(ce));
         if (!o_end) o_end = (end_imp)method_setImplementation(class_getInstanceMethod(object_getClass(re), @selector(endEncoding)), (IMP)h_end);
+        vxprof_install_encoders(object_getClass(re), object_getClass(ce));
     }
     vxmac_log("Metal: macOS-only methods added to %s; catch-all on its device, queue, command buffer, encoders, resources", class_getName(dc));
 }
@@ -909,10 +988,11 @@ void vxmtl_stats(char *out, unsigned size) {
     if (g_gpu_since > 0 && now > g_gpu_since) busy_pct = 100.0 * g_gpu_busy / (now - g_gpu_since);
     cbs = g_gpu_cbs; g_gpu_busy = 0; g_gpu_cbs = 0; g_gpu_since = now;
     pthread_mutex_unlock(&g_gpu_lock);
-    char head[160]; snprintf(head, sizeof head, "\"game_gpu_busy_pct\":%.0f,\"game_cbs\":%lu,\"pace_waits\":%lu,\"pace_ms\":%.0f,", busy_pct, cbs,
-                             atomic_exchange(&g_pace_waits, 0), atomic_exchange(&g_pace_us, 0) / 1e3);
+    char head[220]; snprintf(head, sizeof head, "\"game_gpu_busy_pct\":%.0f,\"game_cbs\":%lu,\"pace_waits\":%lu,\"pace_ms\":%.0f,\"gpu_cap\":%.2f,\"gpu_cap_half\":%d,", busy_pct, cbs,
+                             atomic_exchange(&g_pace_waits, 0), atomic_exchange(&g_pace_us, 0) / 1e3, g_gpu_cap, g_half_on);
     size_t hl = strlen(head); if (hl < size) { memcpy(out, head, hl + 1); out += hl; size -= (unsigned)hl; }
     { void vxpipe_ui_stats(char *, unsigned); char w[200]; vxpipe_ui_stats(w, sizeof w); size_t wl = strlen(w); if (wl + 1 < size) { memcpy(out, w, wl); out[wl] = ','; out += wl + 1; size -= (unsigned)(wl + 1); } }
+    { char pp[200]; vxprof_stats(pp, sizeof pp); size_t pl = strlen(pp); if (pl && pl + 1 < size) { memcpy(out, pp, pl); out[pl] = ','; out += pl + 1; size -= (unsigned)(pl + 1); } }
     snprintf(out, size, "\"inflight\":%ld,\"inflight_waits\":%lu,\"inflight_timeouts\":%lu,\"held_commits\":%lu,\"presents\":%lu,\"drawable_presents\":%lu,\"dropped\":%lu,\"displaylink_calls\":%lu,\"displaylink\":\"%s\"",
              g_inflight_n, (unsigned long)g_inflight_waits, (unsigned long)g_inflight_timeouts, (unsigned long)g_held_commits, (unsigned long)g_presents, (unsigned long)g_drawable_presents, (unsigned long)g_dropped, (unsigned long)g_link_calls,
              g_fake_link ? "stand-in" : "system");

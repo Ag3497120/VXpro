@@ -176,6 +176,7 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
                 let f = String(format: "\"frames\":%d,\"present_interval_ms\":%.2f,\"present_interval_max_ms\":%.1f,\"start_late_ms\":%.2f,\"start_late_max_ms\":%.1f,\"input_to_commit_ms\":%.2f,\"input_to_commit_max_ms\":%.1f,\"gpu_ms\":%.2f,\"deadline_margin_ms\":%.2f,\"deadline_margin_min_ms\":%.1f,\"missed\":%d,\"query_to_input_ms\":%.1f",
                                    pace.n, pace.presN > 0 ? pace.presSum / Double(pace.presN) : 0, pace.presMax, pace.late / Double(pace.n), pace.lateMax, pace.sub / Double(pace.n), pace.subMax,
                                    pace.gpuN > 0 ? pace.gpu / Double(pace.gpuN) : 0, pace.gpuN > 0 ? pace.margin / Double(pace.gpuN) : 0, pace.marginMin, pace.misses, (toi - tq) * 1e3)
+                vxmtl_compositor_interval(pace.presN > 0 ? pace.presSum / Double(pace.presN) : 0)
                 vxmtl_pacing_report(Int32(pace.misses))
                 pace.n = 0; pace.misses = 0; pace.gpuN = 0; pace.presSum = 0; pace.presN = 0; pace.presMax = 0; pace.late = 0; pace.lateMax = 0
                 pace.sub = 0; pace.subMax = 0; pace.margin = 0; pace.marginMin = 1e9; pace.gpu = 0; pace.last = tc

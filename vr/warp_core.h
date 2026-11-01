@@ -102,6 +102,18 @@ void vxw_set_rate_map(vxw_core *c, void *map);
 void vxw_set_hud_mask(vxw_core *c, void *tex);
 // (VX Mac) Up to 4 rectangles of B's UV (x0, y0, x1, y1 each) darkened to 25 % with a soft edge: HUD drawn elsewhere.
 void vxw_set_hud_rects(vxw_core *c, const float *rects, int n);
+// (VX Mac, method 3) The Neural Engine's frame-prediction layers of B for the next encodes (app/Sources/npu_model.m,
+// tools/interp_model.py): layers a planar R16Float texture mw x 6*mh - fill rgb (sRGB-encoded), motion xy (model pixels
+// / 16 per motion interval, + right / down: the scene's motion over the interval before B), conf. Repacked once per seq
+// (B's present number) into the core's own textures, in command_buffer (before the encodes). linear: B is sampled through
+// an sRGB view (the fill is decoded to match). Then each encode: B's blocks move by the model's motion (x t; with
+// VXW_CAM_MV the camera's turn taken out as for motion vectors, and the motion of low-conf pixels scaled towards conf by
+// conf_fade, 0..1: long gaps), holes show the fill at the background's displacement, and B's colour is weighted against
+// the fill by min(2 conf, 1) with conf_t (0..1, min(t, 1): none at B's own time) - the composite the model was trained
+// for. Compiled as a second library (VXW_INTERP): without layers (NULL, or after a call that returned 0) the encodes are
+// exactly as before. Returns 1 when the next encodes use the layers.
+int vxw_set_interp(vxw_core *c, void *command_buffer, void *layers, uint32_t mw, uint32_t mh, uint64_t seq, int linear, float conf_t,
+                   float conf_fade);
 // VXW_AUTO_CONV: the near end of the depth range (the pct-th of 16x16 samples of inverse depth), smoothed over frames
 // into the core's state; call once per real frame before the eyes' vxw_encode.
 void vxw_encode_conv(vxw_core *c, void *command_buffer, const vxw_params *p, void *depth, float pct);

@@ -19,6 +19,7 @@
 #import <QuartzCore/QuartzCore.h>
 #include <crt_externs.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <os/proc.h>
@@ -28,6 +29,7 @@
 #include <unistd.h>
 #include "xros_vr.h"
 #include "vxmac.h"
+#include "interp_frame.h"
 
 extern void (*vx_host_jlog)(const char *event, const char *fields);   // (../../vr/vxmac_vr_glue.m)
 extern int vx_xros_display_w, vx_xros_display_h;
@@ -47,9 +49,9 @@ static uint64_t footprint_mb(void) {
 }
 static void jlog(const char *event, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void jlog(const char *event, const char *fmt, ...) {
-    char extra[3072] = "";
+    char extra[6144] = "";   // (h61c: 3072 -> 4096, the stats line with cap_* is ~2.9 KB; h63: 6144, with method 3's interp_* / iw_*)
     if (fmt) { va_list ap; va_start(ap, fmt); vsnprintf(extra, sizeof extra, fmt, ap); va_end(ap); }
-    char line[3584];
+    char line[6656];
     int n = snprintf(line, sizeof line, "{\"t\":%.3f,\"since_start\":%.3f,\"image\":\"%s\",\"event\":\"%s\",\"available_mb\":%llu,\"footprint_mb\":%llu%s%s}\n",
                      now_s(), now_s() - t0, g_image, event, (unsigned long long)(os_proc_available_memory() >> 20),
                      (unsigned long long)footprint_mb(), *extra ? "," : "", extra);
@@ -224,6 +226,20 @@ float vx_xros_vr_tan_y(void);
 void vx_xros_vr_seen_turn2(uint64_t pseq, float seen, float seen_y);
 void vx_xros_vr_cam_candidates(uint64_t pseq, const void *cands, int n);
 int vxmac_stick_active(void) { return stick_active(); }   // (h57b: for the presenter's yaw offset)
+// (h64: the player's combat input now - bit 1 aiming (a controller's left trigger, the mouse's right button), bit 2
+//  firing (the right trigger, the mouse's left button). The presenter's detectors hold still while it is down: ADS moves
+//  the game's camera to the sights and narrows its FOV, recoil and aim assist turn it - none of it is the head's)
+int vxmac_combat_input(void) {
+    int r = 0;
+    for (GCController *c in GCController.controllers) {
+        GCExtendedGamepad *g = c.extendedGamepad; if (!g) continue;
+        if (g.leftTrigger.value > 0.2f) r |= 1;
+        if (g.rightTrigger.value > 0.2f) r |= 2;
+    }
+    GCMouseInput *mi = GCMouse.current.mouseInput;
+    if (mi) { if (mi.rightButton.pressed) r |= 1; if (mi.leftButton.pressed) r |= 2; }
+    return r;
+}
 static void follow_sample(const float *prof, float yaw_sent, float pitch_sent, int stick, const float *vel_mean, uint64_t pseq) {
     if (!vx_xros_vr_driving()) { g_have_prev = 0; g_win_start = 0; return; }
     double now = CACurrentMediaTime();
@@ -328,19 +344,41 @@ static void pass_hook(void *cb, void *depth, int stores) {
     vx_xros_vr_depth_pass(cb, (__bridge void *)t, 1, (uint32_t)stores, 0);
 }
 
+// (method 3, interp_frame.h: this present's scene - the depth and velocity copies already in this command buffer, the
+//  pose - for the training capture (interp_capture.m, VXMAC_CAPTURE) and the model (npu_model.m, VXMAC_INTERP))
+static void interp_scene(void *cb, void *tex, uint32_t w, uint32_t h, int hud_split, double now) {
+    static double prev;
+    void *vx_xros_vr_scene_depth(uint32_t *w, uint32_t *h, uint32_t *bpp);
+    void *vxmac_vel_latest_tex(uint32_t *w, uint32_t *h, float k[2], float *corr, int *verified);
+    vxmac_frame_info fi = { 0 };
+    fi.depth_buf = vx_xros_vr_scene_depth(&fi.depth_w, &fi.depth_h, &fi.depth_bpp);
+    int ok = 0;
+    fi.vel_tex = vxmac_vel_latest_tex(&fi.vel_w, &fi.vel_h, fi.vel_k, &fi.vel_corr, &ok);
+    fi.flags = (vx_xros_vr_driving() ? VXI_VR : 0) | (stick_active() ? VXI_STICK : 0) | (hud_split ? VXI_HUD_SPLIT : 0) | (ok ? VXI_VEL_OK : 0);
+    fi.seq = vx_xros_vr_next_seq(); fi.t = now; fi.t_prev = prev > 0 ? prev : now; prev = now;
+    fi.tan[0] = vx_xros_vr_game_tan_x(); fi.tan[1] = vx_xros_vr_tan_y();
+    { const char *e = getenv("VXRT_VR_NEAR"); fi.nearp = e && *e ? (float)atof(e) : 0.2f; }
+    fi.sent[0] = vx_xros_vr_sent_yaw(); fi.sent[1] = vx_xros_vr_sent_pitch();
+    { uint64_t vxmtl_game_camera(float m[16]); fi.cam_seq = vxmtl_game_camera(fi.cam); }
+    vxmac_capture_frame(cb, tex, w, h, &fi);
+    vxmac_interp_frame(cb, tex, w, h, &fi);
+}
+
 static int present_hook(void *cb, void *tex, uint32_t w, uint32_t h) {
     vx_xros_display_w = (int)w; vx_xros_display_h = (int)h;
     if (g_frames++ == 0) vxkit_set_program_ready();
     double tn = CACurrentMediaTime();
     if (g_snap_s > 0 && tn - g_snap_last >= g_snap_s) { g_snap_last = tn; snapshot((__bridge id<MTLCommandBuffer>)cb, (__bridge id<MTLTexture>)tex); }
     if (!g_vr) return 1;                             // (flat: the layer is in the window, presented as usual)
-    { void vx_xros_vr_set_hud_layer(void *); vx_xros_vr_set_hud_layer(vxmtl_hud_take()); vxmtl_hud_want(vx_xros_vr_driving()); }   // (h33: this frame's HUD layer, or none)
+    void *hud = vxmtl_hud_take();
+    { void vx_xros_vr_set_hud_layer(void *); vx_xros_vr_set_hud_layer(hud); vxmtl_hud_want(vx_xros_vr_driving()); }   // (h33: this frame's HUD layer, or none)
     { vxmtl_cam_cand cc[16]; int n = vxmtl_camera_candidates(cc, 16);   // (h29: the game's camera candidates for this frame)
       vx_xros_vr_cam_candidates(vx_xros_vr_next_seq(), cc, n); }
     follow_encode((__bridge id<MTLCommandBuffer>)cb, (__bridge id<MTLTexture>)tex);
     vxmac_npu_frame(cb, tex, w, h);   // (npu_flow.m: the frame scaled down for the Neural Engine's optical flow)
     { void vxmac_fsr_frame(void *, void *, uint32_t, uint32_t, uint64_t);   // (fsr.m: the centre to the Neural Engine's SR; off: nothing)
       vxmac_fsr_frame(cb, tex, w, h, vx_xros_vr_next_seq()); }
+    if (vxmac_capture_on() || vxmac_interp_on()) interp_scene(cb, tex, w, h, hud != NULL, tn);   // (method 3; off: nothing)
     vx_xros_vr_submit(cb, tex, w, h, NULL, NULL);
     return 0;                                        // (VR: the presenter shows it; the offscreen layer's present is dropped)
 }
@@ -373,7 +411,8 @@ static NSHashTable *g_right_y, *g_right_pads;
 static _Atomic unsigned long g_stick_y_zeroed;   // (reads of the right stick's y answered 0, for the stats)
 static int stick_pitch_blocked(void) {
     static int keep = -1; if (keep < 0) { const char *e = getenv("VXMAC_STICK_PITCH"); keep = e && !strcmp(e, "1"); }
-    return !keep && vx_xros_vr_driving();
+    int vx_xros_vr_aim_mode(void);   // (h64: warp mode 7 - the gun aims with the stick: its pitch reaches the game)
+    return !keep && vx_xros_vr_driving() && !vx_xros_vr_aim_mode();
 }
 static void note_controller(GCController *c) {
     GCExtendedGamepad *g = c.extendedGamepad; if (!g) return;
@@ -477,8 +516,14 @@ static void *program_main(void *arg) {
         if (n && (!strcmp(n, path.UTF8String) || strstr(n, [NSString stringWithFormat:@"/%s.dylib", g_image].UTF8String))) mh = _dyld_get_image_header(i);
     }
     if (!mh) { jlog("program_error", "\"what\":\"loaded image not found\""); return NULL; }
+    vxaudio_hook_image(mh);   // (h66: its HAL imports through libvxkit's counters - done at load already; idempotent)
     entry_fn entry = (entry_fn)((const char *)mh + [img[@"entry_offset"] unsignedLongLongValue]);
-    jlog("program_loaded", "\"load_s\":%.2f,\"base\":\"%p\",\"entry\":\"%p\",\"argc\":%d", now_s() - t, (void *)mh, (void *)entry, g_argc);
+    // (h61b: which prepared image this bundle carries - ddgame61 was built from 2.3.2's prepared/ (entry 206152) against
+    //  the headset's 2.5.0 data (prepared_2.5.0/, entry 212308) and hung in the game's start; the offset and the source's
+    //  hash tell them apart in the log)
+    NSString *sha = [img[@"source_sha256"] isKindOfClass:NSString.class] ? img[@"source_sha256"] : @"?";
+    jlog("program_loaded", "\"load_s\":%.2f,\"base\":\"%p\",\"entry\":\"%p\",\"argc\":%d,\"entry_offset\":%llu,\"source_sha256\":\"%.16s\"",
+         now_s() - t, (void *)mh, (void *)entry, g_argc, [img[@"entry_offset"] unsignedLongLongValue], sha.UTF8String);
     char apple0[1100]; snprintf(apple0, sizeof apple0, "executable_path=%s", getenv("VXMAC_EXECUTABLE_PATH") ?: g_argv[0]);
     char *apple[] = { apple0, NULL };
     int rc = entry(g_argc, g_argv, *_NSGetEnviron(), apple);
@@ -504,8 +549,156 @@ static void vm_line(char *out, size_t n) {
     snprintf(out, n, "\"virtual_gb\":%.1f,\"compressed_mb\":%llu,\"internal_mb\":%llu,\"regions_1gb\":[%s]",
              i.virtual_size / 1073741824.0, (unsigned long long)(i.compressed >> 20), (unsigned long long)(i.internal >> 20), big);
 }
+// (h62: the footprint by owner, every 10 s as a "mem" line - a 24-48 min session grew ~20-50 MB a minute until the
+// 8 GB limit killed it (internal + compressed: CPU-side memory; the rest, ~3 GB of GPU memory, flat). What it holds:
+//   the kernel's ledgers (graphics, neural, media), reusable (decommitted pages the footprint leaves out), the limit left;
+//   the memory of each VM tag (dirty + compressed: malloc's kinds, IOSurface, untagged = the game's own pools
+//   and mappings), the threads; malloc's zones (in use / allocated: a gap is free memory malloc keeps); the game's
+//   VM calls and its largest reservations (libvxsystem); what it keeps alive through Metal (libvxmtl: pipelines,
+//   libraries, shared buffers; our UI records). Under VXMAC_MALLOC_RELIEF_MB (default 400) available, at most once a
+//   minute, malloc gives back its free pages (malloc_zone_pressure_relief; relief_mb: what it gave). =0: never.)
+#include <malloc/malloc.h>
+static const char *tag_name(int t) {
+    switch (t) {
+    case 0: return "untagged"; case 1: return "malloc"; case 2: return "malloc_small"; case 3: return "malloc_large"; case 4: return "malloc_huge";
+    case 7: return "malloc_tiny"; case 8: return "malloc_large_reusable"; case 9: return "malloc_large_reused"; case 11: return "malloc_nano";
+    case 12: return "malloc_medium"; case 13: return "malloc_guard"; case 20: return "mach_msg"; case 21: return "iokit"; case 30: return "stack";
+    case 33: return "dylib"; case 40: return "appkit"; case 41: return "foundation"; case 42: return "coregraphics"; case 51: return "layerkit";
+    case 60: return "dyld"; case 61: return "dyld_malloc"; case 70: return "imageio"; case 73: return "os_alloc_once"; case 74: return "libdispatch";
+    case 75: return "accelerate"; case 88: return "iosurface"; case 90: return "audio"; case 100: return "ioaccelerator"; case 107: return "compositor_services";
+    default: return NULL;
+    }
+}
+static void mem_line(void) {
+    char o[6000]; size_t k = 0;
+#define ADD(...) do { if (k < sizeof o) k += (size_t)snprintf(o + k, sizeof o - k, __VA_ARGS__); } while (0)
+    task_vm_info_data_t i; mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&i, &c) != KERN_SUCCESS) return;
+    thread_act_array_t th = NULL; mach_msg_type_number_t nth = 0;
+    if (task_threads(mach_task_self(), &th, &nth) == KERN_SUCCESS) {
+        for (mach_msg_type_number_t t = 0; t < nth; t++) mach_port_deallocate(mach_task_self(), th[t]);
+        vm_deallocate(mach_task_self(), (vm_address_t)th, nth * sizeof *th);
+    }
+#define M(x) (long long)((int64_t)(x) >> 20)
+    ADD("\"internal_mb\":%lld,\"compressed_mb\":%lld,\"reusable_mb\":%lld,\"graphics_mb\":%lld,\"neural_mb\":%lld,\"media_mb\":%lld,"
+        "\"purgeable_nv_mb\":%lld,\"peak_mb\":%lld,\"limit_left_mb\":%lld,\"regions\":%d,\"threads\":%u",
+        M(i.internal), M(i.compressed), M(i.reusable), M(i.ledger_tag_graphics_footprint + i.ledger_tag_graphics_footprint_compressed),
+        M(i.ledger_tag_neural_footprint + i.ledger_tag_neural_footprint_compressed), M(i.ledger_tag_media_footprint + i.ledger_tag_media_footprint_compressed),
+        M(i.ledger_purgeable_nonvolatile + i.ledger_purgeable_novolatile_compressed), M(i.ledger_phys_footprint_peak), M(i.limit_bytes_remaining),
+        i.region_count, (unsigned)nth);
+#undef M
+    {   // the VM tags
+        static uint64_t held[256]; memset(held, 0, sizeof held);
+        vm_address_t a = 0; vm_size_t sz = 0;
+        for (;;) {
+            natural_t depth = 0; vm_region_submap_info_data_64_t r; mach_msg_type_number_t rc = VM_REGION_SUBMAP_INFO_COUNT_64;
+            if (vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_64_t)&r, &rc) != KERN_SUCCESS) break;
+            if (!r.is_submap) { held[r.user_tag & 255] += ((uint64_t)r.pages_dirtied + r.pages_swapped_out) * vm_page_size; }
+            a += sz;
+        }
+        ADD(",\"vm_tags_mb\":{");
+        for (int n = 0; n < 12; n++) {
+            int best = -1; for (int t = 0; t < 256; t++) if (held[t] >= (1u << 20) && (best < 0 || held[t] > held[best])) best = t;
+            if (best < 0) break;
+            const char *nm = tag_name(best);
+            if (nm) ADD("%s\"%s\":%llu", n ? "," : "", nm, (unsigned long long)(held[best] >> 20)); else ADD("%s\"tag%d\":%llu", n ? "," : "", best, (unsigned long long)(held[best] >> 20));
+            held[best] = 0;
+        }
+        ADD("}");
+    }
+    {   // malloc's zones
+        vm_address_t *zones = NULL; unsigned nz = 0; uint64_t use = 0, alloc = 0;
+        char zl[600] = ""; size_t zk = 0; int shown = 0;
+        if (malloc_get_all_zones(mach_task_self(), NULL, &zones, &nz) == KERN_SUCCESS) {
+            malloc_statistics_t st[32]; unsigned n = nz < 32 ? nz : 32;
+            for (unsigned z = 0; z < n; z++) {
+                malloc_zone_t *mz = (malloc_zone_t *)zones[z]; memset(&st[z], 0, sizeof st[z]);
+                if (mz && mz->introspect && mz->introspect->statistics) mz->introspect->statistics(mz, &st[z]);
+                use += st[z].size_in_use; alloc += st[z].size_allocated;
+            }
+            for (int t = 0; t < 4; t++) {
+                int best = -1; for (unsigned z = 0; z < n; z++) if (st[z].size_allocated >= (1u << 20) && (best < 0 || st[z].size_allocated > st[best].size_allocated)) best = (int)z;
+                if (best < 0) break;
+                const char *nm = malloc_get_zone_name((malloc_zone_t *)zones[best]);
+                if (zk < sizeof zl) zk += (size_t)snprintf(zl + zk, sizeof zl - zk, "%s[\"%s\",%llu,%llu,%u]", shown++ ? "," : "", nm ? nm : "?",
+                                                            (unsigned long long)(st[best].size_in_use >> 20), (unsigned long long)(st[best].size_allocated >> 20), st[best].blocks_in_use);
+                st[best].size_allocated = 0;
+            }
+        }
+        ADD(",\"malloc_in_use_mb\":%llu,\"malloc_allocated_mb\":%llu,\"malloc_zones\":[%s]", (unsigned long long)(use >> 20), (unsigned long long)(alloc >> 20), zl);
+    }
+    {   // malloc's free pages given back near the limit
+        static double last = -1e9; static long thr = -1; static unsigned long long total;
+        if (thr < 0) { const char *e = getenv("VXMAC_MALLOC_RELIEF_MB"); thr = e && *e ? atol(e) : 400; }
+        unsigned long long got = 0; double t = now_s();
+        if (thr > 0 && (os_proc_available_memory() >> 20) < (size_t)thr && t - last >= 60) { last = t; got = malloc_zone_pressure_relief(NULL, 0); total += got; }
+        ADD(",\"relief_mb\":%llu,\"relief_total_mb\":%llu", got >> 20, total >> 20);
+    }
+    {   static void (*gv)(char *, unsigned), (*mp)(char *, unsigned), (*mt)(char *, unsigned); static int (*md)(const char *); static int once;
+        if (!once++) { gv = (void (*)(char *, unsigned))dlsym(RTLD_DEFAULT, "vxsys_vm_stats"); mp = (void (*)(char *, unsigned))dlsym(RTLD_DEFAULT, "vxpipe_mem_stats");
+                       mt = (void (*)(char *, unsigned))dlsym(RTLD_DEFAULT, "vxsys_mtrace_stats"); md = (int (*)(const char *))dlsym(RTLD_DEFAULT, "vxsys_mtrace_dump"); }
+        char b[1100];
+        if (gv) { gv(b, sizeof b); ADD(",%s", b); }
+        if (mp) { mp(b, sizeof b); ADD(",%s", b); }
+        // (h66: the program's HAL calls a second, the HAL plug-ins loaded, the busiest threads with the top one's stack)
+        { char au[1500]; vxaudio_stats(au, sizeof au, 0); ADD(",%s", au); }
+        // (h64: VXMAC_MALLOC_TRACE=<N> - libvxsystem's sampled allocation stacks: the totals and the top three here,
+        //  Documents/malloc_trace.txt (the 30 stacks holding the most, frame by frame) every 60 s)
+        if (mt) { static int on = -1; if (on < 0) { const char *e = getenv("VXMAC_MALLOC_TRACE"); on = e && atoi(e) > 0; }
+            if (on) { mt(b, sizeof b); ADD(",%s", b);
+                static double last; double t = now_s();
+                if (md && t - last >= 60) { last = t; md([@(g_docs) stringByAppendingPathComponent:@"malloc_trace.txt"].fileSystemRepresentation); } } }
+    }
+#undef ADD
+    if (k >= sizeof o) k = sizeof o - 1;
+    o[k] = 0;
+    jlog("mem", "%s", o);
+}
+// (h64: Documents/vxmac_now.json - a few hundred bytes rewritten every 5 s (a temporary file renamed over it), so the
+//  state can be fetched while playing: devicectl copies of the live jsonl (MBs) keep failing. From this stats tick:
+//  game fps, compositor rate, footprint / available / peak, malloc in use, thermal, the GPU cap, the interpolation mode,
+//  pipelines made, the malloc trace's estimate and top caller when on)
+static double json_num(const char *s, const char *key) {   // ("key":number in a stats fragment; -1 when absent)
+    char k[64]; snprintf(k, sizeof k, "\"%s\":", key);
+    const char *p = s ? strstr(s, k) : NULL;
+    return p ? atof(p + strlen(k)) : -1;
+}
+static void now_json(const char *vr, const char *mt, long thermal) {
+    static double last; double t = now_s();
+    if (t - last < 5 || !*g_docs) return;
+    last = t;
+    task_vm_info_data_t i; mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+    int ok = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&i, &c) == KERN_SUCCESS;
+    malloc_statistics_t ms; malloc_zone_statistics(NULL, &ms);
+    int half = 0; double cap = vxmtl_gpu_cap(&half);
+    int im = 0; { int vx_xros_vr_interp_mode(void); im = vx_xros_vr_interp_mode(); }
+    const char *interp = im == 2 ? "vel" : vxmac_interp_on() ? "model" : "off";
+    char pm[1100] = "", tr[1100] = "", au[400] = "";
+    vxaudio_stats(au, sizeof au, 1);
+    { static void (*mp)(char *, unsigned), (*mtr)(char *, unsigned); static int once;
+      if (!once++) { mp = (void (*)(char *, unsigned))dlsym(RTLD_DEFAULT, "vxpipe_mem_stats"); mtr = (void (*)(char *, unsigned))dlsym(RTLD_DEFAULT, "vxsys_mtrace_stats"); }
+      if (mp) mp(pm, sizeof pm);
+      const char *e = getenv("VXMAC_MALLOC_TRACE"); if (mtr && e && atoi(e) > 0) mtr(tr, sizeof tr); }
+    char o[2800];
+    int n = snprintf(o, sizeof o, "{\"t\":%.0f,\"since_start\":%.0f,\"game_fps\":%.1f,\"compositor_hz\":%.1f,\"mode\":\"%s\",\"footprint_mb\":%llu,\"available_mb\":%llu,"
+                     "\"peak_mb\":%llu,\"malloc_mb\":%llu,\"malloc_blocks\":%u,\"thermal\":%ld,\"gpu_cap\":%.2f,\"gpu_cap_half\":%d,\"game_gpu_busy_pct\":%.0f,"
+                     "\"pace_ms\":%.0f,\"warp_gpu_ms\":%.2f,\"interp\":\"%s\",\"render_pipes_made\":%.0f,\"render_pipes\":%.0f,\"rp_repeat\":%.0f,\"rp_ms_max\":%.1f,"
+                     "\"enc_probes_live\":%.0f,%s%s%s}\n",
+                     t, t - t0, json_num(vr, "game_fps"), json_num(vr, "compositor_hz"), g_vr ? (strstr(vr, "\"mode\":\"vr\"") ? "vr" : "screen") : "flat",
+                     (unsigned long long)footprint_mb(), (unsigned long long)(os_proc_available_memory() >> 20), ok ? (unsigned long long)(i.ledger_phys_footprint_peak >> 20) : 0ULL,
+                     (unsigned long long)(ms.size_in_use >> 20), ms.blocks_in_use, thermal, cap, half, json_num(mt, "game_gpu_busy_pct"), json_num(mt, "pace_ms"),
+                     json_num(vr, "warp_gpu_ms"), interp, json_num(pm, "render_pipes_made"), json_num(pm, "render_pipes"), json_num(pm, "rp_repeat"), json_num(pm, "rp_ms_max"),
+                     json_num(pm, "enc_probes_live"), au, *tr ? "," : "", tr);
+    if (n <= 0 || n >= (int)sizeof o) return;
+    char path[1100], tmp[1100];
+    snprintf(path, sizeof path, "%s/vxmac_now.json", g_docs); snprintf(tmp, sizeof tmp, "%s/.vxmac_now.json.tmp", g_docs);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    ssize_t w = write(fd, o, (size_t)n); close(fd);
+    if (w == n) rename(tmp, path);
+}
 static void stats_tick(void) {
-    char vr[1400] = "", mt[900] = "", fx[300] = "", unk[1200] = "", npu[1100] = "";
+    char vr[1400] = "", mt[900] = "", fx[300] = "", unk[1200] = "", npu[3600] = "";
     vxmac_npu_stats(npu, sizeof npu);
     { void vxmac_fsr_stats(char *, unsigned); char fs[400]; vxmac_fsr_stats(fs, sizeof fs);
       size_t l = strlen(npu); snprintf(npu + l, sizeof npu - l, ",%s", fs); }
@@ -514,13 +707,19 @@ static void stats_tick(void) {
         static long last = -1; long th = (long)[NSProcessInfo processInfo].thermalState;
         if (th != last) { jlog("thermal", "\"state\":%ld", th); last = th; }
         size_t l = strlen(npu); snprintf(npu + l, sizeof npu - l, ",\"thermal\":%ld", th); }
+    if (vxmac_capture_on() || vxmac_interp_on()) {   // (method 3: only when on, the stats line is unchanged otherwise)
+        char c[800], m[1400]; vxmac_capture_stats(c, sizeof c); vxmac_interp_stats(m, sizeof m);
+        size_t l = strlen(npu); snprintf(npu + l, sizeof npu - l, ",%s,%s", c, m); }
+    { int vx_xros_vr_interp_mode(void); void vx_xros_vr_interp_stats(char *, unsigned);   // (h63c: VXMAC_INTERP=vel - the warp's iw_* alone)
+      if (vx_xros_vr_interp_mode() == 2) { char m[700]; vx_xros_vr_interp_stats(m, sizeof m); size_t l = strlen(npu); snprintf(npu + l, sizeof npu - l, ",\"interp\":\"vel\",%s", m); } }
     { unsigned long pe, pt; void vx_xros_vr_pred_stats(unsigned long *, unsigned long *); vx_xros_vr_pred_stats(&pe, &pt);
       size_t l = strlen(npu); snprintf(npu + l, sizeof npu - l, ",\"pred_eyes\":%lu,\"eyes\":%lu,\"stick_y_zeroed\":%lu", pe, pt, (unsigned long)g_stick_y_zeroed); }
     if (g_vr) vx_xros_vr_stats(vr, sizeof vr);
     vxmtl_stats(mt, sizeof mt); vxfx_stats(fx, sizeof fx); vxkit_unknown_selectors(unk, sizeof unk);
     double ww, wh; vxkit_window_size(&ww, &wh);
     static int tick; char vm[900] = "\"vm\":0";
-    if (tick++ % 5 == 0) vm_line(vm, sizeof vm);
+    if (tick++ % 5 == 0) { vm_line(vm, sizeof vm); mem_line(); }
+    now_json(vr, mt, (long)[NSProcessInfo processInfo].thermalState);
     jlog("stats", "%s,%s,\"frames\":%lu,\"window\":[%.0f,%.0f],\"display\":[%d,%d],%s%s%s,%s,\"unknown_appkit\":\"%s\"",
          vm, npu, (unsigned long)g_frames, ww, wh, vx_xros_display_w, vx_xros_display_h, vr, *vr ? "," : "", mt, fx, unk);
 }

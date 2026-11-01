@@ -16,7 +16,9 @@
 #include <stdatomic.h>
 #include <stdarg.h>
 #include <dlfcn.h>
+#include <sys/sysctl.h>
 #include "vxmac.h"
+#include "vxprof.h"
 
 static FILE *g_f;
 static __thread void *tl_rec; static int tl_rec_any(void) { return tl_rec != NULL; }
@@ -45,6 +47,25 @@ static IMP swap(Class c, SEL s, IMP n) {
     return method_getImplementation(m);
 }
 
+// ---- (h62) what the game keeps alive through Metal, counted for the host's "mem" line (vxpipe_mem_stats) ------------
+// A small object associated with each pipeline / library the game makes: its dealloc (with the game's object) takes it
+// off the live count. Libraries also carry their data's size. VXUIRec / VXPassRec (ours) are counted by their own dealloc.
+static _Atomic long g_rp_made, g_rp_live, g_cp_made, g_cp_live, g_lib_made, g_lib_live, g_lib_bytes, g_twins, g_uirec_live, g_passrec_live;
+static const void *kLive = &kLive;
+@interface VXLive : NSObject { @public _Atomic long *ctr, *bytes_ctr; long bytes; }
+@end
+@implementation VXLive
+- (void)dealloc { if (ctr) atomic_fetch_sub(ctr, 1); if (bytes_ctr) atomic_fetch_sub(bytes_ctr, bytes); }
+@end
+static void live_tag(id o, _Atomic long *made, _Atomic long *live, _Atomic long *bytes_ctr, long bytes) {
+    if (!o) return;
+    atomic_fetch_add(made, 1);
+    if (objc_getAssociatedObject(o, kLive)) return;   // (the same object handed back twice: counted once)
+    VXLive *t = [VXLive new]; t->ctr = live; t->bytes_ctr = bytes_ctr; t->bytes = bytes;
+    atomic_fetch_add(live, 1); if (bytes_ctr) atomic_fetch_add(bytes_ctr, bytes);
+    objc_setAssociatedObject(o, kLive, t, OBJC_ASSOCIATION_RETAIN);
+}
+
 // ---- libraries ----------------------------------------------------------------------------------------------------
 // (each library's bytes hashed (FNV-1a 64): the game's shaders are all vs_main_ / ps_main_ / cs_main_, so a shader
 //  is known by its hash, the same in every run and on every device; its functions carry it)
@@ -54,7 +75,8 @@ typedef id (*fn_c_imp)(id, SEL, id, id, NSError **) __attribute__((ns_returns_re
 static fn_imp o_fn; static fn_c_imp o_fn_c;
 static void fn_tag(id l, id f) { if (f && l) { id h = objc_getAssociatedObject(l, kHash); if (h) objc_setAssociatedObject(f, kHash, h, OBJC_ASSOCIATION_RETAIN); } }
 __attribute__((ns_returns_retained)) static id h_fn(id self, SEL s, id n) { id f = o_fn(self, s, n); fn_tag(self, f); return f; }
-__attribute__((ns_returns_retained)) static id h_fn_c(id self, SEL s, id n, id cv, NSError **e) { id f = o_fn_c(self, s, n, cv, e); fn_tag(self, f); return f; }
+static const void *kConst;
+__attribute__((ns_returns_retained)) static id h_fn_c(id self, SEL s, id n, id cv, NSError **e) { id f = o_fn_c(self, s, n, cv, e); fn_tag(self, f); if (f && cv) objc_setAssociatedObject(f, kConst, @1, OBJC_ASSOCIATION_RETAIN); return f; }
 static uint64_t fnv(const void *p, size_t n, uint64_t h) { const uint8_t *b = p; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ULL; } return h; }
 static void lib_note(id<MTLLibrary> l, const char *how) {
     if (!l) return;
@@ -75,14 +97,16 @@ typedef id (*lib_data_imp)(id, SEL, id, NSError **) __attribute__((ns_returns_re
 static lib_data_imp o_lib_data, o_lib_url;
 __attribute__((ns_returns_retained)) static id h_lib_data(id self, SEL s, id d, NSError **e) {
     id l = o_lib_data(self, s, d, e);
+    if (l) @autoreleasepool { live_tag(l, &g_lib_made, &g_lib_live, &g_lib_bytes, d ? (long)dispatch_data_get_size((dispatch_data_t)d) : 0); }
     if (l && d) {
         __block uint64_t h = 0xcbf29ce484222325ULL;
         dispatch_data_apply((dispatch_data_t)d, ^bool(dispatch_data_t r, size_t off, const void *b, size_t n) { h = fnv(b, n, h); return true; });
         objc_setAssociatedObject(l, kHash, [NSString stringWithFormat:@"%016llx", (unsigned long long)h], OBJC_ASSOCIATION_RETAIN);
+        void vxpipe_lib_seen(uint64_t); vxpipe_lib_seen(h);   // (h64: a library made again from the same bytes)
     }
     lib_note(l, "data"); return l;
 }
-__attribute__((ns_returns_retained)) static id h_lib_url(id self, SEL s, id u, NSError **e) { id l = o_lib_url(self, s, u, e); lib_note(l, [[u lastPathComponent] UTF8String] ?: "url"); return l; }
+__attribute__((ns_returns_retained)) static id h_lib_url(id self, SEL s, id u, NSError **e) { id l = o_lib_url(self, s, u, e); if (l) @autoreleasepool { live_tag(l, &g_lib_made, &g_lib_live, NULL, 0); } lib_note(l, [[u lastPathComponent] UTF8String] ?: "url"); return l; }
 
 // ---- reflection ---------------------------------------------------------------------------------------------------
 static NSMutableDictionary<NSString *, NSNumber *> *g_structs;   // (signature -> id)
@@ -181,7 +205,9 @@ static int is_ui_vs(id<MTLFunction> f) {   // (h51: the game's UI vertex shaders
 }
 static void render_note(id p, MTLRenderPipelineDescriptor *d, MTLRenderPipelineReflection *r, const char *how) {
     if (!p) return;
+    live_tag(p, &g_rp_made, &g_rp_live, NULL, 0);
     if (is_ui_vs(d.vertexFunction)) { vxmtl_ui_pipe_add((__bridge void *)p); wui_twin(p, d, d.fragmentFunction); }
+    if (vxprof_on() == 1) { id<MTLFunction> kf = d.fragmentFunction ?: d.vertexFunction; vxprof_pipe_key(p, kf ? objc_getAssociatedObject(kf, kHash) : nil, d.fragmentFunction ? 'f' : 'v'); }
     if (!g_f) return;
     unsigned id_ = atomic_fetch_add(&g_pipe_n, 1) + 1;
     objc_setAssociatedObject(p, kPID, @(id_), OBJC_ASSOCIATION_RETAIN);
@@ -211,6 +237,8 @@ static void render_note(id p, MTLRenderPipelineDescriptor *d, MTLRenderPipelineR
     if (r) { bindings_note(id_, "vert", r.vertexBindings); bindings_note(id_, "frag", r.fragmentBindings); }
 }
 static void compute_note(id p, id<MTLFunction> f, NSString *label, MTLComputePipelineReflection *r, const char *how) {
+    if (p) live_tag(p, &g_cp_made, &g_cp_live, NULL, 0);
+    if (p && vxprof_on() == 1) vxprof_pipe_key(p, f ? objc_getAssociatedObject(f, kHash) : nil, 'k');
     if (!p || !g_f) return;
     unsigned id_ = atomic_fetch_add(&g_pipe_n, 1) + 1;
     objc_setAssociatedObject(p, kPID, @(id_), OBJC_ASSOCIATION_RETAIN);
@@ -223,38 +251,241 @@ static void compute_note(id p, id<MTLFunction> f, NSString *label, MTLComputePip
 }
 static const MTLPipelineOption kRefl = MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo;
 
+// ---- (h64) the game's render pipeline creations: counted, timed, and (VXMAC_PIPE_ARCHIVE=1) kept across launches --------
+// ddgame63d: 7814 render pipelines made in 30 min against ~3700-4100 alive (the game drops and makes them again: ~170 a
+// minute after 15 min), each from a new library (libs_made 4406, alive 4). Counted for the mem line: distinct shaders
+// (library hashes) and distinct pipelines (a key over the functions' library hash + name and the descriptor's state)
+// against repeats (a pipeline made again that was made before in this session), the time each creation took on the
+// game's thread (total, the slowest since the last line, those over 16 ms), the game's descriptors that carry binary
+// archives and the game's own archive calls (adds, serialize).
+// VXMAC_PIPE_ARCHIVE=1 (off by default): our binary archives in Library/Caches/vxmac_pipes/<device>-<OS build>/:
+// every render pipeline the game makes is created with them added to its descriptor's binaryArchives (Metal looks a
+// pipeline up in them before compiling; a miss compiles as before); a pipeline not yet in them is added on a serial
+// background queue (Metal compiles it there again, once), the archive written every 60 s or each 400 adds (a<n>.bin,
+// then reopened from the file and a new one begun), the keys added kept in keys.bin, so the next launch counts
+// "pa_known" (made again with its key in an archive: an expected hit). Never in the game's folders.
+static uint64_t fnv_s(NSString *s, uint64_t h) { const char *c = s.UTF8String; return c ? fnv(c, strlen(c), h) : h; }
+static const void *kConst = &kConst;
+static uint64_t fn_key(id<MTLFunction> f) {
+    if (!f) return 0;
+    NSString *h = objc_getAssociatedObject(f, kHash);
+    uint64_t k = h ? strtoull(h.UTF8String, NULL, 16) : (uint64_t)(uintptr_t)f;
+    if (objc_getAssociatedObject(f, kConst)) k ^= 0x5bd1e995;   // (made with function constants: their values unseen)
+    return fnv_s(f.name, k * 0x100000001b3ULL);
+}
+static uint64_t rp_key(MTLRenderPipelineDescriptor *d) {
+    uint64_t v[24 + 8 * 9 + 31 * 6]; unsigned n = 0;
+    v[n++] = fn_key(d.vertexFunction); v[n++] = fn_key(d.fragmentFunction);
+    v[n++] = d.depthAttachmentPixelFormat; v[n++] = d.stencilAttachmentPixelFormat; v[n++] = d.rasterSampleCount;
+    v[n++] = d.alphaToCoverageEnabled | (d.alphaToOneEnabled << 1) | (d.rasterizationEnabled << 2) | (d.supportIndirectCommandBuffers << 3);
+    v[n++] = d.inputPrimitiveTopology; v[n++] = d.maxVertexAmplificationCount;
+    for (int i = 0; i < 8; i++) {
+        MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];
+        v[n++] = c.pixelFormat; if (!c.pixelFormat) continue;
+        v[n++] = c.blendingEnabled; v[n++] = c.writeMask; v[n++] = c.sourceRGBBlendFactor; v[n++] = c.destinationRGBBlendFactor;
+        v[n++] = c.sourceAlphaBlendFactor; v[n++] = c.destinationAlphaBlendFactor; v[n++] = c.rgbBlendOperation; v[n++] = c.alphaBlendOperation;
+    }
+    MTLVertexDescriptor *vd = d.vertexDescriptor;
+    for (int i = 0; vd && i < 31; i++) {
+        MTLVertexBufferLayoutDescriptor *L = vd.layouts[i]; MTLVertexAttributeDescriptor *A = vd.attributes[i];
+        if (L.stride) { v[n++] = 1000 + i; v[n++] = L.stride; v[n++] = L.stepFunction | ((uint64_t)L.stepRate << 8); }
+        if (A.format) { v[n++] = 2000 + i; v[n++] = A.format | ((uint64_t)A.bufferIndex << 32); v[n++] = A.offset; }
+    }
+    return fnv(v, n * sizeof *v, 0xcbf29ce484222325ULL) | 1;
+}
+// (a set of 64-bit keys, open addressing, 64K at most; returns 1 when the key is new)
+typedef struct { uint64_t *k; unsigned cap, n; pthread_mutex_t l; } keyset;
+static int ks_add(keyset *s, uint64_t key) {
+    int fresh = 0;
+    pthread_mutex_lock(&s->l);
+    if (!s->k) { s->cap = 1 << 16; s->k = calloc(s->cap, sizeof *s->k); }
+    if (s->k && key) {
+        unsigned i = (unsigned)(key * 0x9e3779b97f4a7c15ULL >> 48) & (s->cap - 1);
+        while (s->k[i] && s->k[i] != key) i = (i + 1) & (s->cap - 1);
+        if (!s->k[i] && s->n * 4 < s->cap * 3) { s->k[i] = key; s->n++; fresh = 1; }
+    }
+    pthread_mutex_unlock(&s->l);
+    return fresh;
+}
+static int ks_has(keyset *s, uint64_t key) {
+    int has = 0;
+    pthread_mutex_lock(&s->l);
+    if (s->k && key) { unsigned i = (unsigned)(key * 0x9e3779b97f4a7c15ULL >> 48) & (s->cap - 1); while (s->k[i] && s->k[i] != key) i = (i + 1) & (s->cap - 1); has = s->k[i] == key; }
+    pthread_mutex_unlock(&s->l);
+    return has;
+}
+static keyset g_libset = { .l = PTHREAD_MUTEX_INITIALIZER }, g_rpset = { .l = PTHREAD_MUTEX_INITIALIZER }, g_pa_keys = { .l = PTHREAD_MUTEX_INITIALIZER };
+static _Atomic long g_lib_repeat, g_rp_repeat, g_rp_us, g_rp_max_us, g_rp_slow, g_rp_arch, g_garch_adds, g_garch_ser;
+static _Atomic long g_pa_adds, g_pa_add_fail, g_pa_add_us, g_pa_saved, g_pa_known, g_pa_used;
+void vxpipe_lib_seen(uint64_t h);
+void vxpipe_lib_seen(uint64_t h) { if (!ks_add(&g_libset, h)) atomic_fetch_add(&g_lib_repeat, 1); }
+static void rp_timed(double t0, MTLRenderPipelineDescriptor *d) {
+    long us = (long)((CACurrentMediaTime() - t0) * 1e6);
+    atomic_fetch_add(&g_rp_us, us);
+    long m = atomic_load(&g_rp_max_us); while (us > m && !atomic_compare_exchange_weak(&g_rp_max_us, &m, us)) {}
+    if (us > 16000) atomic_fetch_add(&g_rp_slow, 1);
+    if (d.binaryArchives.count) atomic_fetch_add(&g_rp_arch, 1);
+}
+// our archives
+static int g_pa = -1;
+static id<MTLBinaryArchive> g_pa_add;      // (this session's, pipelines added to it)
+static NSArray *g_pa_read;                 // (earlier files, opened from Library/Caches)
+static NSString *g_pa_dir; static int g_pa_next, g_pa_pending; static double g_pa_saved_at;
+static dispatch_queue_t g_pa_q; static pthread_mutex_t g_pa_l = PTHREAD_MUTEX_INITIALIZER;
+static void pa_keys_save(void) {   // (keys.bin: every key added so far, through a temporary file)
+    pthread_mutex_lock(&g_pa_keys.l);
+    NSMutableData *m = [NSMutableData data];
+    for (unsigned i = 0; g_pa_keys.k && i < g_pa_keys.cap; i++) if (g_pa_keys.k[i]) [m appendBytes:&g_pa_keys.k[i] length:8];
+    pthread_mutex_unlock(&g_pa_keys.l);
+    [m writeToFile:[g_pa_dir stringByAppendingPathComponent:@"keys.bin"] atomically:YES];
+}
+static void pa_serialize(id<MTLDevice> dev, const char *why) {   // (on g_pa_q)
+    if (!g_pa_add || !g_pa_pending) return;
+    NSURL *u = [NSURL fileURLWithPath:[g_pa_dir stringByAppendingPathComponent:[NSString stringWithFormat:@"a%d.bin", g_pa_next]]];
+    NSError *err = nil; double t0 = CACurrentMediaTime();
+    BOOL ok = [g_pa_add serializeToURL:u error:&err];
+    vxmac_log("Metal: pipeline archive %s written (%s): %d pipeline(s), %.0f ms%s%s", u.lastPathComponent.UTF8String, why, g_pa_pending, (CACurrentMediaTime() - t0) * 1e3,
+              ok ? "" : " - failed: ", ok ? "" : err.localizedDescription.UTF8String);
+    if (!ok) return;
+    atomic_fetch_add(&g_pa_saved, g_pa_pending);
+    pa_keys_save();
+    // (the written one reopened from its file for lookups; a new one begun for the adds)
+    MTLBinaryArchiveDescriptor *rd = [MTLBinaryArchiveDescriptor new]; rd.url = u;
+    id<MTLBinaryArchive> r = [dev newBinaryArchiveWithDescriptor:rd error:&err];
+    id<MTLBinaryArchive> fresh = [dev newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&err];
+    pthread_mutex_lock(&g_pa_l);
+    if (r) g_pa_read = [g_pa_read arrayByAddingObject:r];
+    g_pa_add = (g_pa_next < 15) ? fresh : nil;   // (16 files at most: then lookups only)
+    g_pa_next++; g_pa_pending = 0; g_pa_saved_at = CACurrentMediaTime();
+    pthread_mutex_unlock(&g_pa_l);
+}
+static void pa_init(id<MTLDevice> dev) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("VXMAC_PIPE_ARCHIVE");
+        g_pa = e && atoi(e) > 0;
+        if (!g_pa) return;
+        char osb[64] = "?"; size_t ol = sizeof osb; sysctlbyname("kern.osversion", osb, &ol, NULL, 0);
+        NSString *devn = [[dev.name componentsSeparatedByCharactersInSet:[[NSCharacterSet alphanumericCharacterSet] invertedSet]] componentsJoinedByString:@""];
+        NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+        g_pa_dir = [caches stringByAppendingPathComponent:[NSString stringWithFormat:@"vxmac_pipes/%@-%s", devn, osb]];
+        [NSFileManager.defaultManager createDirectoryAtPath:g_pa_dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSMutableArray *rd = [NSMutableArray array]; NSError *err = nil;
+        for (int i = 0; i < 16; i++) {
+            NSString *f = [g_pa_dir stringByAppendingPathComponent:[NSString stringWithFormat:@"a%d.bin", i]];
+            if (![NSFileManager.defaultManager fileExistsAtPath:f]) { g_pa_next = i; break; }
+            MTLBinaryArchiveDescriptor *ad = [MTLBinaryArchiveDescriptor new]; ad.url = [NSURL fileURLWithPath:f];
+            id<MTLBinaryArchive> a = [dev newBinaryArchiveWithDescriptor:ad error:&err];
+            if (a) [rd addObject:a]; else vxmac_log("Metal: pipeline archive %s not opened: %s", f.lastPathComponent.UTF8String, err.localizedDescription.UTF8String);
+            g_pa_next = i + 1;
+        }
+        NSData *kd = [NSData dataWithContentsOfFile:[g_pa_dir stringByAppendingPathComponent:@"keys.bin"]];
+        for (NSUInteger i = 0; i + 8 <= kd.length; i += 8) { uint64_t k; memcpy(&k, (const uint8_t *)kd.bytes + i, 8); ks_add(&g_pa_keys, k); }
+        g_pa_read = rd;
+        g_pa_add = g_pa_next < 16 ? [dev newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&err] : nil;
+        g_pa_q = dispatch_queue_create("vxmac.pipe_archive", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+        g_pa_saved_at = CACurrentMediaTime();
+        vxmac_log("Metal: pipeline archives on (VXMAC_PIPE_ARCHIVE): %lu file(s) from earlier launches, %u key(s), in %s", (unsigned long)rd.count, g_pa_keys.n, g_pa_dir.UTF8String);
+    });
+}
+static MTLRenderPipelineDescriptor *pa_desc(id dev, MTLRenderPipelineDescriptor *d) {   // (the descriptor the game's call is made with)
+    if (g_pa < 0) pa_init(dev);
+    if (g_pa <= 0 || !d) return d;
+    pthread_mutex_lock(&g_pa_l); NSArray *rd = g_pa_read; id ad = g_pa_add; pthread_mutex_unlock(&g_pa_l);
+    if (!rd.count && !ad) return d;
+    MTLRenderPipelineDescriptor *c = [d copy];
+    NSMutableArray *all = [NSMutableArray arrayWithArray:d.binaryArchives ?: @[]];
+    [all addObjectsFromArray:rd]; if (ad) [all addObject:ad];
+    c.binaryArchives = all;
+    atomic_fetch_add(&g_pa_used, 1);
+    return c;
+}
+static void pa_after(id dev, id p, MTLRenderPipelineDescriptor *d) {   // (a pipeline made: added to our archive if new)
+    if (g_pa <= 0 || !p || !d) return;
+    uint64_t k = rp_key(d);
+    if (ks_has(&g_pa_keys, k)) { atomic_fetch_add(&g_pa_known, 1); return; }
+    if (!ks_add(&g_pa_keys, k)) return;
+    MTLRenderPipelineDescriptor *a = [d copy]; a.binaryArchives = nil;
+    dispatch_async(g_pa_q, ^{ @autoreleasepool {
+        pthread_mutex_lock(&g_pa_l); id<MTLBinaryArchive> ar = g_pa_add; pthread_mutex_unlock(&g_pa_l);
+        if (!ar) return;
+        NSError *err = nil; double t0 = CACurrentMediaTime();
+        BOOL ok = [ar addRenderPipelineFunctionsWithDescriptor:a error:&err];
+        atomic_fetch_add(&g_pa_add_us, (long)((CACurrentMediaTime() - t0) * 1e6));
+        if (ok) { atomic_fetch_add(&g_pa_adds, 1); g_pa_pending++; }
+        else if (atomic_fetch_add(&g_pa_add_fail, 1) < 5) vxmac_log("Metal: pipeline archive add failed: %s", err.localizedDescription.UTF8String);
+        if (g_pa_pending >= 400 || (g_pa_pending && CACurrentMediaTime() - g_pa_saved_at >= 60)) pa_serialize(dev, g_pa_pending >= 400 ? "400 added" : "60 s");
+    } });
+}
+void vxpipe_archive_flush(const char *why) {   // (vxmtl: the app goes to the background)
+    if (g_pa <= 0 || !g_pa_q) return;
+    id<MTLDevice> dev = [(id<MTLBinaryArchive>)g_pa_add device];
+    if (dev) dispatch_async(g_pa_q, ^{ @autoreleasepool { pa_serialize(dev, why); } });
+}
+// (the game's own archives' calls, counted: its class hooked when vxmtl's newBinaryArchiveWithDescriptor: hook sees one)
+typedef BOOL (*arch_add_imp)(id, SEL, id, NSError **); typedef BOOL (*arch_ser_imp)(id, SEL, NSURL *, NSError **);
+static arch_add_imp o_aadd, o_acadd; static arch_ser_imp o_aser;
+static int ours_arch(id a) { if (a == g_pa_add) return 1; pthread_mutex_lock(&g_pa_l); BOOL r = [g_pa_read containsObject:a]; pthread_mutex_unlock(&g_pa_l); return r; }
+static BOOL h_aadd(id self, SEL s, id d, NSError **e) { if (g_pa <= 0 || !ours_arch(self)) atomic_fetch_add(&g_garch_adds, 1); return o_aadd(self, s, d, e); }
+static BOOL h_acadd(id self, SEL s, id d, NSError **e) { if (g_pa <= 0 || !ours_arch(self)) atomic_fetch_add(&g_garch_adds, 1); return o_acadd(self, s, d, e); }
+static BOOL h_aser(id self, SEL s, NSURL *u, NSError **e) {
+    int ours = g_pa > 0 && ours_arch(self);
+    BOOL ok = o_aser(self, s, u, e);
+    if (!ours && atomic_fetch_add(&g_garch_ser, 1) < 5) vxmac_log("Metal: the game wrote a binary archive: %s -> %d", u.path.UTF8String, ok);
+    return ok;
+}
+void vxpipe_arch_note(id a) {
+    if (!a) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class c = object_getClass(a);
+        o_aadd = (arch_add_imp)swap(c, @selector(addRenderPipelineFunctionsWithDescriptor:error:), (IMP)h_aadd);
+        o_acadd = (arch_add_imp)swap(c, @selector(addComputePipelineFunctionsWithDescriptor:error:), (IMP)h_acadd);
+        o_aser = (arch_ser_imp)swap(c, @selector(serializeToURL:error:), (IMP)h_aser);
+    });
+}
+
 typedef id (*rp_imp)(id, SEL, id, NSError **) __attribute__((ns_returns_retained));
 typedef id (*rp_opt_imp)(id, SEL, id, MTLPipelineOption, MTLAutoreleasedRenderPipelineReflection *, NSError **) __attribute__((ns_returns_retained));
 typedef void (*rp_cb_imp)(id, SEL, id, MTLNewRenderPipelineStateCompletionHandler);
 typedef void (*rp_opt_cb_imp)(id, SEL, id, MTLPipelineOption, MTLNewRenderPipelineStateWithReflectionCompletionHandler);
 static rp_imp o_rp; static rp_opt_imp o_rp_opt; static rp_cb_imp o_rp_cb; static rp_opt_cb_imp o_rp_opt_cb;
-__attribute__((ns_returns_retained)) static id h_rp(id self, SEL s, MTLRenderPipelineDescriptor *d, NSError **e) {
+static void rp_made(id self, id p, MTLRenderPipelineDescriptor *d, double t0) {   // (each game creation, whichever call)
+    rp_timed(t0, d);
+    if (p && !ks_add(&g_rpset, rp_key(d))) atomic_fetch_add(&g_rp_repeat, 1);
+    pa_after(self, p, d);
+}
+__attribute__((ns_returns_retained)) static id h_rp(id self, SEL s, MTLRenderPipelineDescriptor *d0, NSError **e) {
+    double t0 = CACurrentMediaTime(); MTLRenderPipelineDescriptor *d = pa_desc(self, d0);
     if (g_reflect && o_rp_opt) {
         MTLAutoreleasedRenderPipelineReflection r = nil;
         id p = o_rp_opt(self, @selector(newRenderPipelineStateWithDescriptor:options:reflection:error:), d, kRefl, &r, e);
-        render_note(p, d, r, "sync+r"); return p;
+        rp_made(self, p, d, t0); render_note(p, d0, r, "sync+r"); return p;
     }
-    id p = o_rp(self, s, d, e); render_note(p, d, nil, "sync"); return p;
+    id p = o_rp(self, s, d, e); rp_made(self, p, d, t0); render_note(p, d0, nil, "sync"); return p;
 }
-__attribute__((ns_returns_retained)) static id h_rp_opt(id self, SEL s, MTLRenderPipelineDescriptor *d, MTLPipelineOption opt, MTLAutoreleasedRenderPipelineReflection *rr, NSError **e) {
+__attribute__((ns_returns_retained)) static id h_rp_opt(id self, SEL s, MTLRenderPipelineDescriptor *d0, MTLPipelineOption opt, MTLAutoreleasedRenderPipelineReflection *rr, NSError **e) {
     MTLAutoreleasedRenderPipelineReflection r = nil;
     if (g_reflect) opt |= kRefl;
+    double t0 = CACurrentMediaTime(); MTLRenderPipelineDescriptor *d = pa_desc(self, d0);
     id p = o_rp_opt(self, s, d, opt, &r, e);
     if (rr) *rr = r;
-    render_note(p, d, r, "opt"); return p;
+    rp_made(self, p, d, t0); render_note(p, d0, r, "opt"); return p;
 }
 static void h_rp_cb(id self, SEL s, MTLRenderPipelineDescriptor *d0, MTLNewRenderPipelineStateCompletionHandler h) {
     MTLRenderPipelineDescriptor *d = [d0 copy];   // (the game may reuse its descriptor before the handler runs)
+    MTLRenderPipelineDescriptor *du = pa_desc(self, d); double t0 = CACurrentMediaTime();
     if (g_reflect && o_rp_opt_cb) {
-        o_rp_opt_cb(self, @selector(newRenderPipelineStateWithDescriptor:options:completionHandler:), d0, kRefl,
-                    ^(id<MTLRenderPipelineState> p, MTLRenderPipelineReflection *r, NSError *e) { render_note(p, d, r, "async+r"); h(p, e); });
+        o_rp_opt_cb(self, @selector(newRenderPipelineStateWithDescriptor:options:completionHandler:), du, kRefl,
+                    ^(id<MTLRenderPipelineState> p, MTLRenderPipelineReflection *r, NSError *e) { rp_made(self, p, du, t0); render_note(p, d, r, "async+r"); h(p, e); });
         return;
     }
-    o_rp_cb(self, s, d0, ^(id<MTLRenderPipelineState> p, NSError *e) { render_note(p, d, nil, "async"); h(p, e); });
+    o_rp_cb(self, s, du, ^(id<MTLRenderPipelineState> p, NSError *e) { rp_made(self, p, du, t0); render_note(p, d, nil, "async"); h(p, e); });
 }
 static void h_rp_opt_cb(id self, SEL s, MTLRenderPipelineDescriptor *d0, MTLPipelineOption opt, MTLNewRenderPipelineStateWithReflectionCompletionHandler h) {
     MTLRenderPipelineDescriptor *d = [d0 copy];
-    o_rp_opt_cb(self, s, d0, opt | (g_reflect ? kRefl : 0), ^(id<MTLRenderPipelineState> p, MTLRenderPipelineReflection *r, NSError *e) { render_note(p, d, r, "async-opt"); h(p, r, e); });
+    MTLRenderPipelineDescriptor *du = pa_desc(self, d); double t0 = CACurrentMediaTime();
+    o_rp_opt_cb(self, s, du, opt | (g_reflect ? kRefl : 0), ^(id<MTLRenderPipelineState> p, MTLRenderPipelineReflection *r, NSError *e) { rp_made(self, p, du, t0); render_note(p, d, r, "async-opt"); h(p, r, e); });
 }
 
 typedef id (*cf_imp)(id, SEL, id, NSError **) __attribute__((ns_returns_retained));
@@ -344,6 +575,8 @@ void vxpipe_install_device(Class dc) {
 @property (strong) NSString *head;
 @end
 @implementation VXPassRec
+- (instancetype)init { if ((self = [super init])) atomic_fetch_add(&g_passrec_live, 1); return self; }
+- (void)dealloc { atomic_fetch_sub(&g_passrec_live, 1); }
 @end
 static unsigned tex_id(id<MTLTexture> t) {
     if (!t) return 0;
@@ -405,6 +638,7 @@ static void cam_pass_note(id e, MTLRenderPassDescriptor *pd) {   // (h52: the fr
     if (atomic_exchange(&cframe, fr) == fr) return;
     objc_setAssociatedObject(e, kCamPass, @1, OBJC_ASSOCIATION_RETAIN);
 }
+void vxpipe_enc_clear(id e) { if (objc_getAssociatedObject(e, kCamPass)) objc_setAssociatedObject(e, kCamPass, nil, OBJC_ASSOCIATION_ASSIGN); }   // (h64: vxmtl's enc_clear)
 void vxpipe_render_begin(id e, MTLRenderPassDescriptor *pd) {
     if (e) cam_pass_note(e, pd);
     if (!g_f || !e || !atomic_load(&g_dump)) return;
@@ -725,7 +959,7 @@ static void pipe_add(id e, id p) {
 }
 void vxmtl_ui_pipe_set(id enc, id p);   // (vxmtl.m)
 static int wui_pipe(id e, id p, id *use);
-static void h_rps(id self, SEL s, id p) { id use = p; if (tl_rec_any() && wui_pipe(self, p, &use)) o_rps(self, s, use); else o_rps(self, s, p); vxmtl_ui_pipe_set(self, p); if (g_f) { pipe_add(self, p); VXPassRec *r = rec(self); if (r && r.ui) r.curpipe = p; } }
+static void h_rps(id self, SEL s, id p) { id use = p; if (tl_rec_any() && wui_pipe(self, p, &use)) o_rps(self, s, use); else o_rps(self, s, p); vxmtl_ui_pipe_set(self, p); if (vxprof_live) vxprof_pipe(self, p); if (g_f) { pipe_add(self, p); VXPassRec *r = rec(self); if (r && r.ui) r.curpipe = p; } }
 static void h_rft(id self, SEL s, id t, NSUInteger i) { o_rft(self, s, t, i); rec_read(self, t, "(f)"); }
 static void h_rvt(id self, SEL s, id t, NSUInteger i) { o_rvt(self, s, t, i); rec_read(self, t, "(v)"); }
 static void h_rfts(id self, SEL s, const id __unsafe_unretained *t, NSRange r) { o_rfts(self, s, t, r); for (NSUInteger i = 0; t && i < r.length; i++) rec_read(self, t[i], "(f)"); }
@@ -763,6 +997,8 @@ static int g_wui = -1;
 @property NSValue *scissor, *viewport; @property id pipe; @property int segment, masking, npre; @property void *tex;
 @end
 @implementation VXUIRec
+- (instancetype)init { if ((self = [super init])) atomic_fetch_add(&g_uirec_live, 1); return self; }
+- (void)dealloc { atomic_fetch_sub(&g_uirec_live, 1); }
 @end
 static void wui_twin(id p, MTLRenderPipelineDescriptor *d, id<MTLFunction> fs) {   // (from render_note, UI pipelines only)
     if (g_wui < 0) { const char *e = getenv("VXMAC_WORLD_UI"); g_wui = !(e && !strcmp(e, "0")); }
@@ -774,7 +1010,7 @@ static void wui_twin(id p, MTLRenderPipelineDescriptor *d, id<MTLFunction> fs) {
     NSError *err = nil;
     id<MTLRenderPipelineState> tw = o_rp ? o_rp([(id<MTLRenderPipelineState>)p device], @selector(newRenderPipelineStateWithDescriptor:error:), t, &err)
                                          : [[(id<MTLRenderPipelineState>)p device] newRenderPipelineStateWithDescriptor:t error:&err];
-    if (tw) objc_setAssociatedObject(p, kTwin, tw, OBJC_ASSOCIATION_RETAIN);
+    if (tw) { objc_setAssociatedObject(p, kTwin, tw, OBJC_ASSOCIATION_RETAIN); atomic_fetch_add(&g_twins, 1); }
 }
 // (h60b: split only where it held last time - per layer texture, its last pass reached the HUD's separator with at most 8
 //  draws before it (markers: 1-2). A weapon window / wheel drawn before the separator, or a pass without it, turns the
@@ -963,4 +1199,22 @@ void vxpipe_install_encoders(Class rc, Class cc) {
     }
 #undef S
     out("DUMP encoders %s %s", rc ? class_getName(rc) : "-", cc ? class_getName(cc) : "-");
+}
+
+void vxpipe_mem_stats(char *out, unsigned n) {   // (h62: the host's "mem" line)
+    size_t nb; uint64_t bytes = 0;
+    char enc[160]; void vxmtl_enc_stats(char *, unsigned); vxmtl_enc_stats(enc, sizeof enc); strlcat(enc, "}", sizeof enc);
+    pthread_mutex_lock(&g_brl); nb = g_nbr; for (size_t i = 0; i < g_nbr; i++) bytes += g_br[i].len; pthread_mutex_unlock(&g_brl);
+    snprintf(out, n, "\"mtl\":{\"render_pipes\":%ld,\"render_pipes_made\":%ld,\"compute_pipes\":%ld,\"compute_pipes_made\":%ld,"
+             "\"libs\":%ld,\"libs_made\":%ld,\"lib_data_mb\":%.1f,\"ui_twins\":%ld,\"shared_bufs\":%zu,\"shared_buf_mb\":%llu,"
+             "\"ui_recs\":%ld,\"pass_recs\":%ld,"
+             "\"libs_distinct\":%u,\"libs_repeat\":%ld,\"rp_distinct\":%u,\"rp_repeat\":%ld,\"rp_ms\":%.0f,\"rp_ms_max\":%.1f,\"rp_slow\":%ld,"
+             "\"rp_with_archives\":%ld,\"game_arch_adds\":%ld,\"game_arch_writes\":%ld,%s",
+             atomic_load(&g_rp_live), atomic_load(&g_rp_made), atomic_load(&g_cp_live), atomic_load(&g_cp_made),
+             atomic_load(&g_lib_live), atomic_load(&g_lib_made), atomic_load(&g_lib_bytes) / 1048576.0, atomic_load(&g_twins), nb,
+             (unsigned long long)(bytes >> 20), atomic_load(&g_uirec_live), atomic_load(&g_passrec_live),
+             g_libset.n, atomic_load(&g_lib_repeat), g_rpset.n, atomic_load(&g_rp_repeat), atomic_load(&g_rp_us) / 1e3, atomic_exchange(&g_rp_max_us, 0) / 1e3,
+             atomic_load(&g_rp_slow), atomic_load(&g_rp_arch), atomic_load(&g_garch_adds), atomic_load(&g_garch_ser), enc);
+    if (g_pa > 0) { size_t k = strlen(out); if (k + 2 < n) snprintf(out + k - 1, n - k + 1, ",\"pa\":{\"files\":%lu,\"adds\":%ld,\"add_fail\":%ld,\"add_ms\":%.0f,\"saved\":%ld,\"known\":%ld,\"used\":%ld,\"keys\":%u}}",
+        (unsigned long)g_pa_read.count, atomic_load(&g_pa_adds), atomic_load(&g_pa_add_fail), atomic_load(&g_pa_add_us) / 1e3, atomic_load(&g_pa_saved), atomic_load(&g_pa_known), atomic_load(&g_pa_used), g_pa_keys.n); }
 }

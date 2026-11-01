@@ -31,6 +31,8 @@ void vxkit_set_active(int active);
 // The calling thread is the program's "main thread": the observers it registers are called there (host: before main).
 void vxkit_set_program_thread(void);
 void vxkit_request_quit(void);
+void vxmtl_compositor_interval(double ms);   // (h64: each 5 s window's mean present interval -> VXMAC_GPU_CAP_HALF)
+double vxmtl_gpu_cap(int *half);            // (h64: the cap now; *half: the half-rate start in use)
 void vxmtl_pacing_report(int missed);   // (h60f: the compositor's missed deadlines each 5 s -> the game's GPU cap)   // (h53: [NSApp terminate:] on the program's thread - the program's own quit path)
 // The program presented its first frame (host): GameController notifications held until then are delivered.
 void vxkit_set_program_ready(void);
@@ -42,6 +44,10 @@ void vxmac_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vxmac_set_log_sink(void (*sink)(const char *line));
 // The AppKit selectors that reached the catch-all (unimplemented methods), for the host's log: "Class -sel, ...".
 void vxkit_unknown_selectors(char *out, unsigned size);
+// (h66, vxaudio.m: the program's HAL calls and the HAL plug-ins loaded; slot 0 the mem line, with the busiest threads,
+//  slot 1 vxmac_now.json. vxaudio_hook_image: the program's image after dlopen - its GOT slots to the counters)
+void vxaudio_stats(char *out, unsigned size, int slot);
+void vxaudio_hook_image(const void *mh);
 
 // ---- libvxmtl (Metal) -------------------------------------------------------------------------------------------
 // Called at each [commandBuffer presentDrawable:...] of a CAMetalLayer drawable, before the original, on the

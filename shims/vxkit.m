@@ -788,15 +788,19 @@ static NSEvent *dequeue(unsigned long long mask, BOOL remove) {
             return e;
         }
         double now = [NSDate timeIntervalSinceReferenceDate];
+        // (h62: each slice of the run loop in an autorelease pool of its own - what AppKit's observers on a Mac's main run
+        //  loop do (a pool popped and pushed before each wait and at the exit): objects the run loop's callouts (timers,
+        //  performSelector:s, sources on the program's thread) autorelease are freed after the slice, not left in the
+        //  program thread's pool, which a pthread of ours never drains)
         if (now >= end) {
-            CFRunLoopRunInMode(m, 0, true);              // (a pass over the run loop's sources, as AppKit's does)
+            @autoreleasepool { CFRunLoopRunInMode(m, 0, true); }   // (a pass over the run loop's sources, as AppKit's does)
             e = dequeue(mask, remove);
             if (!e) { if (remove) g_drained = 1; return nil; }
             if (remove) taken(e);
             _current = e; return e;
         }
         double slice = end - now; if (slice > 0.002) slice = 0.002;
-        CFRunLoopRunInMode(m, slice, true);
+        @autoreleasepool { CFRunLoopRunInMode(m, slice, true); }
     }
 }
 - (void)sendEvent:(NSEvent *)e {
@@ -1005,6 +1009,31 @@ static void drop_hops(id center, id observer, NSNotificationName name, id obj, B
 }
 static void h_remove(id self, SEL s, id observer) { drop_hops(self, observer, nil, nil, YES); o_remove(self, s, observer); }
 static void h_remove3(id self, SEL s, id observer, NSNotificationName name, id obj) { drop_hops(self, observer, name, obj, NO); o_remove3(self, s, observer, name, obj); }
+// ---- (h62) NSProcessInfo.physicalMemory: the game's images ask it as well as sysctl hw.memsize (libvxsystem):
+// VXMAC_MEMSIZE_MB answers both (off by default); the first query from outside the host app's own code is logged with
+// its caller and the figure it got.
+#include <dlfcn.h>
+typedef unsigned long long (*physmem_imp)(id, SEL);
+static physmem_imp o_physmem;
+static unsigned long long h_physmem(id self, SEL s) {
+    unsigned long long real = o_physmem(self, s), v = real;
+    const char *e = getenv("VXMAC_MEMSIZE_MB");
+    if (e && *e) v = strtoull(e, NULL, 10) << 20;
+    static int logged;
+    if (!logged) {
+        Dl_info di; void *ra = __builtin_return_address(0);
+        if (dladdr(ra, &di) && di.dli_fname && strstr(di.dli_fname, ".dylib") && !strstr(di.dli_fname, "/usr/lib/") && !strstr(di.dli_fname, "/System/")) {
+            logged = 1; const char *b = strrchr(di.dli_fname, '/');
+            vxmac_log("Foundation: physicalMemory asked by %s+%#lx: %llu MB%s", b ? b + 1 : di.dli_fname, (unsigned long)((uintptr_t)ra - (uintptr_t)di.dli_fbase),
+                      v >> 20, v != real ? " (VXMAC_MEMSIZE_MB)" : "");
+        }
+    }
+    return v;
+}
+__attribute__((constructor)) static void vxkit_physmem_init(void) {
+    Method m = class_getInstanceMethod([NSProcessInfo class], @selector(physicalMemory));
+    if (m) o_physmem = (physmem_imp)method_setImplementation(m, (IMP)h_physmem);
+}
 __attribute__((constructor)) static void vxkit_notes_init(void) {
     Class c = [NSNotificationCenter class];
     o_add = (add_imp)method_setImplementation(class_getInstanceMethod(c, @selector(addObserver:selector:name:object:)), (IMP)h_add);

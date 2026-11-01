@@ -138,6 +138,9 @@ typedef struct {
     float prev_cam[16]; int has_prev; // (vr mode: the camera of the game frame before, for the motion's camera part)
     int head_valid;                  // (0: presented before the first compositor frame; it takes the next frame's head)
     double content_time, interval;
+    __strong id<MTLTexture> vmv; int has_vmv; float vk[2];   // (VX Mac, VXMAC_INTERP=vel: the game's velocity of this frame, copied, and its scale)
+    double gap_before;               // (VX Mac, method 3: this present's own time since the one before (s, 0 unknown): the
+                                     //  interval its velocity covers - the model's motion unit; interval is the smoothed one)
     uint64_t serial;
     uint64_t pseq;                   // (VX Mac: the present's number, vx_xros_vr_next_seq: the SR detail made from it)
     __strong id<MTLTexture> hud, hud_view; int has_hud;   // (VX Mac, h33: the frame's HUD layer, libvxmtl's UI pass)
@@ -200,6 +203,21 @@ static double g_max_gap; static unsigned g_dibr_frames;
 static float g_outside_sum, g_game_tan[2]; static unsigned g_outside_n;
 static unsigned g_frames, g_submits, g_draws, g_noframe, g_depth_frames, g_mv_frames;
 static double g_gpu_ms, g_age_ms; static unsigned g_gpu_n;
+// (VX Mac, method 3: the warp's use of the model's layers - eyes asked / predicted with them, distinct frames, the
+//  predicted time (age) and t, eyes held at the gate, the compositor frames' GPU time with and without the layers;
+//  vx_xros_vr_interp_stats, printed only while VXMAC_INTERP is on (npu_model.m))
+static unsigned long g_iw_conf_off; static unsigned long g_iw_eyes, g_iw_total, g_iw_frames, g_iw_held, g_iw_gpu_n, g_iw_gpu_n0; static uint64_t g_iw_last_seq;
+static double g_iw_age_sum, g_iw_age_max, g_iw_t_sum, g_iw_gpu_ms, g_iw_gpu_ms0; static int g_iw_frame_used;
+static double g_last_gap;
+// (VX Mac, h63c: VXMAC_INTERP - 1 the model's layers (npu_model.m), vel: the same prediction (timing, t cap, 150 ms hold,
+//  camera turn out, no h60 move, depth z-order) on the game's raw velocity with the default kernels (their DIBR hole
+//  rule): no Core ML, no Neural Engine; otherwise off)
+static int interp_mode(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("VXMAC_INTERP"); m = e && !strcmp(e, "1") ? 1 : e && !strcmp(e, "vel") ? 2 : 0; }
+    return m;
+}
+int vx_xros_vr_interp_mode(void) { return interp_mode(); }
 static float g_tan_seen[4];
 
 // ---- the scene's depth (as stereo.m: the depth of the back buffer's aspect with the most depth-tested draws; copied
@@ -242,6 +260,16 @@ void vx_xros_vr_depth_pass(void *cbp, void *texp, uint32_t draws, uint32_t write
         }
     }
     pthread_mutex_unlock(&g_lock);
+}
+
+// (VX Mac, method 3: this frame's scene depth as copied so far, before vx_xros_vr_submit takes it - the training capture
+//  and the model read it in the same command buffer; NULL when no pass wrote it this frame)
+void *vx_xros_vr_scene_depth(uint32_t *w, uint32_t *h, uint32_t *bpp) {
+    pthread_mutex_lock(&g_lock);
+    id<MTLBuffer> b = g_copies > 0 ? g_hold : nil;
+    *w = g_pick_w; *h = g_pick_h; *bpp = g_pick_fmt == MTLPixelFormatDepth16Unorm ? 2 : 4;
+    pthread_mutex_unlock(&g_lock);
+    return (__bridge void *)b;
 }
 
 static id<MTLTexture> slot_tex(id<MTLDevice> dev, id<MTLTexture> t, MTLPixelFormat f, uint32_t w, uint32_t h) {
@@ -366,6 +394,23 @@ void vx_xros_vr_sensitivity(float factor) {
 static double g_move_sum; static unsigned g_move_n;   // (h60: the translation applied, for the log)
 static unsigned g_ref_gen; static unsigned long g_cam_skips, g_yaw_clamps, g_pitch_clamps; static int g_pitch_follows = 1;
 static int g_vehicle; static float g_game_hfov;
+// (h64: combat input and the game's FOV changing hold the detectors still. A run with fights (hab1 d.jsonl, 1800 s)
+//  had 162 vehicle_mode flips at the on-foot FOV (strafing while turning reads as an orbit: |v / w| metres), 89 pitch
+//  axis_freeze "camera moves itself" (recoil, aim snap, ADS's zoom read as a shift), pitch_follow flipping with them -
+//  head pitch went unsent for seconds at a time. Within 1.5 s of the triggers / mouse buttons (vxmac_combat_input) or
+//  1 s of an FOV change: no vehicle entry, no pitch_follow verdict, no "camera moves itself" freeze. VXMAC_COMBAT_GATE=0:
+//  off, as before)
+static double g_combat_t = -100, g_fov_change_t = -100; static int g_combat_bits; static unsigned long g_gated_freezes, g_gated_vehicle, g_gated_follow;
+static int combat_gate_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("VXMAC_COMBAT_GATE"); on = !(e && !strcmp(e, "0")); } return on; }
+static int combat_gate(double now) { return combat_gate_on() && (now - g_combat_t < 1.5 || now - g_fov_change_t < 1.0); }
+// (h64: the game camera's own pitch per present (libvxmtl's view matrix), for the axis checks instead of the picture's
+//  row profile when both frames have one - ADS's zoom and muzzle flashes moved the profile, not the camera)
+static float g_gp_of[64]; static uint64_t g_gp_seq[64];
+static double g_gain_sxy[2], g_gain_sxx[2]; static unsigned g_gain_n[2];   // (h64: the game's yaw per sent yaw, free / aiming)
+// (h64: warp mode 7 - free look and controller aim; below with vr_mouse)
+static int aim_on(void);
+static float g_aim_push_p; static int g_rebase_due; static double g_aim_cam_t;                                // (pitch the cone's edge asks of the game, sent at the next vr_mouse)
+static float g_xh[2][2]; static int g_xh_ok[2];           // (each eye's tangents of the frame's centre: the crosshair's place)
 static float g_cam_rows[9], g_cam_vel[3]; static int g_cam_now_ok;   // (h60: the newest game camera's axes and velocity, m/s)   // (h57e/f: the game's camera is a vehicle's (third-person orbit, below); the game's horizontal FOV)   // (h57: vr mode's zero set again; game camera reads not shown)
 static int g_cam_src = -1, g_cam_src_on = -1; static float g_cam_sy = 1, g_cam_sp = 1, g_cam_off_y, g_cam_off_p; static int g_cam_off_ok, g_cam_pitch_ok;
 static double g_last_poll;
@@ -373,10 +418,55 @@ static float g_pitch_hi = 80, g_pitch_lo = -80;          // (VX Mac, h43: the ga
 static double g_freeze_until[2];                          // (VX Mac, h48: an axis (0 yaw, 1 pitch) the game does not follow now: not sent)
 static float g_pitch_off;                                 // (VX Mac, h43: the estimated game pitch - head pitch, from the picture)   // (VX Mac, h38: the last poll-hook send)
 static int g_poll_in = -1;   // (VX Mac, h38: the head's delta sent when the game polls its events (vx_xros_vr_input_poll), not at each compositor frame; VXMAC_POLL_INPUT=0: the old way)
+// (h64: the learned pitch limit (h43) from the picture is the old way only - VXMAC_PITCH_LEARN=1. With the game's own
+//  pitch read from its constants the closed loop needs no limit (the game drops mouse moves past its own), and the
+//  picture's rule fired on a menu's cut (hab1 d.jsonl 1429 s: -28.7 deg, kept for the rest of the session: the head
+//  could not look further down). The limits now also start again at each vr mode zero)
+static int pitch_learn_old(void) { static int on = -1; if (on < 0) { const char *e = getenv("VXMAC_PITCH_LEARN"); on = e && !strcmp(e, "1"); } return on; }
+// (h64: the pitch account moved back to the head's zero (with g_lock held). Vehicle mode and the free-look cone absorb
+//  the head's pitch into g_pitch_ref; left there, the sent pitch drifted 40-60 deg from the head's (d.jsonl 300-470 s)
+//  and the 80-deg clamp and the pitch limit acted on the drifted account. Every stored sent pitch moves with it, so
+//  the frames' input-based pitch and the game's absolute one stay as they were)
+static void pitch_rebase(void) {
+    float r = g_pitch_ref;
+    if (fabsf(r) < 0.01f) return;
+    g_pitch_ref = 0; g_sent_pitch += r;
+    for (unsigned k = 0; k < 256; k++) g_sent_hist[k].pitch += r;
+    for (unsigned k = 0; k < 1024; k++) g_sendq[k].pitch += r;
+    for (int i = 0; i < 64; i++) { for (int k = 0; k < 4; k++) g_yk[i][k][1] += r; g_stamp_p[i] += r; }
+    if (vx_host_jlog) { char f[64]; snprintf(f, sizeof f, "\"moved_deg\":%.1f", r); vx_host_jlog("pitch_rebase", f); }
+}
+// (h64: warp mode 7, free look and controller aim (VXMAC_AIM=1 starts in it; VXMAC_AIM=cycle only adds it to the warp
+//  mode cycle; unset: no mode 7 at all). The head looks around inside a cone (VXMAC_AIM_CONE="yaw,pitch" half-angles,
+//  default 20,12 deg) without moving the game's camera: the frame stays where the game's camera points, world-fixed, the
+//  off-frame fill and fade around it, and the HUD's crosshair is drawn at the frame's centre, not the head's. Past the
+//  cone's edge the camera is pulled along with the head (yaw: the cone's edge sent 1:1; pitch: the game's own pitch
+//  brought back to the edge, as h52b's loop). The right stick's pitch reaches the game (host.m), so the stick / mouse
+//  aims. VXMAC_AIM_DRIFT=<deg/s> (default 0, off): the camera drifts toward the head inside the cone)
+static int g_aim_avail = -1; static float g_aim_cone_y = 20, g_aim_cone_p = 12, g_aim_drift = 0;
+static void aim_config(void) {
+    if (g_aim_avail >= 0) return;
+    const char *e = getenv("VXMAC_AIM");
+    g_aim_avail = e && *e && strcmp(e, "0") ? (!strcmp(e, "cycle") ? 1 : 2) : 0;
+    const char *c = getenv("VXMAC_AIM_CONE");
+    if (c && *c) { float a = 0, b = 0; int n = sscanf(c, "%f,%f", &a, &b); if (n >= 1 && a >= 0) g_aim_cone_y = a; if (n >= 2 && b >= 0) g_aim_cone_p = b; else if (n == 1) g_aim_cone_p = a * 0.6f; }
+    const char *d = getenv("VXMAC_AIM_DRIFT"); if (d && *d) g_aim_drift = (float)atof(d);
+    if (g_aim_avail) vx_log("VR: warp mode 7 (free look + controller aim) %s; cone +-%.0f yaw, +-%.0f pitch; drift %.1f deg/s", g_aim_avail == 2 ? "at the start" : "in the cycle", g_aim_cone_y, g_aim_cone_p, g_aim_drift);
+}
+static int g_aim_was;
+static int aim_on(void) { return g_warp_mode == 7 && vr_now(); }
+int vx_xros_vr_aim_mode(void) { return aim_on(); }
+static int warp_start_mode(void) {   // (VXMAC_WARP_MODE 0-6, default 6; h64: 7 with VXMAC_AIM, which starts in it when =1)
+    aim_config();
+    const char *e = getenv("VXMAC_WARP_MODE"); int m = e && *e ? atoi(e) : g_aim_avail == 2 ? 7 : 6;
+    return m >= 0 && m <= (g_aim_avail ? 7 : 6) ? m : 6;
+}
 static void vr_mouse(const float *m, double now, int send) {        // (with g_lock held)
     float yaw, pitch; head_angles(m, &yaw, &pitch);
+    if (g_rebase_due) { g_rebase_due = 0; pitch_rebase(); }   // (h64: after vehicle mode, here: no present half-way)
     if (!g_vr_ref || g_recenter) {
-        { const char *e = getenv("VXMAC_PITCH_LIMIT"); if (e && *e) { g_pitch_hi = (float)atof(e); g_pitch_lo = -g_pitch_hi; } }
+        { const char *e = getenv("VXMAC_PITCH_LIMIT"); if (e && *e) { g_pitch_hi = (float)atof(e); g_pitch_lo = -g_pitch_hi; } else if (!pitch_learn_old()) { g_pitch_hi = 80; g_pitch_lo = -80; } }
+        g_aim_push_p = 0;
         g_pitch_off = 0;
         g_recenter = 0; g_vr_ref = 1; g_yaw_ref = yaw; g_ref_gen++; g_cam_off_ok = 0; g_pitch_ref = 0; g_sent_yaw = 0; g_sent_pitch = 0; g_sent_n = 0; g_cam_off_yaw = g_cam_off_pitch = 0;
         vx_log("VR: vr mode's zero: yaw %.1f (the game's camera is taken as level there)", yaw);
@@ -386,6 +476,26 @@ static void vr_mouse(const float *m, double now, int send) {        // (with g_l
     if (now < g_ignore_until) {   // (h54: the game ignores the head and VR stays: the head's moves go into the zero, nothing sent)
         g_yaw_ref = wrap180(g_yaw_ref + wrap180(want_y - g_sent_yaw)); g_pitch_ref += want_p - g_sent_pitch;
         want_y = g_sent_yaw; want_p = g_sent_pitch;
+    }
+    {   // (h64: mode 7's cone - yaw: nothing sent while the head is within the cone of the sent yaw (the frame's, after
+        //  the yaw filter), the cone's edge dragged 1:1 past it; pitch: the head's never sent, only the loop's push)
+        int a = aim_on();
+        if (a) {
+            static double lt; double dt = lt > 0 && now - lt < 0.2 ? now - lt : 0; lt = now;
+            float e = wrap180(want_y - g_sent_yaw);
+            if (e > g_aim_cone_y) want_y = wrap180(want_y - g_aim_cone_y);
+            else if (e < -g_aim_cone_y) want_y = wrap180(want_y + g_aim_cone_y);
+            else if (g_aim_drift > 0 && fabsf(e) > 1.0f) { float s = g_aim_drift * (float)dt; want_y = wrap180(g_sent_yaw + (e > 0 ? fminf(s, e) : fmaxf(-s, e))); }
+            else want_y = g_sent_yaw;
+            if (now - g_aim_cam_t < 0.5) { g_pitch_ref += want_p - g_sent_pitch; want_p = g_sent_pitch + g_aim_push_p; }
+            else {   // (no game camera read: the pitch cone against the sent pitch, as yaw's)
+                float ep = want_p - g_sent_pitch;
+                want_p = ep > g_aim_cone_p ? want_p - g_aim_cone_p : ep < -g_aim_cone_p ? want_p + g_aim_cone_p : g_sent_pitch;
+            }
+            g_aim_push_p = 0;
+        }
+        if (a != g_aim_was) { g_aim_was = a; g_aim_push_p = 0; if (!a) g_rebase_due = 1;
+            if (vx_host_jlog) { char f[96]; snprintf(f, sizeof f, "\"on\":%d,\"cone\":[%.0f,%.0f]", a, g_aim_cone_y, g_aim_cone_p); vx_host_jlog("aim_mode", f); } }
     }
     // (h43: the game's pitch limits - VXMAC_PITCH_LIMIT, else 80, narrowed when the picture stops pitching while the
     //  sent pitch goes on (vx_xros_vr_seen_turn2): never sent beyond them, so the game's pitch and the head's stay one)
@@ -608,16 +718,23 @@ void vx_xros_vr_seen_turn2(uint64_t pseq, float seen, float seen_y) {
         float sent[2] = { wrap180(g_yk[pseq % 64][1][0] - g_yk[(pseq - 1) % 64][1][0]), g_yk[pseq % 64][1][1] - g_yk[(pseq - 1) % 64][1][1] };
         float seen2[2] = { seen, seen_y };
         double tnow = CACurrentMediaTime();
+        // (h64: the pitch from the game's own camera when both frames have it; the gate holds "camera moves itself")
+        int cam_p = combat_gate_on() && g_gp_seq[pseq % 64] == pseq && g_gp_seq[(pseq - 1) % 64] == pseq - 1;
+        if (cam_p) seen2[1] = g_gp_of[pseq % 64] - g_gp_of[(pseq - 1) % 64];
+        int gate = combat_gate(tnow);
         for (int a = 0; a < 2; a++) {
             if (fabsf(sent[a]) > 0.5f && fabsf(seen2[a]) < 0.15f * fabsf(sent[a])) stuck[a]++; else stuck[a] = 0;
             if (fabsf(seen2[a]) > 1.0f && fabsf(sent[a]) < 0.2f) own[a]++; else own[a] = 0;
+            if (gate && own[a] >= 6 && stuck[a] < 6) { own[a] = 0; g_gated_freezes++; continue; }
+            if (aim_on() && a == 1) { stuck[a] = own[a] = 0; continue; }   // (mode 7: the stick pitches the game; the head's pitch is not sent)
             if ((stuck[a] >= 6 || own[a] >= 6) && tnow >= g_freeze_until[a]) {
                 if (stuck[a] >= 6 && g_yk_ok[(pseq - 6) % 64][1]) {
                     float back = a == 0 ? wrap180(g_yk[pseq % 64][1][0] - g_yk[(pseq - 6) % 64][1][0]) : g_yk[pseq % 64][1][1] - g_yk[(pseq - 6) % 64][1][1];
                     if (a == 0) g_sent_yaw = wrap180(g_sent_yaw - back); else g_sent_pitch -= back;
                 }
                 g_freeze_until[a] = tnow + 1.0;
-                if (vx_host_jlog) { char f[96]; snprintf(f, sizeof f, "\"axis\":\"%s\",\"why\":\"%s\"", a ? "pitch" : "yaw", stuck[a] >= 6 ? "no response" : "camera moves itself"); vx_host_jlog("axis_freeze", f); }
+                if (vx_host_jlog) { char f[200]; snprintf(f, sizeof f, "\"axis\":\"%s\",\"why\":\"%s\",\"src\":\"%s\",\"sent\":%.2f,\"seen\":%.2f,\"combat\":%d,\"fov\":%.1f", a ? "pitch" : "yaw", stuck[a] >= 6 ? "no response" : "camera moves itself",
+                                             a && cam_p ? "camera" : "picture", sent[a], seen2[a], g_combat_bits, g_game_hfov); vx_host_jlog("axis_freeze", f); }
                 stuck[a] = own[a] = 0;
             }
         }
@@ -628,6 +745,7 @@ void vx_xros_vr_seen_turn2(uint64_t pseq, float seen, float seen_y) {
         if (fabsf(dpi) > 0.5f) {
             g_pitch_off = g_pitch_off * 0.98f + (seen_y - dpi);   // (the picture's pitch against the sent, summed with a slow decay)
             if (fabsf(cur) > 25 && fabsf(seen_y) < 0.15f * fabsf(dpi) && (cur > 0) == (dpi > 0)) stuck++; else stuck = 0;
+            if (stuck >= 6 && !pitch_learn_old() && g_gp_seq[pseq % 64] == pseq) stuck = 0;   // (h64: the game's own pitch is known: no limit learned)
             if (stuck >= 6) {   // (the game stopped pitching: its limit is about where it stopped)
                 float lim = cur - dpi * 6;
                 if (cur > 0 && lim < g_pitch_hi) { g_pitch_hi = lim; g_sent_pitch = fminf(g_sent_pitch, lim); }
@@ -871,6 +989,7 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
         if (now - plog > 5 && pn > 5 && vx_host_jlog) { double m = ps / pn, sd = sqrt(fmax(0, pss / pn - m * m)); char f[200];
             snprintf(f, sizeof f, "\"mean_ms\":%.1f,\"sd_ms\":%.1f,\"max_ms\":%.0f,\"over100\":%lu,\"frames\":%u,\"move_mean_m\":%.3f", m * 1e3, sd * 1e3, pmx * 1e3, over100, pn, g_move_n ? g_move_sum / g_move_n : 0);
             vx_host_jlog("frame_pacing", f); ps = pss = pmx = 0; pn = 0; over100 = 0; plog = now; g_move_sum = 0; g_move_n = 0; } }
+    g_last_gap = g_last_submit > 0 && now - g_last_submit > 0 && now - g_last_submit < 0.5 ? now - g_last_submit : 0;
     g_last_submit = now;
     g_back_w = w; g_back_h = h;
     {   // (VX Mac, h56: the game's own projection when libvxmtl reads it - the FOV it really renders with (2.5.0 reset it to
@@ -879,11 +998,16 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
         if (on < 0) { const char *e = getenv("VXMAC_GAME_TAN"); on = !(e && !strcmp(e, "0")); }
         if (on && vxmtl_game_tan(&tx, &ty) && tx > 0.1f && ty > 0.1f) {
             g_tan_x_h = tx; if (w && h) C.tan_y = ty;
-            g_game_hfov = 2 * atanf(tx) * 180 / (float)M_PI;
+            float hf = 2 * atanf(tx) * 180 / (float)M_PI;
+            if (g_game_hfov > 0 && fabsf(hf - g_game_hfov) > 0.5f) g_fov_change_t = now;   // (h64: ADS's zoom, a vehicle's camera)
+            g_game_hfov = hf;
         }
         else if (g_tan_x_h > 0 && w && h) C.tan_y = g_tan_x_h * (float)h / (float)w;   // (VX Mac, h31: the horizontal FOV kept at any aspect)
     }
     uint64_t pseq = ++g_present_seq;
+    {   int vxmac_combat_input(void); int cb_bits = vxmac_combat_input();   // (h64: the triggers / mouse buttons, for the gate)
+        if (cb_bits) g_combat_t = now;
+        g_combat_bits = cb_bits; }
     int s = -1;
     for (int k = 0; k < 3 && s < 0; k++) if (k != g_held && k != g_newest && !g_slot[k].writing && !g_slot[k].readers) s = k;
     // (the scene's depth this frame, and the pick for the next)
@@ -954,8 +1078,13 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                 static float pgp, ppi, Kp; static double psxy, psxx, pwin, pkt; static int pfollow = 1;
                 if (fresh) {
                     float pin = pch + g_pitch_ref, dg = gp - pgp, ds = pin - ppi;
-                    if (pkt > 0 && fabsf(ds) < 15 && fabsf(dg) < 15) { psxy += (double)dg * ds; psxx += (double)ds * ds; }
+                    // (h64: not while the gate holds (ADS's zoom sensitivity, recoil, aim assist), nor in mode 7 (the stick
+                    //  pitches; the frame is the game's absolute pitch there))
+                    int pgate = combat_gate(now) || aim_on();
+                    if (pgate) { if (psxx > 0) g_gated_follow++; psxy = psxx = 0; pwin = now; if (aim_on()) pfollow = 1; }
+                    if (!pgate && pkt > 0 && fabsf(ds) < 15 && fabsf(dg) < 15) { psxy += (double)dg * ds; psxx += (double)ds * ds; }
                     pgp = gp; ppi = pin;
+                    g_gp_of[pseq % 64] = gp; g_gp_seq[pseq % 64] = pseq;   // (h64: for the axis checks)
                     if (now - pwin > 1.0) {
                         if (psxx > 4) { double gain = psxy / psxx; int was = pfollow; pfollow = gain > 0.5 ? 1 : gain < 0.25 ? 0 : pfollow;
                             if (was != pfollow && vx_host_jlog) { char f[80]; snprintf(f, sizeof f, "\"follows\":%d,\"gain\":%.2f", pfollow, gain); vx_host_jlog("pitch_follow", f); } }
@@ -986,27 +1115,45 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                     //  the camera turned (over 0.5 deg), the pivot distance d that keeps p + d*f still (p its position, f its
                     //  view axis: least squares); the median of the last 15 over 2 m for 1 s -> vehicle, under 1 m for 1 s
                     //  -> on foot. VXMAC_VEHICLE=0 off; vehicle_signal logged every 5 s)
-                    static float pp[3], pf[3], ring[15]; static int have, nr, veh_on = -1; static double hi_since, lo_since, slog;
+                    // (h64: entry also needs the pivot with the camera's own translation taken out - its velocity from the
+                    //  recent frames that did not turn - over 1.5 m (strafing while turning gave |v / w|: 2-7 m on foot,
+                    //  d.jsonl), 2 s of it, and not within the combat gate (triggers, mouse buttons, an FOV change); samples
+                    //  across an FOV change are skipped. Leaving is as before. VXMAC_COMBAT_GATE=0: h57f's rule as it was)
+                    static float pp[3], pf[3], ring[15], ring2[15], vh[3]; static int have, nr, veh_on = -1; static double hi_since, lo_since, slog, vt;
                     if (veh_on < 0) { const char *e = getenv("VXMAC_VEHICLE"); veh_on = !(e && !strcmp(e, "0")); }
                     if (fresh && veh_on) {
+                        int gate_on = combat_gate_on();
                         float P[3], Fv[3] = { gm[8], gm[9], gm[10] };
                         for (int i = 0; i < 3; i++) P[i] = -(gm[3] * gm[i] + gm[7] * gm[4 + i] + gm[11] * gm[8 + i]);
-                        if (have) {
+                        double vdt = vt > 0 ? now - vt : 0; vt = now;
+                        if (have && !(gate_on && now - g_fov_change_t < 0.5)) {
                             float df[3], dp[3], ff = 0, pf_ = 0;
                             for (int i = 0; i < 3; i++) { df[i] = Fv[i] - pf[i]; dp[i] = P[i] - pp[i]; ff += df[i] * df[i]; pf_ += dp[i] * df[i]; }
-                            if (ff > 0.0087f * 0.0087f) { float d = fabsf(-pf_ / ff); if (d < 50) ring[nr++ % 15] = d; }
+                            if (vdt > 0.005 && vdt < 0.3 && ff < 0.0035f * 0.0035f) for (int i = 0; i < 3; i++) vh[i] = 0.5f * vh[i] + 0.5f * dp[i] / (float)vdt;
+                            if (vdt >= 0.3) for (int i = 0; i < 3; i++) vh[i] = 0;
+                            if (ff > 0.0087f * 0.0087f) { float d = fabsf(-pf_ / ff);
+                                if (d < 50) { float q = 0; for (int i = 0; i < 3; i++) q += (dp[i] - vh[i] * (float)(vdt < 0.3 ? vdt : 0)) * df[i];
+                                    ring[nr % 15] = d; ring2[nr % 15] = -q / ff; nr++; } }
                         }
                         memcpy(pp, P, sizeof P); memcpy(pf, Fv, sizeof Fv); have = 1;
-                        int n = nr < 15 ? nr : 15; float med = 0;
-                        if (n >= 5) { float t2[15]; memcpy(t2, ring, n * sizeof(float)); qsort(t2, n, sizeof(float), cmpf); med = t2[n / 2]; }
-                        if (n >= 5 && med > 2.0f) { if (!hi_since) hi_since = now; } else hi_since = 0;
+                        int n = nr < 15 ? nr : 15; float med = 0, med2 = 0;
+                        if (n >= 5) { float t2[15]; memcpy(t2, ring, n * sizeof(float)); qsort(t2, n, sizeof(float), cmpf); med = t2[n / 2];
+                                      memcpy(t2, ring2, n * sizeof(float)); qsort(t2, n, sizeof(float), cmpf); med2 = t2[n / 2]; }
+                        int gated = gate_on && combat_gate(now);
+                        int enter = n >= 5 && med > 2.0f && (!gate_on || med2 > 1.5f);
+                        if (enter && gated) { if (hi_since) g_gated_vehicle++; enter = 0; }
+                        if (enter) { if (!hi_since) hi_since = now; } else hi_since = 0;
                         if (n >= 5 && med < 1.0f) { if (!lo_since) lo_since = now; } else lo_since = 0;
                         int was = g_vehicle;
-                        if (!g_vehicle && hi_since && now - hi_since > 1.0) g_vehicle = 1;
+                        if (!g_vehicle && hi_since && now - hi_since > (gate_on ? 2.0 : 1.0)) g_vehicle = 1;
                         if (g_vehicle && lo_since && now - lo_since > 1.0) g_vehicle = 0;
-                        if (was != g_vehicle) { vx_log("VR: vehicle mode %s (the camera's pivot %.1f m ahead; FOV %.1f)", g_vehicle ? "on: no head pitch sent, the frame within 10 deg of the head's pitch" : "off", med, g_game_hfov);
-                            if (vx_host_jlog) { char f[96]; snprintf(f, sizeof f, "\"on\":%d,\"pivot_m\":%.2f,\"fov\":%.1f", g_vehicle, med, g_game_hfov); vx_host_jlog("vehicle_mode", f); } }
-                        if (now - slog > 5 && vx_host_jlog) { slog = now; char f[96]; snprintf(f, sizeof f, "\"pivot_m\":%.2f,\"samples\":%d,\"vehicle\":%d,\"fov\":%.1f", med, n, g_vehicle, g_game_hfov); vx_host_jlog("vehicle_signal", f); }
+                        if (was != g_vehicle) { vx_log("VR: vehicle mode %s (the camera's pivot %.1f m ahead, %.1f without its translation; FOV %.1f)", g_vehicle ? "on: no head pitch sent, the frame within 10 deg of the head's pitch" : "off", med, med2, g_game_hfov);
+                            if (vx_host_jlog) { char f[160]; snprintf(f, sizeof f, "\"on\":%d,\"pivot_m\":%.2f,\"pivot_vc_m\":%.2f,\"fov\":%.1f,\"combat\":%d", g_vehicle, med, med2, g_game_hfov, g_combat_bits); vx_host_jlog("vehicle_mode", f); }
+                            if (!g_vehicle && gate_on) g_rebase_due = 1; }
+                        if (now - slog > 5 && vx_host_jlog) { slog = now; char f[240];
+                            snprintf(f, sizeof f, "\"pivot_m\":%.2f,\"pivot_vc_m\":%.2f,\"samples\":%d,\"vehicle\":%d,\"fov\":%.1f,\"combat\":%d,\"gated_vehicle\":%lu,\"gated_freezes\":%lu,\"gated_follow\":%lu",
+                                     med, med2, n, g_vehicle, g_game_hfov, g_combat_bits, g_gated_vehicle, g_gated_freezes, g_gated_follow);
+                            vx_host_jlog("vehicle_signal", f); }
                     }
                 }
                 if (!g_vehicle) np += Kp;
@@ -1014,7 +1161,7 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                 {   // (h57c: at most 25 deg from the input-based pitch; h57e: on a vehicle 10 - the frame's centre follows the head's
                     //  pitch within 10 deg, the vehicle camera's own pitch inside that)
                     float lim = g_vehicle ? 10.f : 25.f;
-                    if (fabsf(np - pch) > lim) { np = pch + (np > pch ? lim : -lim); g_pitch_clamps++; }
+                    if (!aim_on() && fabsf(np - pch) > lim) { np = pch + (np > pch ? lim : -lim); g_pitch_clamps++; }   // (h64: mode 7 - the stick pitches: the game's own pitch, unclamped)
                 }
                 // (h52b: the loop closed on the game's true pitch - each new game frame, the head's pitch (the controller's
                 //  share left out) against the game's: a quarter of the error, at most 3 deg a frame, outside 0.3 deg, is
@@ -1024,7 +1171,12 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                 if (fresh && g_head_valid) {
                     float hy, hp; head_angles(g_head, &hy, &hp);
                     float err = (hp - g_cam_off_pitch) - gp; resid = err;
-                    if (corr_on && g_pitch_follows && fabsf(err) > 0.3f && now >= g_freeze_until[1] && now >= g_nocontrol_until && now >= g_ignore_until && g_look_hold) {
+                    if (aim_on()) {   // (h64: mode 7 - only past the cone's edge: half the excess a game frame, at most 4 deg)
+                        float ex = fabsf(err) - g_aim_cone_p;
+                        g_aim_cam_t = now;
+                        if (ex > 0 && !g_vehicle && now >= g_nocontrol_until && now >= g_ignore_until && g_look_hold) { float c = 0.5f * ex; if (c > 4) c = 4; g_aim_push_p += err > 0 ? c : -c; }
+                    }
+                    else if (corr_on && g_pitch_follows && fabsf(err) > 0.3f && now >= g_freeze_until[1] && now >= g_nocontrol_until && now >= g_ignore_until && g_look_hold) {
                         float c = 0.25f * err; if (c > 3) c = 3; if (c < -3) c = -3;
                         g_sent_pitch -= c;
                     }
@@ -1054,6 +1206,17 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                             if (n_dis > 3 * n_ag) { ysign = -ysign; gy = -gy; K = wrap180(gy - (cons_y + g_cam_off_yaw)); pgy = gy; vx_log("VR: the game's heading turns against the input (%d of %d frames): its sign flipped, re-anchored", n_dis, n_ag + n_dis); }
                             else vx_log("VR: the game's heading turns with the input in %d of %d frames", n_ag, n_ag + n_dis);
                             n_ag = n_dis = -100000;   // (decided once)
+                        }
+                    }
+                    {   // (h64: the game's turn per sent turn, aiming (left trigger / right mouse button) and not: ADS's own
+                        //  sensitivity, aim assist and snap show here; logged with game_cam_yaw)
+                        static float lgy, lci; static int lh;
+                        if (fresh) {
+                            float dg = wrap180(gy - lgy), di = wrap180((cons_y + g_cam_off_yaw) - lci);
+                            int vxmac_stick_active(void);
+                            if (lh && fabsf(di) > 0.3f && fabsf(di) < 20 && fabsf(dg) < 20 && !vxmac_stick_active()) {
+                                int ai = (g_combat_bits & 1) != 0; g_gain_sxy[ai] += (double)dg * di; g_gain_sxx[ai] += (double)di * di; g_gain_n[ai]++; }
+                            lgy = gy; lci = cons_y + g_cam_off_yaw; lh = 1;
                         }
                     }
                     {   // (h57c: one rule, a complementary filter - the offset (game heading - input heading) follows its target
@@ -1087,8 +1250,11 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                     cons_y = y; y = wrap180(yt - g_cam_off_yaw);
                     if (fresh && g_head_valid) { float hy, hp; head_angles(g_head, &hy, &hp); yresid = wrap180((hy - g_yaw_ref) - y); }
                 }
-                if (now - ylog_t > 5 && vx_host_jlog && yaw_on) { ylog_t = now; char f[160];
-                    snprintf(f, sizeof f, "\"game_minus_input_yaw\":%.2f,\"head_minus_frame_yaw\":%.2f,\"cam_reads_skipped\":%lu,\"yaw_offset\":%.1f,\"yaw_clamps\":%lu,\"pitch_clamps\":%lu", wrap180(y - cons_y), yresid, g_cam_skips, K, g_yaw_clamps, g_pitch_clamps);
+                if (now - ylog_t > 5 && vx_host_jlog && yaw_on) { ylog_t = now; char f[360];
+                    snprintf(f, sizeof f, "\"game_minus_input_yaw\":%.2f,\"head_minus_frame_yaw\":%.2f,\"cam_reads_skipped\":%lu,\"yaw_offset\":%.1f,\"yaw_clamps\":%lu,\"pitch_clamps\":%lu,"
+                             "\"free_gain\":%.2f,\"free_n\":%u,\"aim_gain\":%.2f,\"aim_n\":%u,\"aim_mode\":%d", wrap180(y - cons_y), yresid, g_cam_skips, K, g_yaw_clamps, g_pitch_clamps,
+                             g_gain_sxx[0] > 0 ? g_gain_sxy[0] / g_gain_sxx[0] : 0.0, g_gain_n[0], g_gain_sxx[1] > 0 ? g_gain_sxy[1] / g_gain_sxx[1] : 0.0, g_gain_n[1], aim_on());
+                    memset(g_gain_sxy, 0, sizeof g_gain_sxy); memset(g_gain_sxx, 0, sizeof g_gain_sxx); memset(g_gain_n, 0, sizeof g_gain_n);
                     vx_host_jlog("game_cam_yaw", f); }
             }
             if (q && q != last_q2) { if (last_q2 && q > last_q2 + 1) g_cam_skips += q - last_q2 - 1; last_q2 = q; }
@@ -1140,6 +1306,20 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     S->w = w; S->h = h;
     S->has_depth = S->has_mv = S->has_proj = 0;
     S->has_hud = 0;
+    S->has_vmv = 0;
+    if (interp_mode() == 2) {   // (h63c: the game's newest velocity copy (velocity.m: this frame's, verified or not) kept with the frame)
+        void *vxmac_vel_latest_tex(uint32_t *w, uint32_t *h, float k[2], float *corr, int *verified);
+        uint32_t vw = 0, vh = 0; float k[2] = { 0, 0 }, corr = 0; int ver = 0;
+        id<MTLTexture> vt = (__bridge id<MTLTexture>)vxmac_vel_latest_tex(&vw, &vh, k, &corr, &ver);
+        if (vt && vw && vh) {
+            S->vmv = slot_tex(dev, S->vmv, vt.pixelFormat, vw, vh);
+            [b copyFromTexture:vt sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(vw, vh, 1)
+                     toTexture:S->vmv destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            static float kdef = 0; if (!kdef) { const char *e = getenv("VXMAC_INTERP_VEL_K"); kdef = e && *e ? (float)atof(e) : -1.05f; }
+            int kok = ver && fabsf(k[0]) > 0.1f;
+            S->vk[0] = kok ? k[0] : kdef; S->vk[1] = kok ? k[1] : kdef; S->has_vmv = 1;
+        }
+    }
     if (g_hud_in) {   // (VX Mac, h33: the HUD layer copied with the frame, in the same command buffer after the UI pass)
         id<MTLTexture> hin = g_hud_in; g_hud_in = nil;
         id<MTLTexture> was_h = S->hud;
@@ -1266,6 +1446,7 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     memcpy(S->head, head, sizeof head);
     S->head_valid = head_valid;
     S->content_time = now; S->interval = interval;
+    pthread_mutex_lock(&g_lock); S->gap_before = g_last_gap; pthread_mutex_unlock(&g_lock);
     pthread_mutex_lock(&g_lock);
     S->cam_ok = g_cam_now_ok; g_cam_now_ok = 0; memcpy(S->cam_rows, g_cam_rows, sizeof g_cam_rows); memcpy(S->cam_vel, g_cam_vel, sizeof g_cam_vel);
     pthread_mutex_unlock(&g_lock);
@@ -1297,8 +1478,27 @@ static id<MTLTexture> g_zero_mv, g_far_depth;
 static double g_report;
 
 
-int vx_xros_vr_begin_frame(const float m[16], double presentation_time) {
+int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
     config();
+    // (h64: no device anchor this frame (VXMacImmersive.swift passes the identity then): the last tracked head is kept -
+    //  the identity sent the game's camera to the zero's heading and back in one frame. Logged as head_tracking on each
+    //  loss and recovery. VXMAC_HEAD_HOLD=0: the identity as before)
+    const float *m = m_in;
+    {   static float last[16]; static int have, lost, on = -1; static double lost_t; static unsigned long losses, lost_frames;
+        if (on < 0) { const char *e = getenv("VXMAC_HEAD_HOLD"); on = !(e && !strcmp(e, "0")); }
+        int ident = m_in[0] == 1 && m_in[5] == 1 && m_in[10] == 1 && m_in[15] == 1 && m_in[12] == 0 && m_in[13] == 0 && m_in[14] == 0 &&
+                    m_in[1] == 0 && m_in[2] == 0 && m_in[4] == 0 && m_in[6] == 0 && m_in[8] == 0 && m_in[9] == 0;
+        if (ident && have) {
+            lost_frames++;
+            if (!lost) { lost = 1; losses++; lost_t = CACurrentMediaTime();
+                if (vx_host_jlog) { char f[96]; snprintf(f, sizeof f, "\"lost\":1,\"losses\":%lu,\"held\":%d", losses, on); vx_host_jlog("head_tracking", f); } }
+            if (on) m = last;
+        } else if (!ident) {
+            if (lost) { lost = 0;
+                if (vx_host_jlog) { char f[128]; snprintf(f, sizeof f, "\"lost\":0,\"lost_s\":%.2f,\"lost_frames\":%lu", CACurrentMediaTime() - lost_t, lost_frames); vx_host_jlog("head_tracking", f); } }
+            memcpy(last, m_in, sizeof last); have = 1;
+        }
+    }
     vx_input_chords_poll();
     {   // (the mode shown changed: vr's zero at the head as it is now; the screen placed again ahead of it)
         pthread_mutex_lock(&g_lock);
@@ -1845,12 +2045,13 @@ static int draw_hud_layer(id<MTLCommandBuffer> cb, void *outp, int eye, const fl
     if (!g_hl_pso || g_hl_cf != out.pixelFormat) {
         NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
             "struct V { float4 p [[position]]; float2 uv; };\n"
-            "struct LP { int opaque; int pad[3]; float4 ex; float4 uvr; };\n"   // (ex: a UV rectangle left out; uvr: the part of the texture drawn)
+            "struct LP { int opaque; int pad[3]; float4 ex; float4 uvr; float4 ex2; };\n"   // (ex, ex2: UV rectangles left out; uvr: the part of the texture drawn)
             "vertex V lv(uint i [[vertex_id]], constant float4 &r [[buffer(0)]], constant LP &l [[buffer(1)]]) { float2 c = float2(i & 1, i >> 1); V o;\n"
             "  o.p = float4(mix(r.x, r.z, c.x), mix(r.y, r.w, c.y), 0, 1); o.uv = mix(l.uvr.xy, l.uvr.zw, c); return o; }\n"
             "fragment float4 lf(V i [[stage_in]], texture2d<float> t [[texture(0)]], constant LP &l [[buffer(0)]]) {\n"
             "  constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
             "  if (l.ex.z > l.ex.x && all(i.uv >= l.ex.xy) && all(i.uv <= l.ex.zw)) discard_fragment();\n"
+            "  if (l.ex2.z > l.ex2.x && all(i.uv >= l.ex2.xy) && all(i.uv <= l.ex2.zw)) discard_fragment();\n"
             "  if (l.opaque == 2) return float4(0, 0, 0, 0.92);\n"   // (h46: the menu's backdrop)
             "  int opaque = l.opaque;\n"
             "  float2 du = dfdx(i.uv) * 0.25, dv = dfdy(i.uv) * 0.25;\n"
@@ -1887,7 +2088,7 @@ static int draw_hud_layer(id<MTLCommandBuffer> cb, void *outp, int eye, const fl
     [e setVertexBytes:r length:sizeof r atIndex:0];
     if (menu) {   // (h46: a dark backdrop over the eye first - the world-placed frame behind the menu panel never shows doubled)
         float full[4] = { -1, 1, 1, -1 };
-        struct { int opaque; int pad[3]; float ex[4]; float uvr[4]; } B = { 2, { 0 }, { 0, 0, 0, 0 }, { 0, 0, 1, 1 } };
+        struct { int opaque; int pad[3]; float ex[4]; float uvr[4]; float ex2[4]; } B = { 2, { 0 }, { 0, 0, 0, 0 }, { 0, 0, 1, 1 }, { 0, 0, 0, 0 } };
         [e setVertexBytes:full length:sizeof full atIndex:0];
         [e setVertexBytes:&B length:sizeof B atIndex:1];
         [e setFragmentBytes:&B length:sizeof B atIndex:0];
@@ -1899,8 +2100,14 @@ static int draw_hud_layer(id<MTLCommandBuffer> cb, void *outp, int eye, const fl
     // (h45: the subtitles' band (u 0.15-0.85, v 0.78-0.97) left out of the layer and drawn on its own, 0.8x, from 8 to
     //  ~14 deg below the centre - they sat low; VXMAC_SUB=0: as part of the layer)
     static int sub = -1; if (sub < 0) { const char *ev = getenv("VXMAC_SUB"); sub = !(ev && !strcmp(ev, "0")); }
-    struct { int opaque; int pad[3]; float ex[4]; float uvr[4]; } L = { menu, { 0 }, { 0, 0, 0, 0 }, { 0, 0, 1, 1 } };
+    struct { int opaque; int pad[3]; float ex[4]; float uvr[4]; float ex2[4]; } L = { menu, { 0 }, { 0, 0, 0, 0 }, { 0, 0, 1, 1 }, { 0, 0, 0, 0 } };
     if (sub && !menu) { L.ex[0] = 0.15f; L.ex[1] = 0.78f; L.ex[2] = 0.85f; L.ex[3] = 0.97f; }
+    // (h64: mode 7 - the crosshair (the HUD's centre, VXMAC_AIM_XHAIR half-width in UV, default 0.05) cut from the
+    //  head-locked layer and drawn where the frame's centre is in this eye, at the layer's own scale: the gun's aim)
+    static float xh = -1; if (xh < 0) { const char *ev = getenv("VXMAC_AIM_XHAIR"); xh = ev && *ev ? (float)atof(ev) : 0.05f; if (xh > 0.3f) xh = 0.3f; }
+    int xhair = !menu && eye >= 0 && eye < 2 && g_xh_ok[eye] && xh > 0;
+    float xv = xh * (float)src.width / (float)src.height;
+    if (xhair) { L.ex2[0] = 0.5f - xh; L.ex2[1] = 0.5f - xv; L.ex2[2] = 0.5f + xh; L.ex2[3] = 0.5f + xv; }
     [e setVertexBytes:&L length:sizeof L atIndex:1];
     [e setFragmentBytes:&L length:sizeof L atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -1909,10 +2116,20 @@ static int draw_hud_layer(id<MTLCommandBuffer> cb, void *outp, int eye, const fl
         float top = -tanf(8 * (float)M_PI / 180), cx2 = shift;
         float r2[4] = { (cx2 - bw / 2 + tan[0]) / (tan[0] + tan[1]) * 2 - 1, (top + tan[3]) / (tan[2] + tan[3]) * 2 - 1,
                         (cx2 + bw / 2 + tan[0]) / (tan[0] + tan[1]) * 2 - 1, (top - bh + tan[3]) / (tan[2] + tan[3]) * 2 - 1 };
-        struct { int opaque; int pad[3]; float ex[4]; float uvr[4]; } L2 = { 0, { 0 }, { 0, 0, 0, 0 }, { 0.15f, 0.78f, 0.85f, 0.97f } };
+        struct { int opaque; int pad[3]; float ex[4]; float uvr[4]; float ex2[4]; } L2 = { 0, { 0 }, { 0, 0, 0, 0 }, { 0.15f, 0.78f, 0.85f, 0.97f }, { 0, 0, 0, 0 } };
         [e setVertexBytes:r2 length:sizeof r2 atIndex:0];
         [e setVertexBytes:&L2 length:sizeof L2 atIndex:1];
         [e setFragmentBytes:&L2 length:sizeof L2 atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+    if (xhair) {
+        float cx3 = g_xh[eye][0] + shift, cy3 = g_xh[eye][1], bw = 2 * hw * 2 * xh, bh = 2 * hh * 2 * xv;
+        float r3[4] = { (cx3 - bw / 2 + tan[0]) / (tan[0] + tan[1]) * 2 - 1, (cy3 + bh / 2 + tan[3]) / (tan[2] + tan[3]) * 2 - 1,
+                        (cx3 + bw / 2 + tan[0]) / (tan[0] + tan[1]) * 2 - 1, (cy3 - bh / 2 + tan[3]) / (tan[2] + tan[3]) * 2 - 1 };
+        struct { int opaque; int pad[3]; float ex[4]; float uvr[4]; float ex2[4]; } L3 = { 0, { 0 }, { 0, 0, 0, 0 }, { 0.5f - xh, 0.5f - xv, 0.5f + xh, 0.5f + xv }, { 0, 0, 0, 0 } };
+        [e setVertexBytes:r3 length:sizeof r3 atIndex:0];
+        [e setVertexBytes:&L3 length:sizeof L3 atIndex:1];
+        [e setFragmentBytes:&L3 length:sizeof L3 atIndex:0];
         [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     }
     [e endEncoding];
@@ -2070,6 +2287,17 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
     static int warp_depth = -1; if (warp_depth < 0) { const char *e = getenv("VXMAC_WARP_DEPTH"); warp_depth = !(e && !strcmp(e, "0")); }
     if (!warp_depth) use_dibr = 0;                       // (VX Mac, h33: VXMAC_WARP_DEPTH=0 - rotation only, for an A/B)
     g_dibr_frames += use_dibr;
+    // (VX Mac, method 3: the Neural Engine's layers of this very frame (app/Sources/npu_model.m, VXMAC_INTERP=1; off,
+    //  or no result for this frame yet: none, and everything below is as before). With them the frame is predicted to
+    //  this eye's time with the model's cleaned motion, its holes filled from the model's fill, weighted by its conf -
+    //  needs the frame's own interval (its velocity's) and, in vr mode, the camera of the frame before (its turn is
+    //  the head's, taken out of the motion: the pose reprojects it))
+    void *i_tex = NULL; uint32_t i_w = 0, i_h = 0;
+    int vxmac_interp_result(uint64_t seq, void **tex, uint32_t *w, uint32_t *h);
+    int i_vel = interp_mode() == 2;
+    int i_use = (i_vel ? S->has_vmv : vxmac_interp_result(S->pseq, &i_tex, &i_w, &i_h)) && C.predict && S->gap_before > 0.005 && S->gap_before < 0.4 &&
+                (!vr_now() || S->has_prev);
+    static int i_move = -1; if (i_move < 0) { const char *e = getenv("VXMAC_INTERP_MOVE"); i_move = e && !strcmp(e, "1"); }
     static const float sg[3] = { 1, 1, -1 };
     {   // (VX Mac, h37: the eye's position against the frame's camera (leaning, the neck, the eye's offset) - the depth warp's
         //  parallax, 6DoF; clamped to 15 cm: a frame that old is not moved further. The warp mode (L3+R3 held 1 s cycles it,
@@ -2077,7 +2305,7 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
         //  3 depth + translation within 3 cm)
         if (g_warp_mode < 0) {   // (h38: the start mode - 2, the frame turned whole like a monitor (no per-pixel depth): the
                                  //  user read the depth warp's parallax as distortion; VXMAC_WARP_MODE=0-5)
-            const char *e = getenv("VXMAC_WARP_MODE"); int m = e && *e ? atoi(e) : 6; g_warp_mode = m >= 0 && m <= 6 ? m : 6;
+            g_warp_mode = warp_start_mode();
             vx_log("VR: warp mode %d at the start", g_warp_mode);
             if (vx_host_jlog) { char f[48]; snprintf(f, sizeof f, "\"mode\":%d,\"start\":1", g_warp_mode); vx_host_jlog("warp_mode", f); }
         }
@@ -2087,7 +2315,7 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
         float n = sqrtf(M[12] * M[12] + M[13] * M[13] + M[14] * M[14]);
         if (n > lim) { float k = lim / n; M[12] *= k; M[13] *= k; M[14] *= k; }
         if (g_warp_mode == 2) use_dibr = 0;
-        if (g_warp_mode == 6) {   // (6, the default since h38: the frame turned whole with the head (no head translation, no
+        if (g_warp_mode == 6 || g_warp_mode == 7) {   // (h64: 7 draws as 6) (6, the default since h38: the frame turned whole with the head (no head translation, no
                                   //  depth-dependent term from motion) and each eye's fixed half-IPD baseline from the depth
                                   //  - stereo that never changes with head motion: 3D without swimming. VXMAC_IPD (m, 0.064))
             static float ipd = -1; if (ipd < 0) { const char *e = getenv("VXMAC_IPD"); ipd = e && *e ? (float)atof(e) : 0.064f; }
@@ -2097,7 +2325,8 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
             //  VXMAC_MOVE_MAX m, default 0.3; VXMAC_MOVE=0 off): new frames no longer step forward every 50-150 ms)
             static int mv_on = -1; static float mv_max = 0.3f;
             if (mv_on < 0) { const char *e = getenv("VXMAC_MOVE"); mv_on = !(e && !strcmp(e, "0")); e = getenv("VXMAC_MOVE_MAX"); if (e && *e) mv_max = (float)atof(e); }
-            if (mv_on && use_dibr && S->cam_ok && vr_now()) {
+            // (method 3: not with the model's motion - the camera's own motion is in it (VXMAC_INTERP_MOVE=1: both))
+            if (mv_on && use_dibr && S->cam_ok && vr_now() && !(i_use && !i_move)) {
                 float age = (float)(pt - S->content_time); if (age < 0) age = 0; if (age > 0.2f) age = 0.2f;
                 float dw[3] = { S->cam_vel[0] * age, S->cam_vel[1] * age, S->cam_vel[2] * age };
                 float d[3] = { S->cam_rows[0] * dw[0] + S->cam_rows[1] * dw[1] + S->cam_rows[2] * dw[2],
@@ -2128,6 +2357,11 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
         float a = acosf(c) * 180 / (float)M_PI;
         pthread_mutex_lock(&g_lock); g_rot_sum += a; g_rot_n++; if (a > g_rot_max) g_rot_max = a; pthread_mutex_unlock(&g_lock);
     }
+    if (eye >= 0 && eye < 2) {   // (h64: mode 7 - the frame's centre (the gun's aim) in this eye's tangents, for the crosshair)
+        float ex = p.rot[2], ey = p.rot[5], ez = p.rot[8];
+        g_xh_ok[eye] = aim_on() && ez > 0.2f;
+        if (g_xh_ok[eye]) { g_xh[eye][0] = ex / ez; g_xh[eye][1] = ey / ez; }
+    }
     {   // (how much of this eye's view lies outside the game's frame: a 16 x 16 grid of its directions, for the log)
         int out = 0;
         for (int j = 0; j < 16; j++) for (int i = 0; i < 16; i++) {
@@ -2140,6 +2374,9 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
     }
     p.dst_near = C.depth_out && odp ? near_m / C.scale : 0;
     int use_depth = use_dibr;                            // (otherwise rotation only: everything far)
+    // (method 3: the model's motion needs the depth's z-order (what passes in front of what) at any rate; outside the dibr
+    //  gate it comes without the eyes' baseline - no parallax, as the far plane gave)
+    if (i_use && !use_depth && S->has_depth && warp_depth) { use_depth = 1; p.pos[0] = p.pos[1] = p.pos[2] = 0; }
     id<MTLTexture> depth = use_depth ? S->depth : g_far_depth;
     if (!use_depth) {                                // (no depth: everything at the far plane)
         float far1 = S->flags & VXW_DEPTH_STD ? 1.0f : S->z_a / C.farp;
@@ -2159,13 +2396,52 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
     // (no prediction across long gaps: with game frames 150 ms or more apart, or this one that old, the motion of one
     //  frame says nothing about the next; h5's block noise at 4-8 fps)
     g_pred_eyes_total++;
-    if (S->has_mv && C.predict && S->interval > 0 && S->interval < 0.15 && pt - S->content_time < 0.15 && (!vr || (p.flags & VXW_CAM_MV))) {
+    if (g_warp_mode == 5) i_use = 0;                     // (no warp: no prediction either)
+    float i_conf_t = 0, i_conf_fade = 0;
+    if (i_use) {   // (method 3: t = age / the frame's own interval, as in training (tau = gap / interval). The gate is the
+                   //  model's: up to VXMAC_INTERP_MAX_MS (150) of age, where t is then held (no jump back); from
+                   //  VXMAC_INTERP_FADE_MS (100) on, low-conf pixels' own motion fades towards conf x it; t at most
+                   //  VXMAC_INTERP_TMAX (1.5: tests/interp_warp_mac.m on 1783 captured pairs - 4: 24.74 dB, 2: 25.06, 1.5:
+                   //  25.21, 1.25: 25.25; further extrapolation of one interval's motion overshoots))
+        static float max_s = -1, fade_s, tmax;
+        if (max_s < 0) { const char *e = getenv("VXMAC_INTERP_MAX_MS"); max_s = (e && *e ? (float)atof(e) : 150) / 1e3f;
+                         e = getenv("VXMAC_INTERP_FADE_MS"); fade_s = (e && *e ? (float)atof(e) : 100) / 1e3f; if (fade_s > max_s) fade_s = max_s;
+                         e = getenv("VXMAC_INTERP_TMAX"); tmax = e && *e ? (float)atof(e) : 1.5f; }
+        double age = pt - S->content_time; if (age < 0) age = 0;
+        int held = age > max_s;
+        double ag = held ? max_s : age;
+        float t = (float)(ag / S->gap_before); p.t = t < 0 ? 0 : t > tmax ? tmax : t;
+        if (vr && !(p.flags & VXW_CAM_MV)) {
+            float ia[16], R[16];
+            inv_rigid(S->prev_cam, ia);
+            mul4(ia, S->head, R);
+            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) p.cam[r * 3 + c] = sg[r] * R[c * 4 + r] * sg[c];
+            p.flags |= VXW_CAM_MV;
+        }
+        i_conf_t = p.t < 1 ? p.t : 1;
+        // (VXMAC_INTERP_CONF: auto (default) uses the model's conf unless it has collapsed - mean under 0.05: run1's
+        //  model gives 0.004 everywhere (tests/interp_warp_mac.m), a weight that says nothing; 1 always, 0 never)
+        static int conf_mode = -1;
+        if (conf_mode < 0) { const char *e = getenv("VXMAC_INTERP_CONF"); conf_mode = e && !strcmp(e, "1") ? 1 : e && !strcmp(e, "0") ? 0 : 2; }
+        float vxmac_interp_conf_mean(void);
+        int conf_off = i_vel || conf_mode == 0 || (conf_mode == 2 && vxmac_interp_conf_mean() < 0.05f);
+        if (conf_off) i_conf_t = 0;
+        i_conf_fade = max_s > fade_s ? (float)((age - fade_s) / (max_s - fade_s)) : (age >= max_s ? 1.f : 0.f);
+        i_conf_fade = i_conf_fade < 0 ? 0 : i_conf_fade > 1 ? 1 : i_conf_fade * i_conf_fade * (3 - 2 * i_conf_fade);
+        if (conf_off) i_conf_fade = 0;   // (a collapsed conf would stop every pixel's motion in the fade)
+        pthread_mutex_lock(&g_lock);
+        g_iw_eyes++; g_iw_conf_off += conf_off; g_iw_age_sum += age; if (age > g_iw_age_max) g_iw_age_max = age; g_iw_t_sum += p.t; g_iw_held += held;
+        if (S->pseq != g_iw_last_seq) { g_iw_last_seq = S->pseq; g_iw_frames++; }
+        g_iw_frame_used = 1;
+        pthread_mutex_unlock(&g_lock);
+    } else if (S->has_mv && C.predict && S->interval > 0 && S->interval < 0.15 && pt - S->content_time < 0.15 && (!vr || (p.flags & VXW_CAM_MV))) {
         g_pred_eyes++;
         float t = (float)((pt - S->content_time) / S->interval);
         p.t = t < 0 ? 0 : t > 2 ? 2 : t;
         p.mv_sx = S->mv_sx; p.mv_sy = S->mv_sy;
     }
     id<MTLTexture> mv = S->has_mv ? S->mv : g_zero_mv;
+    if (i_use && i_vel) { mv = S->vmv; p.mv_sx = -S->vk[0] * (float)S->w; p.mv_sy = -S->vk[1] * (float)S->h; }   // (h63c: the raw velocity as motion vectors)
     void *a = NULL;
     if (p.flags & VXW_CAM_MV && S->prev_view) { a = (__bridge void *)S->prev_view; p.flags |= VXW_STILL; p.thr = 0.03f; }
     {   // (VX Mac: the Neural Engine's sharper centre of this very frame, when it is ready (app/Sources/fsr.m; off: none))
@@ -2184,6 +2460,14 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
             }
         }
         vxw_set_detail(g_core, ok ? dt : NULL, dr);
+    }
+    {   // (VX Mac, method 3: the model's layers for this eye's encode, or none: the encode exactly as before)
+        int lin = S->view && S->color && S->view.pixelFormat != S->color.pixelFormat;   // (sampled through an sRGB view)
+        if (!vxw_set_interp(g_core, cbp, i_use && !i_vel ? i_tex : NULL, i_w, i_h, S->pseq, lin, i_conf_t, i_conf_fade) && i_use && !i_vel) {
+            p.t = 0;   // (the layers could not be used (their pipelines): no prediction, as without them)
+            pthread_mutex_lock(&g_lock); g_iw_eyes--; pthread_mutex_unlock(&g_lock);
+        }
+        pthread_mutex_lock(&g_lock); g_iw_total++; pthread_mutex_unlock(&g_lock);
     }
     vxw_set_rate_map(g_core, (__bridge void *)g_rrm);
     hud_mask_update(cb);                                 // (VX Mac: the HUD's mask, once per game frame)
@@ -2253,6 +2537,7 @@ void vx_xros_vr_end_frame(void *cbp) {
     int s = g_frame_slot;
     g_frame_slot = -1;
     if (!cb && s >= 0) g_slot[s].readers--;           // (a frame the compositor cancelled)
+    int iu = g_iw_frame_used; g_iw_frame_used = 0;    // (method 3: this frame's eyes used the model's layers)
     pthread_mutex_unlock(&g_lock);
     if (!cb) return;
     void vxmtl_warp_begin(void), vxmtl_warp_end(void);   // (h55: the game's commits wait while the warp is on the GPU)
@@ -2261,7 +2546,8 @@ void vx_xros_vr_end_frame(void *cbp) {
         vxmtl_warp_end();
         pthread_mutex_lock(&g_lock);
         if (s >= 0) g_slot[s].readers--;
-        if (d.GPUEndTime > d.GPUStartTime) { g_gpu_ms += (d.GPUEndTime - d.GPUStartTime) * 1e3; g_gpu_n++; }
+        if (d.GPUEndTime > d.GPUStartTime) { g_gpu_ms += (d.GPUEndTime - d.GPUStartTime) * 1e3; g_gpu_n++;
+            if (iu) { g_iw_gpu_ms += (d.GPUEndTime - d.GPUStartTime) * 1e3; g_iw_gpu_n++; } else { g_iw_gpu_ms0 += (d.GPUEndTime - d.GPUStartTime) * 1e3; g_iw_gpu_n0++; } }
         pthread_mutex_unlock(&g_lock);
     }];
 }
@@ -2482,6 +2768,21 @@ void vx_xros_vr_stats(char *out, unsigned size) {
 }
 
 float vx_xros_vr_real_hz(void) { config(); return C.real_hz; }
+
+// (VX Mac, method 3: the warp's side of the model's stats, since the last call; npu_model.m prints it while on.
+//  iw_gpu_ms / iw_gpu_ms_plain: the compositor frames' GPU time with the layers / without (both eyes and the rest of
+//  the frame: their difference is the layers' cost, taken at the same time))
+void vx_xros_vr_interp_stats(char *out, unsigned size) {
+    pthread_mutex_lock(&g_lock);
+    double gi = g_iw_gpu_n ? g_iw_gpu_ms / g_iw_gpu_n : 0, g0 = g_iw_gpu_n0 ? g_iw_gpu_ms0 / g_iw_gpu_n0 : 0;
+    snprintf(out, size, "\"iw_eyes\":%lu,\"iw_eyes_asked\":%lu,\"iw_frames\":%lu,\"iw_dt_ms_mean\":%.1f,\"iw_dt_ms_max\":%.0f,\"iw_t_mean\":%.2f,"
+             "\"iw_held\":%lu,\"iw_conf_off\":%lu,\"iw_gpu_ms\":%.2f,\"iw_gpu_ms_plain\":%.2f,\"iw_gpu_extra_ms\":%.2f,\"iw_gpu_frames\":[%lu,%lu]",
+             g_iw_eyes, g_iw_total, g_iw_frames, g_iw_eyes ? g_iw_age_sum / g_iw_eyes * 1e3 : 0.0, g_iw_age_max * 1e3,
+             g_iw_eyes ? g_iw_t_sum / g_iw_eyes : 0.0, g_iw_held, g_iw_conf_off, gi, g0, g_iw_gpu_n && g_iw_gpu_n0 ? gi - g0 : 0.0, g_iw_gpu_n, g_iw_gpu_n0);
+    g_iw_conf_off = 0; g_iw_eyes = g_iw_total = g_iw_frames = g_iw_held = g_iw_gpu_n = g_iw_gpu_n0 = 0;
+    g_iw_age_sum = g_iw_age_max = g_iw_t_sum = g_iw_gpu_ms = g_iw_gpu_ms0 = 0;
+    pthread_mutex_unlock(&g_lock);
+}
 float vx_xros_vr_max_hz(void) { config(); return C.max_hz; }
 
 float vx_xros_vr_tan_y(void) { config(); return C.tan_y; }   // (VX Mac, h31: the frame's vertical tangent now, for the glue and host)
@@ -2498,24 +2799,24 @@ void vx_xros_vr_scale_counts(float fx, float fy) {
 }
 
 // (VX Mac, h47: the labels in the device's language (its first preferred language; VXMAC_LANG=xx overrides): en, ja,
-//  zh-Hans, zh-Hant, ko, fr, de, es. 0-6 the warp modes (number and a short name), 7 "VR", 8 "Screen", 9 the quit question, 10 quitting, 11/12 the automatic screen off / on)
-static const char *g_strs[8][13] = {
+//  zh-Hans, zh-Hant, ko, fr, de, es. 0-6 the warp modes (number and a short name; 13 mode 7, h64), 7 "VR", 8 "Screen", 9 the quit question, 10 quitting, 11/12 the automatic screen off / on)
+static const char *g_strs[8][14] = {
     { "Mode 0: depth + head position", "Mode 1: depth, rotation only", "Mode 2: rotation only (flat)", "Mode 3: depth + position 3 cm",
-      "Mode 4: camera from the picture", "Mode 5: no warp", "Mode 6: rotation + fixed stereo", "VR", "Screen", "Quit? Pinch both hands again", "Quitting the game...", "VR: cutscenes stay in VR", "Screen: cutscenes switch to Screen" },
+      "Mode 4: camera from the picture", "Mode 5: no warp", "Mode 6: rotation + fixed stereo", "VR", "Screen", "Quit? Pinch both hands again", "Quitting the game...", "VR: cutscenes stay in VR", "Screen: cutscenes switch to Screen", "Mode 7: free look + controller aim" },
     { "補正 0：深度＋頭の位置", "補正 1：深度・回転のみ", "補正 2：回転のみ（平面）", "補正 3：深度＋位置 3 cm",
-      "補正 4：画像から測るカメラ", "補正 5：補正なし", "補正 6：回転＋固定の立体", "VR", "スクリーン", "終了しますか？もう一度両手でピンチ", "ゲームを終了しています…", "VR：カットシーンも VR のまま", "スクリーン：カットシーンはスクリーンに切替" },
+      "補正 4：画像から測るカメラ", "補正 5：補正なし", "補正 6：回転＋固定の立体", "VR", "スクリーン", "終了しますか？もう一度両手でピンチ", "ゲームを終了しています…", "VR：カットシーンも VR のまま", "スクリーン：カットシーンはスクリーンに切替", "補正 7：見回し＋コントローラーで照準" },
     { "模式 0：深度＋头部位置", "模式 1：深度，仅旋转", "模式 2：仅旋转（平面）", "模式 3：深度＋位置 3 厘米",
-      "模式 4：由画面测得的相机", "模式 5：无补偿", "模式 6：旋转＋固定立体", "VR", "屏幕", "退出？请再次双手捏合", "正在退出游戏…", "VR：过场动画保持 VR", "屏幕：过场动画切换到屏幕" },
+      "模式 4：由画面测得的相机", "模式 5：无补偿", "模式 6：旋转＋固定立体", "VR", "屏幕", "退出？请再次双手捏合", "正在退出游戏…", "VR：过场动画保持 VR", "屏幕：过场动画切换到屏幕", "模式 7：自由环视＋手柄瞄准" },
     { "模式 0：深度＋頭部位置", "模式 1：深度，僅旋轉", "模式 2：僅旋轉（平面）", "模式 3：深度＋位置 3 公分",
-      "模式 4：由畫面測得的相機", "模式 5：無補償", "模式 6：旋轉＋固定立體", "VR", "螢幕", "結束？請再次雙手捏合", "正在結束遊戲…", "VR：過場動畫保持 VR", "螢幕：過場動畫切換到螢幕" },
+      "模式 4：由畫面測得的相機", "模式 5：無補償", "模式 6：旋轉＋固定立體", "VR", "螢幕", "結束？請再次雙手捏合", "正在結束遊戲…", "VR：過場動畫保持 VR", "螢幕：過場動畫切換到螢幕", "模式 7：自由環視＋手把瞄準" },
     { "모드 0: 깊이 + 머리 위치", "모드 1: 깊이, 회전만", "모드 2: 회전만 (평면)", "모드 3: 깊이 + 위치 3 cm",
-      "모드 4: 화면에서 측정한 카메라", "모드 5: 보정 없음", "모드 6: 회전 + 고정 입체", "VR", "화면", "종료할까요? 양손으로 다시 핀치", "게임을 종료하는 중…", "VR: 컷신도 VR 유지", "화면: 컷신은 화면으로 전환" },
+      "모드 4: 화면에서 측정한 카메라", "모드 5: 보정 없음", "모드 6: 회전 + 고정 입체", "VR", "화면", "종료할까요? 양손으로 다시 핀치", "게임을 종료하는 중…", "VR: 컷신도 VR 유지", "화면: 컷신은 화면으로 전환", "모드 7: 자유 시점 + 컨트롤러 조준" },
     { "Mode 0 : profondeur + position de la tête", "Mode 1 : profondeur, rotation seule", "Mode 2 : rotation seule (plat)", "Mode 3 : profondeur + position 3 cm",
-      "Mode 4 : caméra mesurée sur l'image", "Mode 5 : sans correction", "Mode 6 : rotation + stéréo fixe", "VR", "Écran", "Quitter ? Pincez à nouveau des deux mains", "Fermeture du jeu…", "VR : cinématiques en VR", "Écran : cinématiques sur l'écran" },
+      "Mode 4 : caméra mesurée sur l'image", "Mode 5 : sans correction", "Mode 6 : rotation + stéréo fixe", "VR", "Écran", "Quitter ? Pincez à nouveau des deux mains", "Fermeture du jeu…", "VR : cinématiques en VR", "Écran : cinématiques sur l'écran", "Mode 7 : regard libre + visée à la manette" },
     { "Modus 0: Tiefe + Kopfposition", "Modus 1: Tiefe, nur Drehung", "Modus 2: nur Drehung (flach)", "Modus 3: Tiefe + Position 3 cm",
-      "Modus 4: Kamera aus dem Bild", "Modus 5: keine Korrektur", "Modus 6: Drehung + feste Stereo", "VR", "Bildschirm", "Beenden? Erneut mit beiden Händen pinchen", "Spiel wird beendet…", "VR: Zwischensequenzen bleiben in VR", "Bildschirm: Zwischensequenzen auf dem Bildschirm" },
+      "Modus 4: Kamera aus dem Bild", "Modus 5: keine Korrektur", "Modus 6: Drehung + feste Stereo", "VR", "Bildschirm", "Beenden? Erneut mit beiden Händen pinchen", "Spiel wird beendet…", "VR: Zwischensequenzen bleiben in VR", "Bildschirm: Zwischensequenzen auf dem Bildschirm", "Modus 7: freier Blick + Zielen mit dem Controller" },
     { "Modo 0: profundidad + posición de la cabeza", "Modo 1: profundidad, solo rotación", "Modo 2: solo rotación (plano)", "Modo 3: profundidad + posición 3 cm",
-      "Modo 4: cámara medida en la imagen", "Modo 5: sin corrección", "Modo 6: rotación + estéreo fijo", "VR", "Pantalla", "¿Salir? Pellizca de nuevo con ambas manos", "Cerrando el juego…", "VR: cinemáticas en VR", "Pantalla: cinemáticas en pantalla" } };
+      "Modo 4: cámara medida en la imagen", "Modo 5: sin corrección", "Modo 6: rotación + estéreo fijo", "VR", "Pantalla", "¿Salir? Pellizca de nuevo con ambas manos", "Cerrando el juego…", "VR: cinemáticas en VR", "Pantalla: cinemáticas en pantalla", "Modo 7: mirada libre + apuntar con el mando" } };
 static int ui_lang(void) {
     static int l = -1;
     if (l >= 0) return l;
@@ -2528,17 +2829,19 @@ static int ui_lang(void) {
 static const char *ui_str(int i) { return g_strs[ui_lang()][i]; }
 #define g_warp_names_at(i) ui_str(i)
 static void show_warp_mode_label(void) {
-    if (g_warp_mode < 0 || g_warp_mode > 6) return;
-    show_label(g_warp_names_at(g_warp_mode));
+    if (g_warp_mode < 0 || g_warp_mode > 7) return;
+    show_label(g_warp_names_at(g_warp_mode == 7 ? 13 : g_warp_mode));
     pthread_mutex_lock(&g_lock); g_label_until = CACurrentMediaTime() + 1.5; g_label_big = 1; pthread_mutex_unlock(&g_lock);
 }
 // (VX Mac, h37: the warp's A/B mode, cycled live (host.m: the controller's Home button held 1 s); a 1 s label and a log line each change)
 void vx_xros_vr_cycle_warp_mode(void) {
-    if (g_warp_mode < 0) { const char *e = getenv("VXMAC_WARP_MODE"); int m = e && *e ? atoi(e) : 6; g_warp_mode = m >= 0 && m <= 6 ? m : 6; }
-    g_warp_mode = (g_warp_mode + 1) % 7;
+    if (g_warp_mode < 0) g_warp_mode = warp_start_mode();
+    aim_config();
+    g_warp_mode = (g_warp_mode + 1) % (g_aim_avail ? 8 : 7);   // (h64: 7, free look + controller aim, only with VXMAC_AIM)
     show_warp_mode_label();
-    vx_log("VR: %s", g_warp_names_at(g_warp_mode));
-    if (vx_host_jlog) { char f[96]; snprintf(f, sizeof f, "\"mode\":%d,\"name\":\"%s\"", g_warp_mode, g_warp_names_at(g_warp_mode)); vx_host_jlog("warp_mode", f); }
+    const char *nm = g_warp_names_at(g_warp_mode == 7 ? 13 : g_warp_mode);
+    vx_log("VR: %s", nm);
+    if (vx_host_jlog) { char f[160]; snprintf(f, sizeof f, "\"mode\":%d,\"name\":\"%s\"", g_warp_mode, nm); vx_host_jlog("warp_mode", f); }
 }
 
 // (VX Mac, h38: the game is about to drain its events (libvxkit's poll hook, the game's thread): the head's delta since
