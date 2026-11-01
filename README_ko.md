@@ -21,7 +21,7 @@ VXpro는 **Mac App Store 버전 Cyberpunk 2077**을 **Vision Pro 단독**으로 
 
 > **게임 버전:** Cyberpunk 2077 **2.5.0**(Mac App Store 최신 업데이트. App Store에는 버전 **1.0.4**로 표시되지만 이는 App Store 자체 번호이며, 안의 게임은 2.5.0입니다)과 **2.3.2**를 지원하며, 둘 다 헤드셋에서 테스트했습니다. 영어 음성이 포함됩니다. 다른 언어의 음성에는 해당 음성 아카이브가 필요하며, 2.5.0에서는 아직 지원하지 않습니다(2.5.0의 다른 언어 음성은 Apple이 호스팅하는 다운로드입니다). 자막과 메뉴는 모든 언어에서 작동합니다.
 
-- 개발자 모드가 켜져 있고 Mac과 페어링된 **Apple Vision Pro**, 약 **160 GB의 여유 공간**;
+- 개발자 모드가 켜져 있고 Mac과 페어링된 **Apple Vision Pro**, 2.5.0 기준 약 **85 GB의 여유 공간** (데이터 약 80 GB, 모든 음성 언어를 포함한 2.3.2는 약 160 GB);
 - **Apple 실리콘 Mac**, visionOS SDK가 포함된 **Xcode 26**, `xcodegen`, Python 3;
 - **본인의 유료 Apple Developer Program 계정** (본인 팀으로 서명);
 - **Mac App Store에서 직접 구매한 Cyberpunk 2077 (버전 2.5.0 또는 2.3.2)**, Mac에 설치되어 있어야 합니다.
@@ -35,7 +35,7 @@ tools/vxmac_cyberpunk.py build && tools/vxmac_cyberpunk.py install
 tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 ```
 
-전체 가이드(영어/일본어): [docs/VISION_PRO_CYBERPUNK_MAC.md](docs/VISION_PRO_CYBERPUNK_MAC.md). **헤드셋에서 VX Mac Host를 삭제하지 마세요** (약 158 GB의 게임 데이터와 저장 파일이 삭제됩니다). 자주 저장하세요.
+전체 가이드(영어/일본어): [docs/VISION_PRO_CYBERPUNK_MAC.md](docs/VISION_PRO_CYBERPUNK_MAC.md). **헤드셋에서 VX Mac Host를 삭제하지 마세요** (약 80 GB의 게임 데이터와 저장 파일이 삭제됩니다). 자주 저장하세요.
 
 ## 헤드셋에서의 조작
 
@@ -62,7 +62,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - 종료는 양손 집기(3초 + 다시) 또는 앱 창의 **Quit game** 버튼으로 하세요. 앱을 직접 닫으면 게임이 일시 정지되고 10초 후 종료를 요청하지만, 백그라운드에서는 종료가 끝나지 않을 수 있습니다.
 - 헤드셋이 뜨거워지거나 워프가 프레임을 놓치면 화면이 약 45 Hz로 고정될 수 있습니다: 헤드셋을 식힌 뒤 계속하세요.
 - 권장: 16:9, **1280x720 네이티브**, FOV 110 (`fov --max 110`과 `settings`, 가이드 참조).
-- 게임 데이터의 첫 복사는 용량이 크고 오래 걸립니다 (158 GB).
+- 게임 데이터의 첫 복사는 용량이 크고 오래 걸립니다 (2.5.0 기준 약 80 GB).
 - App Store에 제출하지 않지만 유료 Apple Developer Program 멤버십이 필요합니다. 이유는 두 가지 권한(entitlement) 때문입니다. **Increased Memory Limit**이 없으면 visionOS가 앱을 약 5 GB로 제한하여, 6~8 GB를 사용하는 게임이 로딩 중에 종료됩니다. **Extended Virtual Addressing**은 게임이 처음에 매우 넓은 가상 주소 범위를 예약하기 때문에 필요합니다. 저희가 아는 한 무료(Personal Team) 계정으로는 이 두 권한에 서명할 수 없습니다(직접 확인하지는 않았으니 시도해 보신 분은 알려 주세요). 무료 서명은 7일마다 만료되기도 합니다.
 
 ## 고지

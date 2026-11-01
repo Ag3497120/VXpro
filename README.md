@@ -33,7 +33,7 @@ VXpro is the Mac App Store route of [VeRantyx](https://github.com/Ag3497120/VeRa
 
 > **Game versions:** Cyberpunk 2077 **2.5.0** (the latest Mac App Store update; the App Store lists it as version **1.0.4**, which is its own numbering — the game inside is 2.5.0) and **2.3.2**, both tested on the headset. English voice is included; other voice languages need their voice archives, which are not supported yet for 2.5.0 (its other voices are Apple-hosted downloads). Subtitles and menus work in every language.
 
-- an **Apple Vision Pro** in Developer Mode, paired with your Mac, with about **160 GB free**;
+- an **Apple Vision Pro** in Developer Mode, paired with your Mac, with **about 85 GB free** for 2.5.0 (its data is about 80 GB; 2.3.2 with all voice languages needs about 160 GB);
 - a **Mac with Apple silicon**, **Xcode 26** with the visionOS SDK, `xcodegen`, Python 3;
 - your **own paid Apple Developer Program account** (the app needs the Increased Memory Limit and Extended Virtual
   Addressing entitlements; you sign it with your own team);
@@ -57,7 +57,7 @@ automatic switch is wrong; **pinch with one hand for 1 s** in VR to cycle the wa
 pinch for 3 s, then pinch with both hands again** when "Quit? Pinch both hands again" shows: the game quits through
 its own path (as Cmd+Q on a Mac) and the app closes. See "Controls in the headset" in the guide.
 
-> **Never delete VX Mac Host from the headset**: that deletes the ~158 GB copy of the game's data and your saves.
+> **Never delete VX Mac Host from the headset**: that deletes the copy of the game's data (about 80 GB) and your saves.
 > **Save often**: the game runs close to visionOS's memory limit.
 
 ## What VXpro does not do
@@ -76,7 +76,7 @@ its own path (as Cmd+Q on a Mac) and the app closes. See "Controls in the headse
 - The display can lock at about 45 Hz when the headset gets hot or the warp misses frames: let the headset cool down.
 - Other voice languages on 2.5.0 are not supported yet (English voice works; subtitles and menus in every language).
 - Recommended: 16:9, **1280x720 native**, FOV 110 (`fov --max 110` + `settings`; see the guide).
-- The first copy of the game's data is large and slow (158 GB).
+- The first copy of the game's data is large and slow (about 80 GB for 2.5.0).
 - A paid Apple Developer Program membership is required, even though nothing goes to the App Store. The reason is two entitlements: without **Increased Memory Limit**, visionOS caps the app at about 5 GB and the game (6-8 GB) is shut down while loading; **Extended Virtual Addressing** is needed because the game reserves a very large virtual address range up front. As far as we know, free (Personal Team) accounts can't sign these two (not tested ourselves; reports welcome). Free signing also expires every 7 days.
 
 ## Known limitations

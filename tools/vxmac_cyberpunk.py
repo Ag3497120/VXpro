@@ -20,7 +20,7 @@ Every command that talks to the headset takes --dry-run (prints the devicectl co
 Everything made here goes into build/cyberpunk/ (git-ignored). The App Store bundle is only read.
 
 NEVER uninstall VX Mac Host (on the headset or with `devicectl device uninstall app`) and never install with
---remove-existing-content: that deletes its container, the ~158 GB copy of the game's data and your saves in it.
+--remove-existing-content: that deletes its container, the copy of the game's data (about 80 GB for 2.5.0) and your saves in it.
 """
 import argparse, hashlib, json, os, shlex, shutil, subprocess, sys, tempfile, time
 
@@ -135,7 +135,7 @@ def cmd_doctor(a):
     line(bool(devs), 'paired Vision Pro: %d' % len(devs), '' if devs else 'pair it in Xcode > Window > Devices and Simulators')
     for d in devs:
         say('       %s  %s  tunnel=%s  developer mode=%s' % (d['id'], d['name'], d['state'], d['developer_mode']))
-    say('       free space on the headset: check Settings > General > Storage (about 160 GB is needed)')
+    say('       free space on the headset: check Settings > General > Storage (about 85 GB for 2.5.0, about 160 GB for 2.3.2)')
     say('Game')
     game = a.game or (json.load(open(CONFIG)).get('game') if os.path.exists(CONFIG) else None)
     if not game:

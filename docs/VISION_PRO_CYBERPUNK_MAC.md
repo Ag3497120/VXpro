@@ -14,7 +14,7 @@ team. Nothing of the game is distributed by VXpro. Technical background and hist
 [VeRantyx](https://github.com/Ag3497120/VeRantyx).)
 
 > **Never delete VX Mac Host from the headset** (and never install it with `--remove-existing-content`). Deleting
-> the app deletes its container: the ~158 GB copy of the game's data **and your saves**. Re-installing with
+> the app deletes its container: the copy of the game's data (about 80 GB for 2.5.0) **and your saves**. Re-installing with
 > `tools/vxmac_cyberpunk.py install` keeps them.
 
 > **Save often.** The app runs close to visionOS's memory limit for one app (see "Limits"). If visionOS ends it,
@@ -54,8 +54,8 @@ team. Nothing of the game is distributed by VXpro. Technical background and hist
 
 - **Apple Vision Pro** with **Developer Mode** on (Settings > Privacy & Security > Developer Mode), paired with the
   Mac in Xcode (Window > Devices and Simulators). The app targets visionOS 26.0 and later; tested on an M2 Vision Pro.
-- **About 160 GB free on the headset**: the game's data is 158.5 GB (decimal; Phantom Liberty and all voice
-  languages included), plus the app. Check in Settings > General > Storage: the Mac cannot read the headset's free
+- **About 85 GB free on the headset** for 2.5.0: its data is about 80 GB (decimal), plus the app. 2.3.2 with
+  Phantom Liberty and all voice languages is 158.5 GB: about 160 GB free. Check in Settings > General > Storage: the Mac cannot read the headset's free
   space. If you also have the Windows route installed, it keeps its own ~67 GB.
 - **A Mac with Apple silicon**, **Xcode 26** or later with the visionOS SDK, `xcodegen` (`brew install xcodegen`),
   Python 3, and **about 5 GB free** for the work copies and the build. Clone the repository into a path
@@ -67,7 +67,7 @@ team. Nothing of the game is distributed by VXpro. Technical background and hist
   Mac can read, e.g. an external drive). `doctor` checks its executable `Contents/MacOS/Cyberpunk2077` against the tested
   builds: 2.5.0 `sha256 8f4a88ad201f360772b3747f51701944f39b98b4ecbf7edc6271c1cc24932844`, 2.3.2 `sha256 3907f316f6adf9dd8188be82aeea9ae161445b2e1f6d25cf08c87b8a3ae6b421`. For
   another build `prepare` works only when its memory-pool patterns are found, and warns that it is untested.
-- **Time**: the build takes minutes; copying 158 GB to the headset over the network takes longer (devicectl ran at
+- **Time**: the build takes minutes; copying the data (about 80 GB for 2.5.0) to the headset over the network takes longer (devicectl ran at
   roughly 30-40 MB/s on the Windows route: plan on one to two hours or more; keep the headset awake and on the
   same network).
 
@@ -257,7 +257,7 @@ Each item is independent; fixed ones will be removed from this list.
 - **Quit with the both-hands 3 s pinch** (see "Quitting safely"): closing the app pauses the game and asks it to quit after
   10 s, which may not complete in the background.
 - **The display can lock at about 45 Hz** when the headset gets hot or the warp misses frames: take a break and let the headset cool down, then continue.
-- **The first copy of the game's data is large and slow** (158 GB over the network).
+- **The first copy of the game's data is large and slow** (about 80 GB for 2.5.0, over the network).
 - **A paid Apple Developer Program membership is required**, even though nothing is submitted to the App Store.
   Without *Increased Memory Limit* visionOS caps the app at about 5 GB and the game (6-8 GB) is shut down while
   loading; *Extended Virtual Addressing* is needed because the game reserves a very large virtual address range up
@@ -327,4 +327,4 @@ VXpro and VeRantyx are not affiliated with CD PROJEKT RED or Apple; Cyberpunk 20
 | The game starts without its data (`game_data ... null` in `vxmac_host.jsonl`) | the copy is incomplete or in the wrong place: `copy` (it verifies) |
 | `launch` waits at "Acquired usage assertion" | put the headset on and unlock it |
 | The picture freezes when you open another app | the game waits while VX Mac Host is in the background (visionOS allows no GPU work there); come back to it |
-| Wanting to "start fresh" | do **not** delete the app (that deletes the 158 GB copy and your saves); `install` again instead |
+| Wanting to "start fresh" | do **not** delete the app (that deletes the copy of the game's data and your saves); `install` again instead |

@@ -21,7 +21,7 @@ VXpro 让 **Mac App Store 版 Cyberpunk 2077** 在 **Vision Pro 单机** 上运�
 
 > **游戏版本：** 支持 Cyberpunk 2077 **2.5.0**（Mac App Store 最新更新；App Store 显示的版本号为 **1.0.4**，这是 App Store 自己的编号，其中的游戏为 2.5.0）和 **2.3.2**，均已在头显上测试。包含英语语音；其他语言的语音需要对应的语音档案，2.5.0 暂不支持（其其他语言语音为 Apple 托管的下载内容）。字幕和菜单支持所有语言。
 
-- 已开启开发者模式并与 Mac 配对的 **Apple Vision Pro**，约 **160 GB 可用空间**；
+- 已开启开发者模式并与 Mac 配对的 **Apple Vision Pro**，2.5.0 约需 **85 GB 可用空间**（数据约 80 GB；含全部语音语言的 2.3.2 约需 160 GB）；
 - **Apple 芯片的 Mac**、带 visionOS SDK 的 **Xcode 26**、`xcodegen`、Python 3；
 - 你**自己的付费 Apple Developer Program 账号**（用你自己的团队签名）；
 - 你**自己从 Mac App Store 购买的 Cyberpunk 2077（版本 2.5.0 或 2.3.2）**，已安装在 Mac 上。
@@ -35,7 +35,7 @@ tools/vxmac_cyberpunk.py build && tools/vxmac_cyberpunk.py install
 tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 ```
 
-完整指南（英文/日文）：[docs/VISION_PRO_CYBERPUNK_MAC.md](docs/VISION_PRO_CYBERPUNK_MAC.md)。**请勿从头显中删除 VX Mac Host**（会删除约 158 GB 的游戏数据和存档）。请经常存档。
+完整指南（英文/日文）：[docs/VISION_PRO_CYBERPUNK_MAC.md](docs/VISION_PRO_CYBERPUNK_MAC.md)。**请勿从头显中删除 VX Mac Host**（会删除约 80 GB 的游戏数据和存档）。请经常存档。
 
 ## 头显中的操作
 
@@ -62,7 +62,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - 请用双手捏合（3 秒＋再次）或应用窗口的 **Quit game** 按钮退出。若直接关闭应用，游戏会暂停，并在 10 秒后被要求退出，但在后台可能无法完成退出。
 - 头显变热或画面变形（warp）赶不上帧时，显示可能锁定在约 45 Hz：请让头显冷却后再继续。
 - 推荐：16:9，**1280x720 原生**，FOV 110（`fov --max 110` 和 `settings`，见指南）。
-- 首次复制游戏数据量大且耗时（158 GB）。
+- 首次复制游戏数据量大且耗时（2.5.0 约 80 GB）。
 - 虽然不提交到 App Store，但仍需要付费的 Apple Developer Program 会员资格。原因是两项权限（entitlement）：没有 **Increased Memory Limit**，visionOS 会把应用限制在约 5 GB，需要 6–8 GB 的游戏会在加载时被终止；**Extended Virtual Addressing** 是因为游戏一开始就会预留非常大的虚拟地址范围。据我们所知，免费（Personal Team）账号无法签署这两项权限（我们自己未验证，欢迎反馈）。免费签名每 7 天也会过期。
 
 ## 声明

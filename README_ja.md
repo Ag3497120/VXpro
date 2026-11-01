@@ -32,7 +32,7 @@ VXRuntime は VeRantyx 側にあります）。
 
 > **ゲームの版について：** Cyberpunk 2077 **2.5.0**（Mac App Store の最新の更新。App Store ではバージョン **1.0.4** と表示されますが、これは App Store 独自の番号で、中のゲームは 2.5.0 です）と **2.3.2** に対応しています（どちらもヘッドセットで確認済み）。英語音声は含まれます。ほかの言語の音声にはその音声アーカイブが必要で、2.5.0 ではまだ対応していません（2.5.0 のほかの言語の音声は Apple がホストするダウンロードです）。字幕とメニューは全言語で動きます。
 
-- **Apple Vision Pro**（デベロッパモード、Mac とペアリング済み、空き容量 **約 160 GB**）
+- **Apple Vision Pro**（デベロッパモード、Mac とペアリング済み、空き容量は 2.5.0 で **約 85 GB**。データが約 80 GB。全言語の音声を含む 2.3.2 は約 160 GB）
 - **Apple シリコンの Mac**、**Xcode 26**（visionOS SDK）、`xcodegen`、Python 3
 - **自分の有料 Apple Developer Program アカウント**（アプリには Increased Memory Limit と Extended Virtual
   Addressing のエンタイトルメントが必要で、自分のチームで署名します）
@@ -56,7 +56,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 もう一度両手でピンチ** します。ゲーム自身の終了処理（Mac の Cmd+Q と同じ）で終わり、アプリも閉じます。VR 中に **片手で 1 秒ピンチ** すると warp モードが切り替わります。詳しくはガイドの
 「ヘッドセットでの操作」を参照してください。
 
-> **VX Mac Host をヘッドセットから削除しないでください**：約 158 GB のゲームデータの複製とセーブが消えます。
+> **VX Mac Host をヘッドセットから削除しないでください**：ゲームデータの複製（約 80 GB）とセーブが消えます。
 > **こまめにセーブしてください**：ゲームは visionOS のメモリ上限近くで動いています。
 
 ## VXpro がしないこと
@@ -76,7 +76,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
   冷ましてください。
 - 2.5.0 のほかの言語の音声はまだ対応していません（英語音声は動きます。字幕とメニューは全言語）。
 - 推奨：16:9、**1280x720 ネイティブ**、FOV 110（`fov --max 110` と `settings`。ガイド参照）。
-- ゲームデータの最初の複製は大きく時間がかかる（158 GB）。
+- ゲームデータの最初の複製は大きく時間がかかる（2.5.0 で約 80 GB）。
 - App Store には提出しませんが、有料の Apple Developer Program が必要です。理由は 2 つのエンタイトルメントです。**Increased Memory Limit** がないと visionOS がアプリを約 5 GB に制限し、6〜8 GB 使うゲームはロード中に止められます。**Extended Virtual Addressing** は、ゲームが最初にとても広い仮想メモリの範囲を確保するために必要です。私たちの知る限り、無料（Personal Team）のアカウントではこの 2 つに署名できません（自分たちでは未確認なので、試した方はぜひ教えてください）。無料の署名は 7 日ごとに期限も切れます。
 
 ## 既知の制限
