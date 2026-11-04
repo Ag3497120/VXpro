@@ -68,46 +68,37 @@ static aff aff_rot(const float x_[3], float ang, const float c[3]) {
 static int vrik_weapon(void) { static int on = -1; if (on < 0) { const char *v = getenv("VXMAC_VRIK_WEAPON"); on = !(v && !strcmp(v, "0")); } return on; }
 static int vrik_on(void) { static int on = -1; if (on < 0) { const char *v = getenv("VXMAC_VRIK"); on = !(v && !strcmp(v, "0")); if (on) vxmac_log("VRIK: V's arms follow the hands (bone buffer, two-bone IK; VXMAC_VRIK=0 off)"); } return on; }
 
-// ---- which mesh a draw is: cache by (index buffer, offset, count) ---------------------------------------------------
-typedef struct { const void *ib; NSUInteger io, count; int list, rigv; } vrik_mesh;
+// ---- which mesh a draw is: cache by (index buffer, offset, count, skinning offset isd0) ----------------------------
+typedef struct { const void *ib; NSUInteger io, count; uint32_t isd0; int list, rigv; } vrik_mesh;
 static vrik_mesh g_vk_mesh[256]; static int g_vk_nmesh; static pthread_mutex_t g_vk_l = PTHREAD_MUTEX_INITIALIZER;
 static const float *vrik_bindpos(int rigv, int name) { const float *p = &vrik_bind[rigv][name * 3]; return isnan(p[0]) ? NULL : p; }
 
-// Strict unit-scale rotation check (for rigid joint bones and view matrices)
+// Strict unit-scale orthogonal rotation check (stops at exact 16-byte palette boundaries in the bone buffer)
 static int vrik_is_rot(const float *M) {
     for (int r = 0; r < 3; r++) {
         float l2 = M[r*4]*M[r*4] + M[r*4+1]*M[r*4+1] + M[r*4+2]*M[r*4+2];
-        if (!(l2 >= 0.90f && l2 <= 1.10f && fabsf(M[r*4+3]) < 10.0f)) return 0;
+        if (!(l2 >= 0.85f && l2 <= 1.15f && isfinite(M[r*4+3]) && fabsf(M[r*4+3]) < 10.0f)) return 0;
     }
-    if (fabsf(v3dot(M, M + 4)) > 0.05f || fabsf(v3dot(M, M + 8)) > 0.05f || fabsf(v3dot(M + 4, M + 8)) > 0.05f) return 0;
-    return 1;
-}
-
-// General bone matrix check (allows non-uniformly scaled/sheared muscle bones like *_elbow_bend_A_mscl_JNT while rejecting padding/zeros)
-static int vrik_is_bone(const float *M) {
-    for (int r = 0; r < 3; r++) {
-        float l2 = M[r*4]*M[r*4] + M[r*4+1]*M[r*4+1] + M[r*4+2]*M[r*4+2];
-        if (!(l2 >= 0.02f && l2 <= 16.0f && isfinite(M[r*4+3]) && fabsf(M[r*4+3]) < 25.0f)) return 0;
-    }
+    if (fabsf(v3dot(M, M + 4)) > 0.08f || fabsf(v3dot(M, M + 8)) > 0.08f || fabsf(v3dot(M + 4, M + 8)) > 0.08f) return 0;
     return 1;
 }
 
 // (bones of list L at unmodified palette P agree on their rotational arm/hand joints)
-static int vrik_try(const uint8_t *P, uint32_t max_bones, int L, int rigv) {
+static int vrik_try(const uint8_t *P, uint32_t rot, int L, int rigv) {
     uint32_t o = vrik_list_off[L], nb = vrik_list_off[L + 1] - o;
-    if (nb > max_bones || nb < 16) return -1;
+    if (nb > rot || nb < 16) return -1;
     int good = 0, has_arm_pose = 0;
     for (uint32_t i = 0; i < nb; i++) {
         int nm = vrik_list[o + i], j = vrik_list_par[o + i];
         const float *A = (const float *)(P + (size_t)i * 48);
-        if (!vrik_is_bone(A)) return -1;
+        if (!vrik_is_rot(A)) return -1;
         if (vrik_seg[nm] > 0) {
             float t2 = A[3]*A[3] + A[7]*A[7] + A[11]*A[11];
             if (t2 > 0.12f) has_arm_pose = 1;   // V's arm/hand bones pivot ~1.45m above V's feet so |t| >= 0.75m (weapons have |t| < 0.2m)
         }
         if (j < 0) continue;
         const float *B = (const float *)(P + (size_t)j * 48);
-        if (!vrik_is_rot(A) || !vrik_is_rot(B)) return -1;
+        if (!vrik_is_rot(B)) return -1;
         const float *c = vrik_bindpos(rigv, nm); if (!c) continue;
         float a[3], b[3]; aff_pt(A, c, a); aff_pt(B, c, b);
         float d[3] = { a[0]-b[0], a[1]-b[1], a[2]-b[2] };
@@ -116,18 +107,20 @@ static int vrik_try(const uint8_t *P, uint32_t max_bones, int L, int rigv) {
         for (int k = 0; k < 12; k++) rd += fabsf(A[k] - B[k]);
         if (rd > 0.02f) good++;
     }
-    if (!has_arm_pose || good < 4) return -1;
-    return good * 100 + (int)nb;
+    int min_good = (nb == rot) ? 2 : 6;
+    if (!has_arm_pose || good < min_good) return -1;
+    return (nb == rot ? 100 : 0) + good;
 }
 
-static int vrik_identify(const void *ib, NSUInteger io, NSUInteger count, const uint8_t *orig_P, size_t avail, int *rigv, uint32_t *out_rot) {
-    uint32_t rot = 0;
-    while ((size_t)(rot + 1) * 48 <= avail && rot < 128 && vrik_is_bone((const float *)(orig_P + (size_t)rot * 48))) rot++;
-    if (out_rot) *out_rot = rot;
+static int vrik_identify(const void *ib, NSUInteger io, NSUInteger count, uint32_t isd0, const uint8_t *orig_P, uint32_t rot, int *rigv) {
     for (int i = 0; i < g_vk_nmesh; i++) {
-        if (g_vk_mesh[i].ib == ib && g_vk_mesh[i].io == io && g_vk_mesh[i].count == count) {
-            *rigv = g_vk_mesh[i].rigv;
-            return g_vk_mesh[i].list;
+        if (g_vk_mesh[i].ib == ib && g_vk_mesh[i].io == io && g_vk_mesh[i].count == count && g_vk_mesh[i].isd0 == isd0) {
+            int cL = g_vk_mesh[i].list, cv = g_vk_mesh[i].rigv;
+            if (cL < 0 || vrik_try(orig_P, rot, cL, cv) > 0) {
+                *rigv = cv;
+                return cL;
+            }
+            break;
         }
     }
     // Quick O(1) check: if no bone in the first 15 has |t| > 0.35m, this is a weapon/item palette (not V's body rig)
@@ -140,7 +133,13 @@ static int vrik_identify(const void *ib, NSUInteger io, NSUInteger count, const 
     if (can_be_body && rot >= 16) {
         for (int L = 0; L < VRIK_NLISTS; L++) for (int v = 0; v < 2; v++) { int g = vrik_try(orig_P, rot, L, v); if (g > bestg) { bestg = g; best = L; bestv = v; } }
     }
-    if (g_vk_nmesh < 256) { vrik_mesh m = { ib, io, count, best, bestv }; g_vk_nmesh++; g_vk_mesh[g_vk_nmesh - 1] = m; }
+    int found = 0;
+    for (int i = 0; i < g_vk_nmesh; i++) {
+        if (g_vk_mesh[i].ib == ib && g_vk_mesh[i].io == io && g_vk_mesh[i].count == count && g_vk_mesh[i].isd0 == isd0) {
+            g_vk_mesh[i].list = best; g_vk_mesh[i].rigv = bestv; found = 1; break;
+        }
+    }
+    if (!found && g_vk_nmesh < 256) { vrik_mesh m = { ib, io, count, isd0, best, bestv }; g_vk_nmesh++; g_vk_mesh[g_vk_nmesh - 1] = m; }
     if (best >= 0) vxmac_log("VRIK: a foreground mesh (%lu indices, rot=%u) is list %d (%u bones, %s rig, score %d)", (unsigned long)count, rot, best, vrik_list_off[best + 1] - vrik_list_off[best], bestv ? "man" : "woman", bestg);
     else vxmac_log("VRIK: a foreground mesh (%lu indices, rot=%u) is none of V's", (unsigned long)count, rot);
     *rigv = bestv;
@@ -153,9 +152,9 @@ typedef struct {
     uint8_t *P;
     uint32_t max_b, nb;
     NSUInteger count;
-    int L, applied;
+    int L, applied, mod_k1, mod_k2;
     unsigned stamp;
-    aff obj, mod0, modlast;
+    aff obj, mod1, mod2;
     aff orig[128];
 } vrik_pal;
 
@@ -215,12 +214,14 @@ static void vrik_solve_all(void) {
     int rigv = g_vk.rigv;
 
     // Temporal smoothing + outlier slew-rate limiting in camera view space (+X right, +Y up, +Z forward)
+    // Advance the filter state at most once per rendered frame (g_frame) so multiple palette updates never over-step
     static float s_hv[2][3] = { { -0.18f, -0.22f, 0.36f }, { 0.18f, -0.22f, 0.36f } };
     static float s_fv[2][3] = { { 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f } };
     static float s_ref_fv[2][3] = { { 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f } };
     static float s_arm_w[2] = { 0.0f, 0.0f };
     static int s_hold_frames[2] = { 0, 0 };
     static int s_init[2] = { 0, 0 };
+    static unsigned s_last_frame = 0;
 
     // Left-hand carry state (evaluated in camera view space so it is 100% immune to the game's left-hand animations)
     static int s_carry_left = 0, s_release_hold = 0;
@@ -228,87 +229,98 @@ static void vrik_solve_all(void) {
     float left_grip  = (g_vk.curls[0][2] + g_vk.curls[0][3] + g_vk.curls[0][4]) / 3.0f;
     float right_grip = (g_vk.curls[1][2] + g_vk.curls[1][3] + g_vk.curls[1][4]) / 3.0f;
 
-    for (int side = 0; side < 2; side++) {
-        if (ok[side]) {
-            // Clamp raw wrist target to comfortable view-space bounds so hands/weapons never plunge into the floor or clip the camera
-            float rx = fmaxf(-0.42f, fminf(0.42f, hf[side][0]));
-            float ry = fmaxf(-0.34f, fminf(0.20f, hf[side][1]));
-            float rz = fmaxf( 0.22f, fminf(0.56f, -hf[side][2]));
-            float rf[3] = { hf[side][3], hf[side][4], -hf[side][5] };
-            if (!v3norm(rf)) { rf[0] = 0.0f; rf[1] = 0.0f; rf[2] = 1.0f; }
-            if (!s_init[side]) {
-                s_hv[side][0] = rx; s_hv[side][1] = ry; s_hv[side][2] = rz;
-                memcpy(s_fv[side], rf, sizeof rf);
-                memcpy(s_ref_fv[side], rf, sizeof rf);
-                s_init[side] = 1;
-            } else {
-                // Slew-rate limit per solve step (absorbs 1-frame ARKit occlusion jumps) + low-pass filter
-                float dx = rx - s_hv[side][0], dy = ry - s_hv[side][1], dz = rz - s_hv[side][2];
-                float dl = sqrtf(dx*dx + dy*dy + dz*dz);
-                if (dl > 0.030f) { float s = 0.030f / dl; dx *= s; dy *= s; dz *= s; }
-                s_hv[side][0] += dx * 0.28f;
-                s_hv[side][1] += dy * 0.28f;
-                s_hv[side][2] += dz * 0.28f;
-                for (int i = 0; i < 3; i++) {
-                    s_fv[side][i] += (rf[i] - s_fv[side][i]) * 0.22f;
-                    s_ref_fv[side][i] += (s_fv[side][i] - s_ref_fv[side][i]) * 0.02f;
-                }
-                v3norm(s_fv[side]);
-                v3norm(s_ref_fv[side]);
-            }
-            s_hold_frames[side] = 25;
-            s_arm_w[side] = fminf(1.0f, s_arm_w[side] + 0.08f);
-        } else {
-            if (s_hold_frames[side] > 0) s_hold_frames[side]--;
-            else s_arm_w[side] = fmaxf(0.0f, s_arm_w[side] - 0.04f);
-        }
-    }
+    unsigned cur_frame = atomic_load(&g_frame);
+    int step_filter = (cur_frame != s_last_frame || (!s_init[0] && ok[0]) || (!s_init[1] && ok[1]));
+    s_last_frame = cur_frame;
 
-    // Update left-hand carry state machine in camera view space
-    if (s_arm_w[0] > 0.6f && s_arm_w[1] > 0.6f) {
-        float dv[3] = { s_hv[0][0] - s_hv[1][0], s_hv[0][1] - s_hv[1][1], s_hv[0][2] - s_hv[1][2] };
-        float dist_v = v3len(dv);
-        if (!s_carry_left) {
-            if (dist_v > 0.08f && dist_v < 0.38f && dv[2] > 0.02f && left_grip >= 0.48f && right_grip < 0.24f) {
-                if (++s_release_hold >= 12) {
-                    s_carry_left = 1;
-                    s_carry_off_v[0] = s_hv[1][0] - s_hv[0][0];
-                    s_carry_off_v[1] = s_hv[1][1] - s_hv[0][1];
-                    s_carry_off_v[2] = s_hv[1][2] - s_hv[0][2];
-                    vxmac_log("VRIK: right hand released -> weapon carried smoothly by left hand");
+    if (step_filter) {
+        for (int side = 0; side < 2; side++) {
+            if (ok[side]) {
+                // Clamp raw wrist target to comfortable view-space bounds so hands/weapons never plunge into the floor or clip the camera
+                float rx = fmaxf(-0.42f, fminf(0.42f, hf[side][0]));
+                float ry = fmaxf(-0.34f, fminf(0.20f, hf[side][1]));
+                float rz = fmaxf( 0.22f, fminf(0.56f, -hf[side][2]));
+                float rf[3] = { hf[side][3], hf[side][4], -hf[side][5] };
+                if (!v3norm(rf)) { rf[0] = 0.0f; rf[1] = 0.0f; rf[2] = 1.0f; }
+                if (!s_init[side]) {
+                    s_hv[side][0] = rx; s_hv[side][1] = ry; s_hv[side][2] = rz;
+                    memcpy(s_fv[side], rf, sizeof rf);
+                    memcpy(s_ref_fv[side], rf, sizeof rf);
+                    s_init[side] = 1;
+                } else {
+                    // Slew-rate limit per frame (absorbs 1-frame ARKit occlusion jumps) + low-pass filter
+                    float dx = rx - s_hv[side][0], dy = ry - s_hv[side][1], dz = rz - s_hv[side][2];
+                    float dl = sqrtf(dx*dx + dy*dy + dz*dz);
+                    if (dl > 0.030f) { float s = 0.030f / dl; dx *= s; dy *= s; dz *= s; }
+                    s_hv[side][0] += dx * 0.28f;
+                    s_hv[side][1] += dy * 0.28f;
+                    s_hv[side][2] += dz * 0.28f;
+                    for (int i = 0; i < 3; i++) {
+                        s_fv[side][i] += (rf[i] - s_fv[side][i]) * 0.22f;
+                        s_ref_fv[side][i] += (s_fv[side][i] - s_ref_fv[side][i]) * 0.02f;
+                    }
+                    v3norm(s_fv[side]);
+                    v3norm(s_ref_fv[side]);
                 }
+                s_hold_frames[side] = 25;
+                s_arm_w[side] = fminf(1.0f, s_arm_w[side] + 0.08f);
             } else {
-                s_release_hold = 0;
-            }
-        } else {
-            float gun_grip_v[3] = { s_hv[0][0] + s_carry_off_v[0], s_hv[0][1] + s_carry_off_v[1], s_hv[0][2] + s_carry_off_v[2] };
-            float re_d[3] = { s_hv[1][0] - gun_grip_v[0], s_hv[1][1] - gun_grip_v[1], s_hv[1][2] - gun_grip_v[2] };
-            if ((v3len(re_d) < 0.16f && right_grip >= 0.42f) || left_grip < 0.18f) {
-                s_carry_left = 0;
-                s_release_hold = 0;
-                vxmac_log("VRIK: right hand re-acquired weapon grip");
+                if (s_hold_frames[side] > 0) s_hold_frames[side]--;
+                else s_arm_w[side] = fmaxf(0.0f, s_arm_w[side] - 0.04f);
             }
         }
-    } else {
-        s_carry_left = 0;
-        s_release_hold = 0;
+
+        // Update left-hand carry state machine in camera view space
+        if (s_arm_w[0] > 0.6f && s_arm_w[1] > 0.6f) {
+            float dv[3] = { s_hv[0][0] - s_hv[1][0], s_hv[0][1] - s_hv[1][1], s_hv[0][2] - s_hv[1][2] };
+            float dist_v = v3len(dv);
+            if (!s_carry_left) {
+                if (dist_v > 0.08f && dist_v < 0.38f && dv[2] > 0.02f && left_grip >= 0.48f && right_grip < 0.24f) {
+                    if (++s_release_hold >= 12) {
+                        s_carry_left = 1;
+                        s_carry_off_v[0] = s_hv[1][0] - s_hv[0][0];
+                        s_carry_off_v[1] = s_hv[1][1] - s_hv[0][1];
+                        s_carry_off_v[2] = s_hv[1][2] - s_hv[0][2];
+                        vxmac_log("VRIK: right hand released -> weapon carried smoothly by left hand");
+                    }
+                } else {
+                    s_release_hold = 0;
+                }
+            } else {
+                float gun_grip_v[3] = { s_hv[0][0] + s_carry_off_v[0], s_hv[0][1] + s_carry_off_v[1], s_hv[0][2] + s_carry_off_v[2] };
+                float re_d[3] = { s_hv[1][0] - gun_grip_v[0], s_hv[1][1] - gun_grip_v[1], s_hv[1][2] - gun_grip_v[2] };
+                if ((v3len(re_d) < 0.16f && right_grip >= 0.42f) || left_grip < 0.18f) {
+                    s_carry_left = 0;
+                    s_release_hold = 0;
+                    vxmac_log("VRIK: right hand re-acquired weapon grip");
+                }
+            }
+        } else {
+            s_carry_left = 0;
+            s_release_hold = 0;
+        }
     }
 
     float T_wrist[2][3] = {{0},{0}};
     int solved[2] = { 0, 0 };
+    g_vk.D[0] = aff_id();
 
     for (int side = 0; side < 2; side++) {
+        g_vk.D[side ? 4 : 1] = g_vk.D[side ? 5 : 2] = g_vk.D[side ? 6 : 3] = aff_id();
         if (s_arm_w[side] < 0.01f || !g_vk.have_af[side]) continue;
         int nA = side ? VRIK_RIGHTARM : VRIK_LEFTARM, nF = side ? VRIK_RIGHTFOREARM : VRIK_LEFTFOREARM, nH = side ? VRIK_RIGHTHAND : VRIK_LEFTHAND;
         const float *cA = vrik_bindpos(rigv, nA), *cF = vrik_bindpos(rigv, nF), *cH = vrik_bindpos(rigv, nH);
         if (!cA || !cF || !cH) continue;
         const float *SA = g_vk.SA[side].m, *SF = g_vk.SF[side].m;
-        float S[3], E[3], W[3]; aff_pt(SA, cA, S); aff_pt(SF, cF, E); aff_pt(SF, cH, W);
+        float S[3], E[3], eA[3], W[3]; aff_pt(SA, cA, S); aff_pt(SF, cF, E); aff_pt(SA, cF, eA); aff_pt(SF, cH, W);
+        float de[3] = { eA[0]-E[0], eA[1]-E[1], eA[2]-E[2] };
+        int side_ok = side ? (S[0] > 0.02f && S[0] < 0.40f) : (S[0] < -0.02f && S[0] > -0.40f);
+        if (!side_ok || S[2] < 1.10f || S[2] > 1.70f || v3len(de) > 0.025f) continue;
         float Ev[3], Wv[3]; aff_pt(o2v.m, E, Ev); aff_pt(o2v.m, W, Wv);
         float a = 0, b = 0, d3[3];
         for (int i = 0; i < 3; i++) d3[i] = E[i] - S[i]; a = v3len(d3);
         for (int i = 0; i < 3; i++) d3[i] = W[i] - E[i]; b = v3len(d3);
-        if (v3len(Ev) > 0.95f || a < 0.15f || a > 0.45f || b < 0.15f || b > 0.45f) continue;
+        if (v3len(Ev) > 0.95f || a < 0.18f || a > 0.38f || b < 0.18f || b > 0.38f) continue;
 
         // Blend smoothly in view space between the game's animated wrist Wv and the damped VR wrist s_hv[side]
         // (Use damped relative motion around a gentle anchor so game animations and VR hand tracking never fight)
@@ -457,8 +469,16 @@ static void vrik_finger_deltas(int side, const vrik_pal *pal, uint32_t o, aff M_
     }
 }
 
+static int vrik_pal_still_modified(const vrik_pal *p) {
+    if (!p || !p->applied || p->nb == 0 || p->mod_k1 < 0 || p->mod_k2 < 0) return 0;
+    if (vrik_same_bone(&p->mod1, &p->orig[p->mod_k1]) && vrik_same_bone(&p->mod2, &p->orig[p->mod_k2])) return 0;
+    const aff *cur1 = (const aff *)(p->P + (size_t)p->mod_k1 * 48);
+    const aff *cur2 = (const aff *)(p->P + (size_t)p->mod_k2 * 48);
+    return vrik_same_bone(cur1, &p->mod1) && vrik_same_bone(cur2, &p->mod2);
+}
+
 static void vrik_apply_pal(vrik_pal *pal) {
-    if ((!g_vk.have_af[0] && !g_vk.have_af[1]) || pal->nb == 0) return;
+    if ((!g_vk.have_af[0] && !g_vk.have_af[1]) || pal->nb == 0 || pal->nb > pal->max_b) return;
     if (pal->L >= 0) {
         uint32_t o = vrik_list_off[pal->L];
         int has_r_fng = 0;
@@ -467,6 +487,7 @@ static void vrik_apply_pal(vrik_pal *pal) {
         }
         aff M_fng[128];
         if (has_r_fng) vrik_finger_deltas(1, pal, o, M_fng);
+        int k1 = -1, k2 = -1;
         for (uint32_t k = 0; k < pal->nb; k++) {
             int nm = vrik_list[o + k], s = vrik_seg[nm];
             aff *dst = (aff *)(pal->P + (size_t)k * 48);
@@ -475,44 +496,55 @@ static void vrik_apply_pal(vrik_pal *pal) {
             } else {
                 *dst = (s > 0) ? aff_mul(g_vk.D[s], pal->orig[k]) : pal->orig[k];
             }
-            if (s > 0) vrik_record_known(&pal->orig[k], dst, s);
+            if (s > 0) {
+                if (k1 < 0) k1 = (int)k;
+                k2 = (int)k;
+                vrik_record_known(&pal->orig[k], dst, s);
+            }
         }
-        pal->mod0 = ((const aff *)pal->P)[0];
-        pal->modlast = ((const aff *)pal->P)[pal->nb - 1];
+        if (k1 < 0) { k1 = 0; k2 = (int)pal->nb - 1; }
+        pal->mod_k1 = k1; pal->mod_k2 = k2;
+        pal->mod1 = ((const aff *)pal->P)[k1];
+        pal->mod2 = ((const aff *)pal->P)[k2];
         pal->applied = 1;
         return;
     }
-    // Check if this palette shares exact bone matrices with V's arm/hand/finger palettes (e.g. fingernails 5916, palm cyberware 3918)
-    int matched_known = 0, fallback_seg = 0;
-    for (uint32_t k = 0; k < pal->nb; k++) {
-        for (int m = 0; m < g_vk.nknown; m++) {
-            if (vrik_same_bone(&g_vk.known[m].orig, &pal->orig[k])) {
-                if (!fallback_seg) fallback_seg = g_vk.known[m].seg;
-                matched_known++;
-                break;
-            }
-        }
-    }
-    if (matched_known >= 2) {
-        int cur_seg = fallback_seg;
+    // Check if this is a body-origin sub-palette (e.g. fingernails 5916 or palm cyberware 3918) sharing exact bone matrices with V's hands
+    float db[3] = { pal->obj.m[3] - g_vk.obj.m[3], pal->obj.m[7] - g_vk.obj.m[7], pal->obj.m[11] - g_vk.obj.m[11] };
+    float dist_body = v3len(db);
+    if (dist_body < 0.05f && pal->nb <= 64) {
+        int matched_known = 0, k1 = -1, k2 = -1;
         for (uint32_t k = 0; k < pal->nb; k++) {
-            int exact = -1;
             for (int m = 0; m < g_vk.nknown; m++) {
-                if (vrik_same_bone(&g_vk.known[m].orig, &pal->orig[k])) { exact = m; cur_seg = g_vk.known[m].seg; break; }
+                if (vrik_same_bone(&g_vk.known[m].orig, &pal->orig[k])) { matched_known++; break; }
             }
-            aff *dst = (aff *)(pal->P + (size_t)k * 48);
-            if (exact >= 0) *dst = g_vk.known[exact].mod;
-            else *dst = (cur_seg > 0) ? aff_mul(g_vk.D[cur_seg], pal->orig[k]) : pal->orig[k];
         }
-        pal->mod0 = ((const aff *)pal->P)[0];
-        pal->modlast = ((const aff *)pal->P)[pal->nb - 1];
-        pal->applied = 1;
+        if (matched_known >= 2) {
+            for (uint32_t k = 0; k < pal->nb; k++) {
+                int exact = -1;
+                for (int m = 0; m < g_vk.nknown; m++) {
+                    if (vrik_same_bone(&g_vk.known[m].orig, &pal->orig[k])) { exact = m; break; }
+                }
+                aff *dst = (aff *)(pal->P + (size_t)k * 48);
+                if (exact >= 0) {
+                    *dst = g_vk.known[exact].mod;
+                    if (k1 < 0) k1 = (int)k;
+                    k2 = (int)k;
+                } else {
+                    *dst = pal->orig[k];
+                }
+            }
+            if (k1 >= 0) {
+                pal->mod_k1 = k1; pal->mod_k2 = k2;
+                pal->mod1 = ((const aff *)pal->P)[k1];
+                pal->mod2 = ((const aff *)pal->P)[k2];
+                pal->applied = 1;
+            }
+        }
         return;
     }
-    // Foreground weapon / attachment mesh: must have its instance origin near the camera (< 0.85m) and distinct from V's body origin at the feet (> 0.50m)
-    if (g_vk.have_af[1] && vrik_weapon()) {
-        float db[3] = { pal->obj.m[3] - g_vk.obj.m[3], pal->obj.m[7] - g_vk.obj.m[7], pal->obj.m[11] - g_vk.obj.m[11] };
-        if (v3len(db) < 0.50f) return;
+    // Foreground weapon / attachment mesh: must have its instance origin near the camera (< 0.85m), distinct from V's body origin (> 0.50m), and <= 24 bones
+    if (g_vk.have_af[1] && vrik_weapon() && dist_body > 0.50f && pal->nb >= 1 && pal->nb <= 24) {
         aff o2v = aff_mul(g_vk.vcam, pal->obj);
         float wpos[3] = { o2v.m[3], o2v.m[7], o2v.m[11] };
         if (v3len(wpos) < 0.85f) {
@@ -524,8 +556,9 @@ static void vrik_apply_pal(vrik_pal *pal) {
                 aff *dst = (aff *)(pal->P + (size_t)k * 48);
                 *dst = aff_mul(D_weap_gun, pal->orig[k]);
             }
-            pal->mod0 = ((const aff *)pal->P)[0];
-            pal->modlast = ((const aff *)pal->P)[pal->nb - 1];
+            pal->mod_k1 = 0; pal->mod_k2 = (int)pal->nb - 1;
+            pal->mod1 = ((const aff *)pal->P)[0];
+            pal->mod2 = ((const aff *)pal->P)[pal->nb - 1];
             pal->applied = 1;
         }
     }
@@ -568,47 +601,43 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger bi, id ib, NSUInteger 
 
     pthread_mutex_lock(&g_vk_l);
     unsigned seq = ++g_vk.call_seq;
-    uint32_t max_b = (uint32_t)(pav / 48);
-    if (max_b > 128) max_b = 128;
 
     // Look up P in the persistent multi-pass palette cache (never wiped on setViewport toggles or secondary encoders)
     vrik_pal *pal = NULL;
     for (int i = 0; i < g_vk.npals; i++) {
         if (g_vk.pals[i].P == P) { pal = &g_vk.pals[i]; break; }
     }
-    if (!pal) {
-        if (g_vk.npals < 128) {
-            pal = &g_vk.pals[g_vk.npals++];
-        } else {
-            int oldest = 0;
-            for (int i = 1; i < 128; i++) if (g_vk.pals[i].stamp < g_vk.pals[oldest].stamp) oldest = i;
-            pal = &g_vk.pals[oldest];
+    int still_modified = (pal && pal->mod_k1 >= 0 && (size_t)(pal->mod_k1 + 1) * 48 <= pav &&
+                          pal->mod_k2 >= 0 && (size_t)(pal->mod_k2 + 1) * 48 <= pav &&
+                          vrik_pal_still_modified(pal));
+    if (!still_modified) {
+        // P currently holds fresh unmodified matrices from the game CPU: count exact palette length up to the 16-byte sentinel
+        uint32_t rot = 0;
+        while ((size_t)(rot + 1) * 48 <= pav && rot < 128 && vrik_is_rot((const float *)(P + (size_t)rot * 48))) rot++;
+        if (rot == 0) { pthread_mutex_unlock(&g_vk_l); return; }
+        if (!pal) {
+            if (g_vk.npals < 128) {
+                pal = &g_vk.pals[g_vk.npals++];
+            } else {
+                int oldest = 0;
+                for (int i = 1; i < 128; i++) if (g_vk.pals[i].stamp < g_vk.pals[oldest].stamp) oldest = i;
+                pal = &g_vk.pals[oldest];
+            }
+            memset(pal, 0, sizeof *pal);
+            pal->P = P; pal->L = -2;
         }
-        memset(pal, 0, sizeof *pal);
-        pal->P = P; pal->max_b = max_b; pal->L = -2;
-        memcpy(pal->orig, P, (size_t)max_b * 48);
-    } else {
-        // Check if P still holds VRIK's modified output from an earlier pass/batch of the SAME frame.
-        // Only snapshot P into pal->orig when the game CPU has written fresh unmodified matrices into P!
-        int still_modified = (pal->applied && pal->nb > 0 && pal->nb <= max_b &&
-                              vrik_same_bone((const aff *)P, &pal->mod0) &&
-                              vrik_same_bone((const aff *)(P + (size_t)(pal->nb - 1) * 48), &pal->modlast));
-        if (!still_modified) {
-            pal->max_b = max_b;
-            memcpy(pal->orig, P, (size_t)max_b * 48);
-            pal->applied = 0;
-        } else if (max_b > pal->max_b) {
-            memcpy(pal->orig + pal->max_b, P + (size_t)pal->max_b * 48, (size_t)(max_b - pal->max_b) * 48);
-            pal->max_b = max_b;
-        }
+        pal->max_b = rot;
+        pal->applied = 0;
+        pal->mod_k1 = pal->mod_k2 = -1;
+        memcpy(pal->orig, P, (size_t)rot * 48);
     }
     pal->stamp = seq;
     pal->obj = obj;
     pal->count = count;
 
-    // Always identify using the guaranteed-unmodified pal->orig matrices, never modified P
-    uint32_t rot = 0;
-    int rigv = 0, L = vrik_identify((__bridge const void *)ib, io, count, (const uint8_t *)pal->orig, (size_t)pal->max_b * 48, &rigv, &rot);
+    // Always identify using the guaranteed-unmodified pal->orig matrices (exact length pal->max_b), never modified P
+    uint32_t rot = pal->max_b;
+    int rigv = 0, L = vrik_identify((__bridge const void *)ib, io, count, isd[0], (const uint8_t *)pal->orig, rot, &rigv);
 
     int state_changed = 0;
     if (L >= 0) {
@@ -624,7 +653,7 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger bi, id ib, NSUInteger 
                 if (v3len(pv) < 1.0f) { near_cam = 1; break; }
             }
             if (near_cam) {
-                if (pal->L < 0 || nb > pal->nb || !pal->applied) {
+                if (pal->L != L || pal->nb != nb) {
                     pal->L = L; pal->nb = nb;
                     state_changed = 1;
                 }
@@ -632,18 +661,40 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger bi, id ib, NSUInteger 
                 #define BONE(nm) ({ int _b = -1; for (uint32_t _k = 0; _k < nb; _k++) if (vrik_list[o + _k] == (nm)) { _b = (int)_k; break; } _b; })
                 for (int side = 0; side < 2; side++) {
                     int bA = BONE(side ? VRIK_RIGHTARM : VRIK_LEFTARM);
+                    if (bA < 0) bA = BONE(side ? VRIK_R_SHL_0_JNT : VRIK_L_SHL_0_JNT);
                     int bF = BONE(side ? VRIK_RIGHTFOREARM : VRIK_LEFTFOREARM);
                     int bH = BONE(side ? VRIK_RIGHTHAND : VRIK_LEFTHAND);
-                    if (bA >= 0 && bF >= 0) {
-                        if (!g_vk.have_af[side] || !vrik_same_bone(&g_vk.SA[side], &pal->orig[bA]) || !vrik_same_bone(&g_vk.SF[side], &pal->orig[bF])) {
-                            g_vk.SA[side] = pal->orig[bA]; g_vk.SF[side] = pal->orig[bF];
-                            g_vk.have_af[side] = 1; state_changed = 1;
+                    const float *cA = vrik_bindpos(rigv, side ? VRIK_RIGHTARM : VRIK_LEFTARM);
+                    const float *cF = vrik_bindpos(rigv, side ? VRIK_RIGHTFOREARM : VRIK_LEFTFOREARM);
+                    const float *cH = vrik_bindpos(rigv, side ? VRIK_RIGHTHAND : VRIK_LEFTHAND);
+                    if (bA >= 0 && bF >= 0 && cA && cF && cH) {
+                        float S[3], eA[3], eF[3], W[3];
+                        aff_pt(pal->orig[bA].m, cA, S);
+                        aff_pt(pal->orig[bA].m, cF, eA);
+                        aff_pt(pal->orig[bF].m, cF, eF);
+                        aff_pt(pal->orig[bF].m, cH, W);
+                        float de[3] = { eA[0]-eF[0], eA[1]-eF[1], eA[2]-eF[2] };
+                        float da[3] = { eF[0]-S[0],  eF[1]-S[1],  eF[2]-S[2] };
+                        float df[3] = { W[0]-eF[0],  W[1]-eF[1],  W[2]-eF[2] };
+                        float la = v3len(da), lf = v3len(df);
+                        int side_ok = side ? (S[0] > 0.02f && S[0] < 0.40f) : (S[0] < -0.02f && S[0] > -0.40f);
+                        if (side_ok && S[2] > 1.10f && S[2] < 1.70f && v3len(de) < 0.02f && la > 0.18f && la < 0.38f && lf > 0.18f && lf < 0.38f) {
+                            if (!g_vk.have_af[side] || !vrik_same_bone(&g_vk.SA[side], &pal->orig[bA]) || !vrik_same_bone(&g_vk.SF[side], &pal->orig[bF])) {
+                                g_vk.SA[side] = pal->orig[bA]; g_vk.SF[side] = pal->orig[bF];
+                                g_vk.have_af[side] = 1; state_changed = 1;
+                            }
                         }
                     }
-                    if (bH >= 0) {
-                        if (!g_vk.have_h[side] || !vrik_same_bone(&g_vk.SH[side], &pal->orig[bH])) {
-                            g_vk.SH[side] = pal->orig[bH];
-                            g_vk.have_h[side] = 1; state_changed = 1;
+                    if (bH >= 0 && bF >= 0 && cH) {
+                        float wF[3], wH[3];
+                        aff_pt(pal->orig[bF].m, cH, wF);
+                        aff_pt(pal->orig[bH].m, cH, wH);
+                        float dw[3] = { wF[0]-wH[0], wF[1]-wH[1], wF[2]-wH[2] };
+                        if (v3len(dw) < 0.02f) {
+                            if (!g_vk.have_h[side] || !vrik_same_bone(&g_vk.SH[side], &pal->orig[bH])) {
+                                g_vk.SH[side] = pal->orig[bH];
+                                g_vk.have_h[side] = 1; state_changed = 1;
+                            }
                         }
                     }
                 }
@@ -652,18 +703,21 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger bi, id ib, NSUInteger 
         }
     } else {
         pal->L = -1;
-        pal->nb = rot > pal->max_b ? pal->max_b : rot;
+        pal->nb = rot;
     }
 
     if (state_changed) {
         g_vk.nknown = 0;
         vrik_solve_all();
-        // Re-apply cleanly from unmodified pal->orig to all active palettes seen recently
+        // Re-apply ONLY to the current palette and palettes already snapshotted & modified in the current frame
+        // (never overwrite a palette whose P holds fresh unmodified CPU matrices awaiting its first draw call of the frame!)
         for (int i = 0; i < g_vk.npals; i++) {
-            if (seq - g_vk.pals[i].stamp < 64 && g_vk.pals[i].L >= 0) vrik_apply_pal(&g_vk.pals[i]);
+            vrik_pal *p = &g_vk.pals[i];
+            if (p->L >= 0 && (p == pal || vrik_pal_still_modified(p))) vrik_apply_pal(p);
         }
         for (int i = 0; i < g_vk.npals; i++) {
-            if (seq - g_vk.pals[i].stamp < 64 && g_vk.pals[i].L < 0) vrik_apply_pal(&g_vk.pals[i]);
+            vrik_pal *p = &g_vk.pals[i];
+            if (p->L < 0 && (p == pal || vrik_pal_still_modified(p))) vrik_apply_pal(p);
         }
     } else if (!pal->applied) {
         vrik_apply_pal(pal);
