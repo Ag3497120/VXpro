@@ -93,6 +93,9 @@ int vxw_encode_eye(vxw_core *c, void *command_buffer, const vxw_params *p, void 
 // (VX Mac) A detail texture for the next encodes: a sharper copy of B's centre (the Neural Engine's SR), shown over B
 // inside rect (B's UV: x, y, w, h) with a soft ring; tex NULL: none. Read by the GPU: kept unchanged until the encodes'
 // command buffers complete.
+// Set the tracked viewmodel transform for subsequent encodes; NULL disables it.
+void vxw_set_viewmodel(vxw_core *c, const float delta[3], const float rot[3]);
+
 void vxw_set_detail(vxw_core *c, void *tex, const float rect[4]);
 // (VX Mac) The target's rasterization rate map (CompositorServices' foveation) for the next encodes, or NULL: the warp
 // then works on the logical screen (the map's screenSize) and draws through the map (a render pass, never compute).

@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 // The immersive presenter (see xros_vr.h; VISIONOS_PORT.md, "VR presentation"). visionOS only.
 //
 // Knobs (read once):
@@ -58,6 +59,8 @@
 #include "xros_vr.h"
 #include "warp_core.h"
 #include "npu_interp.h"
+#include "hand_gestures.h"
+#include "hand_weapon.h"
 
 void vx_log(const char *fmt, ...);
 void vx_xros_pace_tick(void);
@@ -111,12 +114,12 @@ static void config_once(void) {
     C.scroll_cm = envf("VXRT_HAND_SCROLL_CM", 1.5f);
     if (getenv("VXRT_VR_INPUT_LAG")) g_input_lag_s = envf("VXRT_VR_INPUT_LAG", 0.044f);
     C.calibrate = envf("VXRT_VR_CALIBRATE", 1) != 0 && !getenv("VXRT_VR_COUNTS_PER_DEG");
-    // (the game's depth for the eyes' parallax: 1 always, 0 never, 2 (the default) only while the game is fast enough
+    // (the game's depth for the eyes' parallax: 1 (the default) always, 0 never, 2 only while the game is fast enough
     //  for it (frames 55 ms apart or less, the shown one younger than 100 ms); below that its holes and smears were the
     //  worst of h5a's picture. Prediction in vr mode only with VXRT_VR_PREDICT_VR=1, for the same reason)
-    C.dibr = (int)envf("VXRT_VR_DIBR", 2);
+    C.dibr = (int)envf("VXRT_VR_DIBR", 1);
     C.predict_vr = envf("VXRT_VR_PREDICT_VR", 0) != 0;
-    C.stereo = envf("VXRT_VR_STEREO", 0.4f);            // (the eyes' and the head's offsets x this: smaller holes)
+    C.stereo = envf("VXRT_VR_STEREO", 1.0f);            // (the eyes' and the head's offsets x this: smaller holes)
     vx_log("VR: vr mode drives the camera %s; hand input %s (ray from the %s)", C.engage == 2 ? "always" : C.engage == 1 ? "while the game renders depth" :
            "while the game renders a 3D view (FSR2's constants and motion vectors)", C.hand ? "on" : "off", C.hand_shoulder ? "shoulder" : "head");
     vx_log("VR: mode %s", C.vr ? "vr (head turns sent to the game as mouse moves)" : C.screen ? "screen (a flat screen fixed in the room)" : "head (the game's camera as the head at each present)");
@@ -132,6 +135,7 @@ static void config(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthre
 typedef struct {
     __strong id<MTLTexture> color, view, depth, mv, prev, prev_view;   // (prev: the frame before, for the HUD's still check)   // (view: the colour as the warp samples it, sRGB-decoded for 8-bit unorm)
     uint32_t w, h, has_depth, has_mv, has_proj, flags;
+    __strong id<MTLBuffer> sdp_tmp;
     __strong id<MTLBuffer> cal_buf; uint32_t cal_n, cal_bpp;   // (the motion vectors' middle strip, for calibration)
     float tan_x, tan_y, z_a, z_b, mv_sx, mv_sy;
     float head[16];                  // (origin from the camera it is shown from: the head at its present)
@@ -180,6 +184,7 @@ static int g_force;                                     // (0 auto; the manual t
 static double g_label_until;                             // (below, with the label)
 static int g_label_big;                                  // (VX Mac, h47: the warp mode's label, larger)
 static const char *ui_str(int i);                        // (VX Mac, h47: the labels' languages, below)
+static int ui_lang(void);
 static int g_label_extra;                                // (VX Mac, h54: the manual toggle's label when it also changed the automatic screen)
 static int vr_now(void) { return g_force == 1 || (!g_force && C.vr && (C.engage == 2 || g_engaged)); }   // (the game's camera driven now)
 static int screen_now(void) { return g_force == 2 || (!vr_now() && (C.screen || C.vr)); }               // (the world-locked screen shown now)
@@ -226,7 +231,9 @@ typedef struct { void *tex; uint32_t w, h, draws; } depth_cand;
 static depth_cand g_cand[16];
 static int g_ncand, g_copies;
 static void *g_pick; static uint32_t g_pick_w, g_pick_h; static MTLPixelFormat g_pick_fmt;
-static id<MTLBuffer> g_hold;
+static id<MTLBuffer> g_hold, g_hold_pool[3];
+static unsigned g_hold_busy;
+static int g_hold_index = -1;
 static uint32_t g_back_w, g_back_h;
 
 void vx_xros_vr_depth_pass(void *cbp, void *texp, uint32_t draws, uint32_t writes, uint32_t funcs) {
@@ -241,15 +248,22 @@ void vx_xros_vr_depth_pass(void *cbp, void *texp, uint32_t draws, uint32_t write
     pthread_mutex_lock(&g_lock);
     depth_cand *c = NULL;
     for (int k = 0; k < g_ncand; k++) if (g_cand[k].tex == texp) c = &g_cand[k];
-    if (!c && g_ncand < 16) { c = &g_cand[g_ncand++]; *c = (depth_cand){ texp, w, h, 0 }; }
-    if (c) c->draws += draws;
+    if (!c && writes && g_ncand < 16) { c = &g_cand[g_ncand++]; *c = (depth_cand){ texp, w, h, 0 }; }
+    if (c && writes) c->draws += draws;
     // (VX Mac: by the pick's size, not its texture: the Mac game draws its scene depth into two textures by turns
     //  (one Depth32Float, one Depth32Float_Stencil8), so a pick by texture matched every other frame and the depth came
     //  and went - the picture's scale jumped with it (the zoom pulses, h25). The last pass of the frame at that size wins)
-    if (g_pick && writes && w == g_pick_w && h == g_pick_h && (f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8 || f == g_pick_fmt)) {
+    if (g_pick && writes && w == g_pick_w && h == g_pick_h && (g_pick_fmt == MTLPixelFormatDepth32Float_Stencil8 ? f == g_pick_fmt : (f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8 || f == g_pick_fmt))) {
         uint32_t bpp = f == MTLPixelFormatDepth16Unorm ? 2 : 4;
         NSUInteger need = (NSUInteger)w * h * bpp;
-        if (!g_hold || g_hold.length != need) g_hold = [cb.device newBufferWithLength:need options:MTLResourceStorageModePrivate];
+        if (g_hold_index < 0) {
+            for (int i = 0; i < 3; i++) if (!(g_hold_busy & (1u << i))) { g_hold_index = i; g_hold_busy |= 1u << i; break; }
+        }
+        if (g_hold_index >= 0) {
+            if (!g_hold_pool[g_hold_index] || g_hold_pool[g_hold_index].length != need)
+                g_hold_pool[g_hold_index] = [cb.device newBufferWithLength:need options:MTLResourceStorageModePrivate];
+            g_hold = g_hold_pool[g_hold_index];
+        }
         if (g_hold) {
             id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
             [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
@@ -292,6 +306,30 @@ static MTLPixelFormat srgb_of(MTLPixelFormat f) {
 static void show_label(const char *text);
 static float g_screen[16]; static int g_screen_valid, g_recenter;
 static float g_cursor_dot[4];                            // (the hand's pointer on the screen: u, v, shown, pinched)
+// (VX Mac, h70: the magazine by hand, for the eyes' drawing - the grip's bottom as a ring while a magazine is wanted
+//  (lit when the hand is there), a magazine in the off hand while one is held; the room's frame; under g_lock)
+static float g_vm_delta[3], g_vm_rot[3], g_vm_off_delta[3], g_vm_off_rot[3];
+static int g_vm_active, g_vm_off_active;
+
+int vx_xros_vr_viewmodel_pose(float delta_cam[3], float rot_cam[3]) {
+    pthread_mutex_lock(&g_lock);
+    int active = g_vm_active;
+    if (active) { memcpy(delta_cam, g_vm_delta, sizeof g_vm_delta); memcpy(rot_cam, g_vm_rot, sizeof g_vm_rot); }
+    pthread_mutex_unlock(&g_lock);
+    return active;
+}
+int vx_xros_vr_viewmodel_poses(float gun_delta[3], float gun_rot[3], float off_delta[3], float off_rot[3], int *off_ok) {
+    pthread_mutex_lock(&g_lock);
+    int active = g_vm_active;
+    if (active) {
+        memcpy(gun_delta, g_vm_delta, sizeof g_vm_delta); memcpy(gun_rot, g_vm_rot, sizeof g_vm_rot);
+        memcpy(off_delta, g_vm_off_delta, sizeof g_vm_off_delta); memcpy(off_rot, g_vm_off_rot, sizeof g_vm_off_rot);
+        if (off_ok) *off_ok = g_vm_off_active;
+    } else if (off_ok) *off_ok = 0;
+    pthread_mutex_unlock(&g_lock);
+    return active;
+}
+static struct { int on, ring, lit, mag, holding, state, gun_ok, slide_hold, weapon_type, two_hand, pinch[2]; float well[3], grip_dir[3], mag_at[3], mag_up[3], skel[134], palm[3], off_palm[3], fwd[3], pull, neutral_palm[3], neutral_fwd[3], neutral_up[3], off_neutral[3]; int off_ok; } g_mag_draw;
 void vx_xros_vr_recenter(void) { g_recenter = 1; show_label("Recentred"); }
 static void place_screen(const float *head) {
     if (head[12] == 0 && head[13] == 0 && head[14] == 0) return;   // (no pose yet: h2b placed one at the floor)
@@ -409,6 +447,9 @@ static float g_gp_of[64]; static uint64_t g_gp_seq[64];
 static double g_gain_sxy[2], g_gain_sxx[2]; static unsigned g_gain_n[2];   // (h64: the game's yaw per sent yaw, free / aiming)
 // (h64: warp mode 7 - free look and controller aim; below with vr_mouse)
 static int aim_on(void);
+static float g_hand_aim_y, g_hand_aim_p;
+static int g_hand_draw_zone;
+int vx_xros_vr_draw_zone(void) { pthread_mutex_lock(&g_lock); int z = g_hand_draw_zone; pthread_mutex_unlock(&g_lock); return z; }
 static float g_aim_push_p; static int g_rebase_due; static double g_aim_cam_t;                                // (pitch the cone's edge asks of the game, sent at the next vr_mouse)
 static float g_xh[2][2]; static int g_xh_ok[2];           // (each eye's tangents of the frame's centre: the crosshair's place)
 static float g_cam_rows[9], g_cam_vel[3]; static int g_cam_now_ok;   // (h60: the newest game camera's axes and velocity, m/s)   // (h57e/f: the game's camera is a vehicle's (third-person orbit, below); the game's horizontal FOV)   // (h57: vr mode's zero set again; game camera reads not shown)
@@ -497,6 +538,8 @@ static void vr_mouse(const float *m, double now, int send) {        // (with g_l
         if (a != g_aim_was) { g_aim_was = a; g_aim_push_p = 0; if (!a) g_rebase_due = 1;
             if (vx_host_jlog) { char f[96]; snprintf(f, sizeof f, "\"on\":%d,\"cone\":[%.0f,%.0f]", a, g_aim_cone_y, g_aim_cone_p); vx_host_jlog("aim_mode", f); } }
     }
+    g_yaw_ref = wrap180(g_yaw_ref - g_hand_aim_y); g_pitch_ref -= g_hand_aim_p;
+    g_hand_aim_y = g_hand_aim_p = 0;
     // (h43: the game's pitch limits - VXMAC_PITCH_LIMIT, else 80, narrowed when the picture stops pitching while the
     //  sent pitch goes on (vx_xros_vr_seen_turn2): never sent beyond them, so the game's pitch and the head's stay one)
     if (want_p > g_pitch_hi) want_p = g_pitch_hi; if (want_p < g_pitch_lo) want_p = g_pitch_lo;
@@ -909,6 +952,7 @@ static NSString *const kFloorSrc = @
     "    if (g.x >= 32 || g.y >= 16) return;\n"
     "    float2 uv = float2((g.x + 0.5f) / 32.0f, 0.4f + (g.y + 0.5f) / 16.0f * 0.6f);\n"
     "    uint2 px = min(uint2(uv * float2(d.get_width(), d.get_height())), uint2(d.get_width(), d.get_height()) - 1);\n"
+    "    if (g.y == 0 && g.x < 5) { float2 q[5] = {float2(.5,.1),float2(.14,.72),float2(.515625,.86875),float2(.703125,.86875),float2(.765625,.94375)}; uint2 r = min(uint2(q[g.x] * float2(d.get_width(), d.get_height())), uint2(d.get_width(), d.get_height()) - 1); o[512 + g.x] = float4(d.read(r).r, 0, 0, 0); }\n"
     "    float dv = d.read(px).r; if (p.std_) dv = 1 - dv;\n"
     "    float z = abs(p.za / (dv - p.zb));\n"
     "    if (!isfinite(z) || z <= 0 || z > 1e4) { o[g.y * 32 + g.x] = float4(0); return; }\n"
@@ -917,6 +961,9 @@ static NSString *const kFloorSrc = @
     "}\n";
 static id<MTLComputePipelineState> g_floor_pso; static int g_floor_on = -1; static double g_floor_last;
 static float g_floor_pitch, g_floor_conf;
+static pthread_mutex_t g_floor_lock = PTHREAD_MUTEX_INITIALIZER;
+static id<MTLBuffer> g_floor_buf[2];
+static unsigned g_floor_busy;
 static void floor_fit(id<MTLCommandBuffer> cb, vr_slot *S, uint64_t pseq) {
     if (g_floor_on < 0) { const char *e = getenv("VXMAC_FLOOR"); g_floor_on = !(e && !strcmp(e, "0")); }
     if (!g_floor_on || !vr_now() || !S->has_depth || !S->depth || pseq % 6) return;
@@ -926,15 +973,24 @@ static void floor_fit(id<MTLCommandBuffer> cb, vr_slot *S, uint64_t pseq) {
         g_floor_pso = lib ? [cb.device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fl"] error:&err] : nil;
         if (!g_floor_pso) { vx_log("VR: the floor fit: %s", err.localizedDescription.UTF8String); g_floor_on = 0; return; }
     }
-    id<MTLBuffer> o = [cb.device newBufferWithLength:512 * 16 options:MTLResourceStorageModeShared];
+    pthread_mutex_lock(&g_floor_lock);
+    int slot = -1;
+    for (int i = 0; i < 2; i++) if (!(g_floor_busy & (1u << i))) { slot = i; g_floor_busy |= 1u << i; break; }
+    if (slot >= 0 && !g_floor_buf[slot]) g_floor_buf[slot] = [cb.device newBufferWithLength:517 * 16 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> o = slot >= 0 ? g_floor_buf[slot] : nil;
+    if (slot >= 0 && !o) g_floor_busy &= ~(1u << slot);
+    pthread_mutex_unlock(&g_floor_lock);
+    if (!o) return;
     struct { float tx, ty, za, zb; uint32_t std_; } P = { S->tan_x, S->tan_y, S->z_a, S->z_b, (S->flags & VXW_DEPTH_STD) ? 1u : 0u };
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    if (!e) { pthread_mutex_lock(&g_floor_lock); g_floor_busy &= ~(1u << slot); pthread_mutex_unlock(&g_floor_lock); return; }
     [e setComputePipelineState:g_floor_pso]; [e setTexture:S->depth atIndex:0]; [e setBuffer:o offset:0 atIndex:0]; [e setBytes:&P length:sizeof P atIndex:1];
     [e dispatchThreads:MTLSizeMake(32, 16, 1) threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
     [e endEncoding];
     [cb addCompletedHandler:^(id<MTLCommandBuffer> d) {
-        (void)d;
+        if (d.status != MTLCommandBufferStatusCompleted) goto floor_done;
         const float *v = o.contents;
+        if (!(P.std_) && v[512 * 4] > .85f) goto floor_done;
         float pit[512], rol[512]; int n = 0;
         for (int y = 0; y < 15; y++) for (int x = 0; x < 31; x++) {
             const float *a = v + (y * 32 + x) * 4, *b = v + (y * 32 + x + 1) * 4, *c = v + ((y + 1) * 32 + x) * 4;
@@ -951,16 +1007,17 @@ static void floor_fit(id<MTLCommandBuffer> cb, vr_slot *S, uint64_t pseq) {
             static double lt; double tn = CACurrentMediaTime();
             if (tn - lt > 10) { lt = tn; int valid = 0; for (int k = 0; k < 512; k++) if (v[k * 4 + 3] >= 1) valid++;
                 const float *m = v + (12 * 32 + 16) * 4;
-                vx_log("VR: floor fit: %d valid points, %d up-facing normals; sample (%.2f %.2f %.2f) w %.0f", valid, n, m[0], m[1], m[2], m[3]); }
+                vx_log("VR: floor fit: %d valid points, %d up-facing normals; sample (%.2f %.2f %.2f) w %.0f", valid, n, m[0], m[1], m[2], m[3]);
+                vx_log("VR: depth samples raw sky %.6f left %.6f center %.6f right %.6f low-right %.6f; za %.6f zb %.6f std %u", v[512*4], v[513*4], v[514*4], v[515*4], v[516*4], P.za, P.zb, P.std_); }
         }
-        if (n < 60) { g_floor_conf = (float)n / 450.f; return; }
+        if (n < 60) { g_floor_conf = (float)n / 450.f; goto floor_done; }
         // (the median, and how many lie within 3 degrees of it)
         float tmp[512]; memcpy(tmp, pit, n * sizeof *pit);
         for (int i = 1; i < n; i++) { float t = tmp[i]; int j = i - 1; while (j >= 0 && tmp[j] > t) { tmp[j + 1] = tmp[j]; j--; } tmp[j + 1] = t; }
         float med = tmp[n / 2]; int agree = 0; for (int i = 0; i < n; i++) if (fabsf(pit[i] - med) < 3) agree++;
         (void)rol;
         g_floor_pitch = med; g_floor_conf = (float)agree / 450.f;
-        if (agree < 60) return;
+        if (agree < 60) goto floor_done;
         pthread_mutex_lock(&g_lock);
         double t = CACurrentMediaTime();
         if (g_stamp_at[pseq % 64] == pseq && t - g_floor_last > 1.5) {
@@ -972,6 +1029,8 @@ static void floor_fit(id<MTLCommandBuffer> cb, vr_slot *S, uint64_t pseq) {
             }
         }
         pthread_mutex_unlock(&g_lock);
+    floor_done:
+        pthread_mutex_lock(&g_floor_lock); g_floor_busy &= ~(1u << slot); pthread_mutex_unlock(&g_floor_lock);
     }];
 }
 void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*release)(void *), void *arg) {
@@ -1014,11 +1073,17 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     int had_depth = g_copies > 0 && g_hold;
     id<MTLBuffer> hold = g_hold; uint32_t dw = g_pick_w, dh = g_pick_h; MTLPixelFormat df = g_pick_fmt;
     int best = -1;
-    for (int k = 0; k < g_ncand; k++) if (best < 0 || g_cand[k].draws > g_cand[best].draws) best = k;
-    // (VX Mac: the pick kept while it is still a candidate with at least 60 % of the best's draws - two depth targets
-    //  of one size took turns every frame, h22, and the copy never settled)
-    for (int k = 0; k < g_ncand && best >= 0; k++)
-        if (g_cand[k].tex == g_pick && g_cand[k].draws * 10 >= g_cand[best].draws * 6) { best = k; break; }
+    for (int k = 0; k < g_ncand; k++) if (g_cand[k].draws) {
+        id<MTLTexture> t = (__bridge id<MTLTexture>)g_cand[k].tex;
+        id<MTLTexture> old = best >= 0 ? (__bridge id<MTLTexture>)g_cand[best].tex : nil;
+        if (best < 0 || (t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 && old.pixelFormat != MTLPixelFormatDepth32Float_Stencil8) ||
+            ((t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) == (old.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) && g_cand[k].draws > g_cand[best].draws)) best = k;
+    }
+    for (int k = 0; k < g_ncand && best >= 0; k++) {
+        id<MTLTexture> t = (__bridge id<MTLTexture>)g_cand[k].tex;
+        id<MTLTexture> b = (__bridge id<MTLTexture>)g_cand[best].tex;
+        if (g_cand[k].tex == g_pick && t.pixelFormat == b.pixelFormat && g_cand[k].draws * 10 >= g_cand[best].draws * 6) { best = k; break; }
+    }
     void *np = best >= 0 ? g_cand[best].tex : NULL;
     if (np != g_pick) {
         g_pick = np;
@@ -1029,7 +1094,10 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
         }
     }
     g_ncand = 0; g_copies = 0;
-    if (had_depth) g_hold = nil;                     // (the slot keeps reading this one; the next frame copies into a new one)
+    int hold_index = g_hold_index; g_hold_index = -1; g_hold = nil;
+    if (hold_index >= 0) [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done; pthread_mutex_lock(&g_lock); g_hold_busy &= ~(1u << hold_index); pthread_mutex_unlock(&g_lock);
+    }];
     if (s >= 0) g_slot[s].writing = 1;
     float head[16]; memcpy(head, g_head, sizeof head);
     int head_valid = g_head_valid;
@@ -1351,7 +1419,9 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                      toTexture:S->depth destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
             S->has_depth = 1;
         } else if (f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatDepth16Unorm) {
-            id<MTLBuffer> tmp = [dev newBufferWithLength:(NSUInteger)sw * sh * bpp options:MTLResourceStorageModePrivate];
+            NSUInteger need = (NSUInteger)sw * sh * bpp;
+            if (!S->sdp_tmp || S->sdp_tmp.length != need) S->sdp_tmp = [dev newBufferWithLength:need options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> tmp = S->sdp_tmp;
             if (tmp) {
                 [b copyFromTexture:sdp sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(sw, sh, 1)
                           toBuffer:tmp destinationOffset:0 destinationBytesPerRow:(NSUInteger)sw * bpp destinationBytesPerImage:(NSUInteger)sw * sh * bpp
@@ -1506,6 +1576,11 @@ int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
         if (eff != g_eff) { g_eff = eff; if (eff == 2) { g_vr_ref = 0; g_wc_clear = 1; g_show_mode = 1; } if (eff == 1 && was >= 0) g_recenter = 1; if (was >= 0) g_fade_at = CACurrentMediaTime(); }
         pthread_mutex_unlock(&g_lock);
         if (was >= 0 && eff != was && g_force) { char t[64]; snprintf(t, sizeof t, "%s%s", eff == 2 ? "VR" : eff == 1 ? "Screen" : "Head", g_force ? " (manual)" : " (auto)"); show_label(t); }
+        if (eff == 2 && eff != was) {
+            const char *e = getenv("VXMAC_GESTURES");
+            const char *a = getenv("VXMAC_ARMS");
+            if (!(e && !strcmp(e, "0")) && !(a && !strcmp(a, "0"))) show_label("VXHands ON (Hand + Arm + Joy-Con)");
+        }
     }
     if (screen_now() && (!g_screen_valid || g_recenter) && (m[12] != 0 || m[13] != 0 || m[14] != 0)) { g_recenter = 0; place_screen(m); }
     vx_xros_pace_tick();
@@ -2224,9 +2299,254 @@ static void draw_hud(id<MTLCommandBuffer> cb, void *outp, int eye, const float t
     [e endEncoding];
 }
 
-static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], const float tan[4], float near_m, void *outp, void *odp);
+// (VX Mac, h70) The magazine by hand drawn over the eye: a magazine in the off hand while one is held (a box 12 x 3.5 x
+// 2.2 cm along the fist's knuckles, shaded by face), and the grip's bottom as a ring across the grip's line while a
+// magazine is wanted - lit (larger, brighter) when the hand is there. Points in the room's frame, through the eye's
+// view and tangents to its NDC; no depth test: drawn over the game, like the label.
+static id<MTLRenderPipelineState> g_mag_pso; static MTLPixelFormat g_mag_cf;
+typedef struct { float p[4], c[4]; } MV;
+static float vdot(const float *a, const float *b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+static void vcross(const float *a, const float *b, float *c) {
+    c[0]=a[1]*b[2]-a[2]*b[1]; c[1]=a[2]*b[0]-a[0]*b[2]; c[2]=a[0]*b[1]-a[1]*b[0];
+}
+static int vnorm(float *a) { float n=sqrtf(vdot(a,a)); if (n < 1e-5f) return 0; for(int i=0;i<3;i++) a[i]/=n; return 1; }
+static int mag_project(const float *q, float *out, const float *vfo, const float *tan) {
+    float e[3]; for(int r=0;r<3;r++) e[r]=vfo[r]*q[0]+vfo[4+r]*q[1]+vfo[8+r]*q[2]+vfo[12+r];
+    if(e[2]>-.05f) return 0; float z=-e[2];
+    out[0]=(e[0]/z+tan[0])/(tan[0]+tan[1])*2-1; out[1]=(e[1]/z+tan[3])/(tan[2]+tan[3])*2-1;
+    out[2]=0; out[3]=1; return 1;
+}
+// A tapered, face-shaded prism in room coordinates.
+static void add_beam(MV *v, int *n, const float *A, const float *B, const float *hint,
+                     float ra, float rb, const float *col, const float *vfo, const float *tan) {
+    if (*n + 36 > 8192) return;
+    float d[3], u[3], side[3]; for(int i=0;i<3;i++) d[i]=B[i]-A[i];
+    if(!vnorm(d)) return; vcross(d,hint,side);
+    if(!vnorm(side)) { float ref[3]={0,1,0}; if(fabsf(d[1])>.9f) { ref[0]=1; ref[1]=0; } vcross(d,ref,side); if(!vnorm(side)) return; }
+    vcross(side,d,u); vnorm(u);
+    float c[8][3], projected[8][4];
+    for(int k=0;k<8;k++) { for(int i=0;i<3;i++) c[k][i]=(k&1?B[i]:A[i])+(k&2?1:-1)*side[i]*(k&1?rb:ra)+(k&4?1:-1)*u[i]*(k&1?rb:ra);
+        if(!mag_project(c[k],projected[k],vfo,tan)) return; }
+    static const int faces[6][6]={{0,2,6,0,6,4},{1,3,7,1,7,5},{0,1,5,0,5,4},{2,3,7,2,7,6},{0,1,3,0,3,2},{4,5,7,4,7,6}};
+    static const float shade[6]={.55f,.85f,.65f,.75f,.5f,1};
+    for(int f=0;f<6;f++) for(int j=0;j<6;j++) { MV *x=&v[(*n)++]; memcpy(x->p,projected[faces[f][j]],sizeof x->p); for(int i=0;i<3;i++) x->c[i]=col[i]*shade[f]; x->c[3]=col[3]; }
+}
+// The game's viewmodel is a depth-masked, hand-relative patch of the current frame.
+static id<MTLRenderPipelineState> g_vm_pso; static MTLPixelFormat g_vm_cf;
+typedef struct { float p[4], uv[2], orig_uv[2], mode[4]; } VMV;
+typedef struct { float za, zb; uint32_t std_depth, has_depth; float hand_uv[4]; float lefty; } VMP;
+typedef struct { float pivot[4], delta[4], nr[4], nu[4], nf[4], right[4], up[4], fwd[4], off[4], view[16], tan[4], source[4]; } VMT;
+static void draw_game_viewmodel(id<MTLCommandBuffer> cb, id<MTLTexture> out, vr_slot *S,
+                                const __typeof__(g_mag_draw) *D, const float *M, const float *tan, int eye) {
+    (void)eye;
+    if (!S || !S->view || !S->has_depth || !S->depth || !S->head_valid || !D->gun_ok || S->tan_x <= 0 || S->tan_y <= 0) return;
+    if (!g_vm_pso || g_vm_cf != out.pixelFormat) {
+        NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct VMV { float4 p; float2 uv; float2 orig_uv; float4 mode; };\n"
+        "struct VMP { float za, zb; uint std_depth, has_depth; float4 hand_uv; float lefty; };\n"
+        "struct VMT { float4 pivot, delta, nr, nu, nf, right, up, fwd, off; float4x4 view; float4 tan, source; };\n"
+        "struct O { float4 p [[position]]; float2 uv; float2 orig_uv; float4 mode; };\n"
+        "float dist(texture2d<float> d, sampler s, float2 uv, constant VMP &p) { float dv=d.sample(s,uv,level(0)).r; if(p.std_depth) dv=1.0-dv; return abs(p.za/max(abs(dv-p.zb),1e-5)); }\n"
+        "float mask(texture2d<float> d, sampler s, float2 uv, constant VMP &p) {\n"
+        "  float2 m=float2(p.lefty>0.5 ? 1.0-uv.x : uv.x,uv.y);\n"
+        "  if (!p.has_depth || m.x<0.15 || m.x>0.98 || m.y<0.32 || m.y>0.99) return 0.0;\n"
+        "  float z=dist(d,s,uv,p); return (isfinite(z) && z>=0.03 && z<0.48) ? 1.0 : 0.0; }\n"
+        "vertex O vm_vs(uint id [[vertex_id]], constant VMV *v [[buffer(0)]], constant VMP &p [[buffer(1)]], constant VMT &t [[buffer(2)]], texture2d<float> dep [[texture(0)]]) {\n"
+        " O o; VMV a=v[id]; o.p=a.p; o.uv=a.uv; o.orig_uv=a.orig_uv; o.mode=a.mode;\n"
+        " float z=0.22;\n"
+        " float3 q=float3((2.0*a.uv.x-1.0)*t.source.x*z,(1.0-2.0*a.uv.y)*t.source.y*z,-z);\n"
+        " if (a.mode.x>0.5) q.xy+=t.delta.xy;\n"
+        " float4 e=t.view*float4(q,1); float ez=max(-e.z,0.001);\n"
+        " o.p=float4(((e.x/ez+t.tan.x)/(t.tan.x+t.tan.y)*2.0-1.0)*ez, ((e.y/ez+t.tan.w)/(t.tan.z+t.tan.w)*2.0-1.0)*ez,0,ez); return o; }\n"
+        "fragment float4 vm_fs(O i [[stage_in]], constant VMP &p [[buffer(0)]], texture2d<float> col [[texture(0)]], texture2d<float> dep [[texture(1)]]) {\n"
+        " constexpr sampler s(filter::nearest,address::clamp_to_edge);\n"
+        " constexpr sampler linear_s(filter::linear,address::clamp_to_edge);\n"
+        " if (i.mode.x<0.5) { if (mask(dep,s,i.orig_uv,p)<0.5) discard_fragment();\n"
+        "  float3 sum=0; float weights=0;\n"
+        "  for (int d=0; d<8; ++d) { float a=3.1415926536+float(d)*0.4487989505; float2 dir=float2(cos(a),sin(a));\n"
+        "   for (int j=1; j<=80; ++j) { float r=float(j)*0.008; float2 q=i.orig_uv+dir*r;\n"
+        "    if (any(q<0.0) || any(q>1.0)) break; float z=dist(dep,s,q,p);\n"
+        "    if (isfinite(z) && z>=0.55 && mask(dep,s,q,p)<0.05) { float w=exp(-r*r*20.0)/(0.02+r); sum+=col.sample(linear_s,q).rgb*w; weights+=w; break; } } }\n"
+        "  if (weights<=0.0) return float4(col.sample(s,float2(i.orig_uv.x,clamp(i.orig_uv.y-0.38,0.05,0.35))).rgb, 1.0); return float4(sum/weights,1.0); }\n"
+        " float fg=mask(dep,s,i.uv,p); if (fg<0.5) discard_fragment();\n"
+        " return float4(col.sample(linear_s,i.uv).rgb,1.0); }\n";
+        NSError *err = nil; id<MTLLibrary> lib = [cb.device newLibraryWithSource:src options:nil error:&err];
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [lib newFunctionWithName:@"vm_vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"vm_fs"];
+        pd.colorAttachments[0].pixelFormat = out.pixelFormat; pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne; pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne; pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        g_vm_pso = lib ? [cb.device newRenderPipelineStateWithDescriptor:pd error:&err] : nil; g_vm_cf = out.pixelFormat;
+        if (!g_vm_pso) { vx_log("VR: game viewmodel pipeline: %s", err.localizedDescription.UTF8String); return; }
+    }
+    const char *left = getenv("VXMAC_GESTURE_LEFTY"); int lefty = left && !strcmp(left,"1");
+    const float *h = S->head;
+    float dp[3];
+    for (int i=0;i<3;i++) dp[i]=D->palm[i]-D->neutral_palm[i];
+    float dx=vdot(dp,h), dy=vdot(dp,h+4)-D->pull*.4f;
+    if (D->off_ok) {
+        float off_dp[3]={D->off_palm[0]-D->off_neutral[0],D->off_palm[1]-D->off_neutral[1],D->off_palm[2]-D->off_neutral[2]};
+        dx+=.35f*vdot(off_dp,h); dy+=.35f*vdot(off_dp,h+4);
+    }
+    dx*=.65f; dy*=.65f;
+    float dlen=hypotf(dx,dy);
+    if (dlen>.065f) { dx*=.065f/dlen; dy*=.065f/dlen; dlen=.065f; }
+    if (dlen<.003f) return;
+    VMP p={S->z_a,S->z_b,(S->flags & VXW_DEPTH_STD)?1u:0u,(S->has_depth && S->depth)?1u:0u,{.15f,.32f,.98f,.99f},lefty?1.f:0.f};
+    VMT t={0}; t.delta[0]=dx; t.delta[1]=dy; t.delta[2]=0;
+    memcpy(t.view,M,sizeof t.view); memcpy(t.tan,tan,sizeof t.tan); t.source[0]=S->tan_x; t.source[1]=S->tan_y;
+    enum { NX=64, NY=48, MAXV=NX*NY*6 }; VMV *verts=malloc(sizeof(*verts)*MAXV); if(!verts) return;
+    static const int tri[6][2]={{0,0},{1,0},{1,1},{0,0},{1,1},{0,1}};
+    MTLRenderPassDescriptor *pass=[MTLRenderPassDescriptor new]; pass.colorAttachments[0].texture=out; pass.colorAttachments[0].loadAction=MTLLoadActionLoad; pass.colorAttachments[0].storeAction=MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e=eye_encoder(cb,pass); [e setRenderPipelineState:g_vm_pso];
+    [e setVertexBytes:&p length:sizeof p atIndex:1]; [e setVertexBytes:&t length:sizeof t atIndex:2]; [e setVertexTexture:p.has_depth ? S->depth : S->view atIndex:0];
+    [e setFragmentBytes:&p length:sizeof p atIndex:0]; [e setFragmentTexture:S->view atIndex:0]; [e setFragmentTexture:p.has_depth ? S->depth : S->view atIndex:1];
+    for(int mode=0;mode<2;mode++) { int n=0;
+      for(int y=0;y<NY;y++) for(int x=0;x<NX;x++) { VMV cell[6]; int valid=1;
+        for(int k=0;k<6;k++) { float u=(lefty?.02f:.15f)+.83f*(x+tri[k][0])/NX, v=.32f+.67f*(y+tri[k][1])/NY;
+          VMV *a=&cell[k]; memset(a,0,sizeof *a); a->uv[0]=a->orig_uv[0]=u; a->uv[1]=a->orig_uv[1]=v; a->mode[0]=mode;
+        } if(valid) { memcpy(verts+n,cell,sizeof cell); n+=6; }
+      }
+      if(n) { id<MTLBuffer> buf=[cb.device newBufferWithBytes:verts length:n*sizeof(*verts) options:MTLResourceStorageModeShared];
+        if(buf) { [e setVertexBuffer:buf offset:0 atIndex:0]; [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n]; } }
+    }
+    [e endEncoding]; free(verts);
+}
+
+static void draw_v_hand(MV *v, int *n, const float *s, int pinch, const float *vfo, const float *tan) {
+    if(s[0]<.5f) return;
+    #define J(i) (s+1+(i)*3)
+    const float metal[4]={.10f,.11f,.12f,.98f}, finger[4]={.65f,.40f,.29f,.98f}, cyan[4]={.10f,.48f,.51f,.95f}, yellow[4]={.64f,.46f,.19f,.95f};
+    float across[3], up[3], along[3], elbow[3];
+    for(int i=0;i<3;i++) { across[i]=J(19)[i]-J(7)[i]; along[i]=J(11)[i]-J(1)[i]; elbow[i]=J(0)[i]; }
+    vcross(across,along,up); if(!vnorm(up)) { up[0]=0;up[1]=1;up[2]=0; }
+    float elen=0; for(int i=0;i<3;i++) elen+=(elbow[i]-J(1)[i])*(elbow[i]-J(1)[i]);
+    if(elen<.0025f) { vnorm(along); for(int i=0;i<3;i++) elbow[i]=J(1)[i]-.22f*along[i]; }
+    add_beam(v,n,elbow,J(1),up,.035f,.025f,metal,vfo,tan);
+    float a[3],b[3]; for(int i=0;i<3;i++) { a[i]=elbow[i]+up[i]*.035f; b[i]=J(1)[i]+up[i]*.026f; }
+    add_beam(v,n,a,b,across,.002f,.002f,yellow,vfo,tan);
+    vnorm(along); float cuff[3]; for(int i=0;i<3;i++) cuff[i]=J(1)[i]-.035f*along[i];
+    add_beam(v,n,cuff,J(1),up,.030f,.029f,metal,vfo,tan);
+    const int palm[]={2,7,11,15,19};
+    for(int k=0;k<4 && *n+3<=8192;k++) {
+        float p[3][4]; if(!mag_project(J(1),p[0],vfo,tan) || !mag_project(J(palm[k]),p[1],vfo,tan) || !mag_project(J(palm[k+1]),p[2],vfo,tan)) continue;
+        for(int j=0;j<3;j++) { memcpy(v[*n].p,p[j],sizeof p[j]); memcpy(v[(*n)++].c,finger,sizeof finger); }
+    }
+    const int bases[]={2,7,11,15,19};
+    for(int i=0;i<5;i+=2) add_beam(v,n,J(1),J(bases[i]),up,.012f,.009f,metal,vfo,tan);
+    for(int i=1;i<4;i++) add_beam(v,n,J(bases[i]),J(bases[i+1]),up,.002f,.002f,cyan,vfo,tan);
+    const int start[]={2,6,10,14,18};
+    for(int f=0;f<5;f++) for(int j=0;j<3;j++)
+        add_beam(v,n,J(start[f]+j),J(start[f]+j+1),up,j==0?.008f:.006f,j==2?.004f:.006f,(pinch && j==2 && f<2)?cyan:finger,vfo,tan);
+    for(int f=0;f<5;f++) for(int j=0;j<3;j++) {
+        const float *joint=J(start[f]+j); float a[3],b[3];
+        for(int i=0;i<3;i++) { a[i]=joint[i]-up[i]*.002f; b[i]=joint[i]+up[i]*.002f; }
+        add_beam(v,n,a,b,across,.008f,.008f,(pinch && f<2)?cyan:metal,vfo,tan);
+    }
+    #undef J
+}
+static void draw_mag(id<MTLCommandBuffer> cb, void *outp, const float vfo[16], const float tan[4], int eye, const float *warp_M) {
+    pthread_mutex_lock(&g_lock);
+    __typeof__(g_mag_draw) D = g_mag_draw;
+    vr_slot *S = (g_frame_slot >= 0) ? &g_slot[g_frame_slot] : NULL;
+    pthread_mutex_unlock(&g_lock);
+    static int game_hands = -1; if (game_hands < 0) { const char *e = getenv("VXMAC_FLAT_VM"); game_hands = e && !strcmp(e, "1"); }
+    static int v_hands = -1; if (v_hands < 0) { const char *e = getenv("VXMAC_V_HANDS"); v_hands = e && !strcmp(e, "1"); }
+    if (g_eff != 2 || (!D.on && !(v_hands && (D.skel[0] > .5f || D.skel[67] > .5f))) || (!game_hands && !v_hands && !D.ring && !D.mag)) return;
+    id<MTLTexture> out = (__bridge id<MTLTexture>)outp;
+    if (game_hands && warp_M) draw_game_viewmodel(cb, out, S, &D, warp_M, tan, eye);
+    static int mag_box = -1; if (mag_box < 0) { const char *e = getenv("VXMAC_MAG_BOX"); mag_box = e && !strcmp(e, "1"); }
+    if (!v_hands && (!mag_box || (!D.mag && !D.ring))) return;
+    if (!g_mag_pso || g_mag_cf != out.pixelFormat) {
+        NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "struct VI { float4 p; float4 c; };\n"
+            "struct V { float4 p [[position]]; float4 c; };\n"
+            "vertex V mv(uint i [[vertex_id]], constant VI *v [[buffer(0)]]) { V o; o.p = v[i].p; o.c = v[i].c; return o; }\n"
+            "fragment float4 mf(V i [[stage_in]]) { return float4(i.c.rgb * i.c.a, i.c.a); }\n";
+        NSError *err = nil;
+        id<MTLLibrary> lib = [cb.device newLibraryWithSource:src options:nil error:&err];
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [lib newFunctionWithName:@"mv"]; pd.fragmentFunction = [lib newFunctionWithName:@"mf"];
+        pd.colorAttachments[0].pixelFormat = out.pixelFormat;
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        g_mag_pso = lib ? [cb.device newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+        g_mag_cf = out.pixelFormat;
+        if (!g_mag_pso) { vx_log("VR: the magazine's pipeline: %s", err.localizedDescription.UTF8String); return; }
+    }
+    MV v[8192]; int n = 0, behind = 0;          // (the box 36, the ring 72)
+    // (a room point to the eye's NDC; behind the eye or nearer than 5 cm: the shape is not drawn)
+    #define MAG_NDC(P, O) do { const float *q_ = (P); float e_[3]; \
+        for (int r_ = 0; r_ < 3; r_++) e_[r_] = vfo[r_] * q_[0] + vfo[4 + r_] * q_[1] + vfo[8 + r_] * q_[2] + vfo[12 + r_]; \
+        if (e_[2] > -0.05f) behind = 1; float z_ = e_[2] < -0.05f ? -e_[2] : 0.05f; \
+        (O)[0] = (e_[0] / z_ + tan[0]) / (tan[0] + tan[1]) * 2 - 1; (O)[1] = (e_[1] / z_ + tan[3]) / (tan[2] + tan[3]) * 2 - 1; \
+        (O)[2] = 0; (O)[3] = 1; } while (0)
+    #define MAG_TRI(A, B, C_, col) do { MAG_NDC(A, v[n].p); memcpy(v[n++].c, col, 16); MAG_NDC(B, v[n].p); memcpy(v[n++].c, col, 16); \
+        MAG_NDC(C_, v[n].p); memcpy(v[n++].c, col, 16); } while (0)
+    if (v_hands) {
+        draw_v_hand(v,&n,D.skel,D.pinch[0] || (D.holding && !(getenv("VXMAC_GESTURE_LEFTY") && !strcmp(getenv("VXMAC_GESTURE_LEFTY"), "1"))),vfo,tan);
+        draw_v_hand(v,&n,D.skel+67,D.pinch[1] || (D.holding && (getenv("VXMAC_GESTURE_LEFTY") && !strcmp(getenv("VXMAC_GESTURE_LEFTY"), "1"))),vfo,tan);
+
+    }
+    int overlay_start = n;
+    if (mag_box && D.mag && n + 36 <= 8192) {            // (the box: up the magazine, across it, its thickness)
+        float u[3] = { D.mag_up[0], D.mag_up[1], D.mag_up[2] }, a[3] = { u[1] * 0 - u[2] * 1, u[2] * 0 - u[0] * 0, u[0] * 1 - u[1] * 0 };
+        float an = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]); if (an < 1e-3f) { a[0] = 1; a[1] = 0; a[2] = 0; an = 1; }
+        for (int i = 0; i < 3; i++) a[i] /= an;
+        float b[3] = { u[1] * a[2] - u[2] * a[1], u[2] * a[0] - u[0] * a[2], u[0] * a[1] - u[1] * a[0] };
+        float c[8][3];
+        float length = D.weapon_type == HW_WPN_SHOTGUN ? .025f : D.weapon_type == HW_WPN_RIFLE ? .085f : D.holding ? 0.06f : (D.lit ? 0.045f : 0.035f);
+        float width = D.weapon_type == HW_WPN_SHOTGUN ? .009f : .0175f;
+        for (int k = 0; k < 8; k++) for (int i = 0; i < 3; i++)
+            c[k][i] = D.mag_at[i] + u[i] * ((k & 1) ? length : -length) + a[i] * ((k & 2) ? width : -width) + b[i] * ((k & 4) ? 0.011f : -0.011f);
+        static const int f[6][4] = { { 0, 2, 6, 4 }, { 1, 3, 7, 5 }, { 0, 1, 5, 4 }, { 2, 3, 7, 6 }, { 0, 1, 3, 2 }, { 4, 5, 7, 6 } };
+        static const float shade[6] = { 0.55f, 0.85f, 0.65f, 0.75f, 0.45f, 0.95f };
+        for (int k = 0; k < 6; k++) {
+            float col[4] = { 0.25f * shade[k], 0.85f * shade[k], 0.9f * shade[k], 0.55f };
+            if (D.lit && !D.holding) { col[0] = 0.95f * shade[k]; col[1] = 0.8f * shade[k]; col[2] = 0.2f * shade[k]; }
+            if (D.holding && k == 1) { col[0] = 0.95f; col[1] = 0.3f; col[2] = 0.45f; col[3] = 0.7f; }   // (its top - the end that goes in)
+            MAG_TRI(c[f[k][0]], c[f[k][1]], c[f[k][2]], col); MAG_TRI(c[f[k][0]], c[f[k][2]], c[f[k][3]], col);
+        }
+    }
+    if (mag_box && D.ring) {                              // (the ring: 12 segments across the grip's line)
+        float g[3] = { D.grip_dir[0], D.grip_dir[1], D.grip_dir[2] }, a[3] = { g[1] * 0 - g[2] * 1, g[2] * 0 - g[0] * 0, g[0] * 1 - g[1] * 0 };
+        float an = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]); if (an < 1e-3f) { a[0] = 1; a[1] = 0; a[2] = 0; an = 1; }
+        for (int i = 0; i < 3; i++) a[i] /= an;
+        float b[3] = { g[1] * a[2] - g[2] * a[1], g[2] * a[0] - g[0] * a[2], g[0] * a[1] - g[1] * a[0] };
+        float r0 = D.lit ? 0.035f : 0.028f, r1 = r0 + (D.lit ? 0.01f : 0.006f);
+        float col[4] = { 1.0f, D.lit ? 0.95f : 0.8f, D.lit ? 0.4f : 0.2f, D.lit ? 0.85f : 0.5f };
+        for (int k = 0; k < 12 && n + 6 <= 8192; k++) {
+            float t0 = k * (float)M_PI / 6, t1 = (k + 1) * (float)M_PI / 6, p[4][3];
+            for (int i = 0; i < 3; i++) {
+                p[0][i] = D.well[i] + (a[i] * cosf(t0) + b[i] * sinf(t0)) * r0; p[1][i] = D.well[i] + (a[i] * cosf(t0) + b[i] * sinf(t0)) * r1;
+                p[2][i] = D.well[i] + (a[i] * cosf(t1) + b[i] * sinf(t1)) * r1; p[3][i] = D.well[i] + (a[i] * cosf(t1) + b[i] * sinf(t1)) * r0;
+            }
+            MAG_TRI(p[0], p[1], p[2], col); MAG_TRI(p[0], p[2], p[3], col);
+        }
+    }
+    #undef MAG_TRI
+    #undef MAG_NDC
+    if (behind) n = overlay_start;
+    if (!n) return;
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor new];
+    pass.colorAttachments[0].texture = out; pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = eye_encoder(cb, pass);
+    [e setRenderPipelineState:g_mag_pso];
+    id<MTLBuffer> vertices = [cb.device newBufferWithBytes:v length:n * sizeof *v options:MTLResourceStorageModeShared];
+    if (!vertices) { [e endEncoding]; return; }
+    [e setVertexBuffer:vertices offset:0 atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];
+    [e endEncoding];
+}
+
+static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], const float tan[4], float near_m, void *outp, void *odp, float *warp_M, int *warp_valid);
 int vx_xros_vr_draw_eye(void *cbp, int eye, const float view_from_origin[16], const float tan[4], float near_m, void *outp, void *odp) {
-    int ok = draw_eye_inner(cbp, eye, view_from_origin, tan, near_m, outp, odp);
+    float warp_M[16]; int warp_valid = 0;
+    int ok = draw_eye_inner(cbp, eye, view_from_origin, tan, near_m, outp, odp, warp_M, &warp_valid);
     {   // (VX Mac: the centre's density, once: with foveation the rate map's centre scale; px/deg = screen px per tangent x
         //  that scale x pi/180)
         static int told_fov;
@@ -2246,10 +2566,10 @@ int vx_xros_vr_draw_eye(void *cbp, int eye, const float view_from_origin[16], co
             if (vx_host_jlog) vx_host_jlog("vr_eye_density", f);
         }
     }
-    if (ok) { wc_update((__bridge id<MTLCommandBuffer>)cbp); draw_vignette((__bridge id<MTLCommandBuffer>)cbp, outp, tan, view_from_origin); draw_hud((__bridge id<MTLCommandBuffer>)cbp, outp, eye, tan); draw_fade((__bridge id<MTLCommandBuffer>)cbp, outp); draw_label((__bridge id<MTLCommandBuffer>)cbp, outp); }
+    if (ok) { wc_update((__bridge id<MTLCommandBuffer>)cbp); draw_vignette((__bridge id<MTLCommandBuffer>)cbp, outp, tan, view_from_origin); draw_hud((__bridge id<MTLCommandBuffer>)cbp, outp, eye, tan); draw_mag((__bridge id<MTLCommandBuffer>)cbp, outp, view_from_origin, tan, eye, warp_valid ? warp_M : NULL); draw_fade((__bridge id<MTLCommandBuffer>)cbp, outp); draw_label((__bridge id<MTLCommandBuffer>)cbp, outp); }
     return ok;
 }
-static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], const float tan[4], float near_m, void *outp, void *odp) {
+static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], const float tan[4], float near_m, void *outp, void *odp, float *warp_M, int *warp_valid) {
     id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)cbp;
     pthread_mutex_lock(&g_lock);
     int s = g_frame_slot;
@@ -2347,6 +2667,13 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
         for (int c = 0; c < 3; c++) p.rot[r * 3 + c] = sg[r] * M[c * 4 + r] * sg[c];
         p.pos[r] = sg[r] * M[12 + r] / C.scale * (use_dibr ? C.stereo : 1);
     }
+    if (warp_M) {
+        memcpy(warp_M, M, sizeof M);
+        warp_M[12] = M[12] / C.scale * (use_dibr ? C.stereo : 1);
+        warp_M[13] = M[13] / C.scale * (use_dibr ? C.stereo : 1);
+        warp_M[14] = M[14] / C.scale * (use_dibr ? C.stereo : 1);
+    }
+    if (warp_valid) *warp_valid = 1;
     memcpy(p.dst_tan, tan, sizeof p.dst_tan);
     {   // (VX Mac, h43: the eye's roll against the frame's camera (the frame has none): the head's own tilt, for the log)
         float r = asinf(fmaxf(-1.f, fminf(1.f, p.rot[3]))) * 180 / (float)M_PI;   // (the eye's x axis' up component)
@@ -2469,6 +2796,20 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
         }
         pthread_mutex_lock(&g_lock); g_iw_total++; pthread_mutex_unlock(&g_lock);
     }
+    // Carry the actual warp transform, including stereo scaling and camera motion, to the viewmodel.
+    memset(warp_M, 0, 16*sizeof(float)); warp_M[15]=1;
+    for (int r=0;r<3;r++) { for (int c=0;c<3;c++) warp_M[c*4+r]=sg[r]*p.rot[r*3+c]*sg[c]; warp_M[12+r]=sg[r]*p.pos[r]; }
+    *warp_valid = 1;
+    {   // The game's transformed geometry and the fallback warp must not both move the viewmodel.
+        float delta[3], rot[3];
+        static int (*pipe_active)(void); static dispatch_once_t once;
+        dispatch_once(&once, ^{ pipe_active = dlsym(RTLD_DEFAULT, "vxpipe_viewmodel_active"); });
+        static int warp_vm = -1;
+        if (warp_vm < 0) { const char *e = getenv("VXMAC_WARP_VM"); warp_vm = e && !strcmp(e, "1"); }
+        if (warp_vm && g_eff == 2 && vx_xros_vr_viewmodel_pose(delta, rot) && !(pipe_active && pipe_active()))
+            vxw_set_viewmodel(g_core, delta, rot);
+        else vxw_set_viewmodel(g_core, NULL, NULL);
+    }
     vxw_set_rate_map(g_core, (__bridge void *)g_rrm);
     hud_mask_update(cb);                                 // (VX Mac: the HUD's mask, once per game frame)
     vxw_set_hud_mask(g_core, NULL);
@@ -2560,6 +2901,7 @@ void vx_xros_hand_key(int hid_usage, int down);
 extern int vx_xros_display_w, vx_xros_display_h;
 static char g_hand_stats[400] = "\"hands\":\"none yet\"";
 static int g_hand_stats_reset;
+static char g_gesture_stats[240];                       // (VX Mac, h68: the hand gestures made, reload / melee / grenade / heal)
 typedef struct {
     int pinched, phase;                 // (phase: 0 none, 1 pending, 2 drag or held, 3 scroll)
     double t0; float y0, y_last; float scroll_acc;
@@ -2587,11 +2929,163 @@ static int screen_hit(const float *o, const float *d, float *u, float *v) {
     *v = 0.5f - ((lo[1] + ld[1] * t) / hy) * 0.5f;
     return 1;
 }
+// (h70: the hands' joints for the magazine by hand, from the same frame as the vx_xros_vr_hands call that follows)
+static float g_joints[2 * HW_JOINTS], g_arms[14], g_skel[134];
+void vx_xros_vr_hand_skeleton(const float skel[134]) { memcpy(g_skel, skel, sizeof g_skel); }
+static unsigned g_controller_buttons;
+static double g_controller_time;
+static unsigned g_weapon_cycles;
+void vx_xros_vr_cycle_weapon_type(void) {
+    pthread_mutex_lock(&g_lock); g_weapon_cycles++; pthread_mutex_unlock(&g_lock);
+}
+void vx_xros_vr_hand_arms(const float arms[14]) { memcpy(g_arms, arms, sizeof g_arms); }
+void vx_xros_vr_controller_state(unsigned btns, double now) {
+    pthread_mutex_lock(&g_lock); g_controller_buttons = btns; g_controller_time = now; pthread_mutex_unlock(&g_lock);
+}
+unsigned vx_xros_vr_controller_buttons(double now) {
+    pthread_mutex_lock(&g_lock); unsigned b = now - g_controller_time <= .25 ? g_controller_buttons : 0; pthread_mutex_unlock(&g_lock); return b;
+}
+void vx_xros_vr_hand_joints(const float joints[50]) { memcpy(g_joints, joints, sizeof g_joints); }
 // hands: per hand (left, right) 10 floats in the room's frame: tracked (0/1), the thumb's tip, the index finger's
 // tip, the pointing anchor (between the index finger's and the thumb's knuckles); head: origin from device.
+// (VRIK: each hand's frame in the head's frame, for V's arms: the wrist, and axes forward (wrist -> middle knuckle),
+//  across (little -> index knuckle), normal (forward x across); head: x right, y up, -z forward. Copied with the head of
+//  the same frame, read by vxpipe.m on the game's render threads)
+static float g_ik_head[16], g_ik_joints[2 * HW_JOINTS], g_ik_skel[134], g_ik_slide_pull, g_ik_weap[8];
+static double g_ik_time; static pthread_mutex_t g_ik_lock = PTHREAD_MUTEX_INITIALIZER;
+static float g_ik_sm[2][12]; static double g_ik_seen[2];
+
+int vx_xros_vr_hand_frames(float out[2][12], int ok[2]) {
+    float H[16], J[2 * HW_JOINTS]; double t, now = CACurrentMediaTime();
+    pthread_mutex_lock(&g_ik_lock); memcpy(H, g_ik_head, sizeof H); memcpy(J, g_ik_joints, sizeof J); t = g_ik_time;
+    int any = 0;
+    for (int h = 0; h < 2; h++) {
+        const float *j = J + h * HW_JOINTS; ok[h] = 0;
+        int valid = (now - t <= 0.25 && j[0] >= 0.5f);
+        float raw[12];
+        if (valid) {
+            const float *w = j + 1, *ik = j + 4, *mk = j + 7, *lk = j + 10;
+            float wp[3], f[3], a[3], n[3];
+            for (int i = 0; i < 3; i++) { float d = w[i] - H[12 + i]; wp[i] = d; f[i] = mk[i] - w[i]; a[i] = (h ? ik[i] - lk[i] : lk[i] - ik[i]); }
+            float fl = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
+            float al_raw = sqrtf(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+            if (fl >= 0.015f && al_raw >= 0.015f) {
+                for (int i = 0; i < 3; i++) f[i] /= fl;
+                float ad = a[0]*f[0] + a[1]*f[1] + a[2]*f[2]; for (int i = 0; i < 3; i++) a[i] -= ad * f[i];
+                float al = sqrtf(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+                if (al >= 1e-4f) {
+                    for (int i = 0; i < 3; i++) a[i] /= al;
+                    n[0] = f[1]*a[2] - f[2]*a[1]; n[1] = f[2]*a[0] - f[0]*a[2]; n[2] = f[0]*a[1] - f[1]*a[0];
+                    const float *vs[4] = { wp, f, a, n };
+                    for (int k = 0; k < 4; k++) for (int c = 0; c < 3; c++) raw[k * 3 + c] = vs[k][0] * H[c * 4 + 0] + vs[k][1] * H[c * 4 + 1] + vs[k][2] * H[c * 4 + 2];
+                } else valid = 0;
+            } else valid = 0;
+        }
+        if (valid) {
+            if (now - g_ik_seen[h] > 0.30) {
+                memcpy(g_ik_sm[h], raw, sizeof raw);
+            } else {
+                // Velocity-adaptive (1-Euro style) filter in head space: kills millimeter knuckle jitter while keeping fast motion lag-free
+                float dp = dist3(raw, g_ik_sm[h]);
+                float df = dist3(raw + 3, g_ik_sm[h] + 3);
+                float da = dist3(raw + 6, g_ik_sm[h] + 6);
+                float ap = fminf(0.85f, fmaxf(0.22f, dp * 18.0f));
+                float af = fminf(0.80f, fmaxf(0.15f, df * 4.5f));
+                float aa = fminf(0.70f, fmaxf(0.10f, da * 3.5f));
+                for (int i = 0; i < 3; i++) {
+                    g_ik_sm[h][i]     += (raw[i]     - g_ik_sm[h][i])     * ap;
+                    g_ik_sm[h][3 + i] += (raw[3 + i] - g_ik_sm[h][3 + i]) * af;
+                    g_ik_sm[h][6 + i] += (raw[6 + i] - g_ik_sm[h][6 + i]) * aa;
+                }
+                float *sf = g_ik_sm[h] + 3, *sa = g_ik_sm[h] + 6, *sn = g_ik_sm[h] + 9;
+                float fl = sqrtf(sf[0]*sf[0] + sf[1]*sf[1] + sf[2]*sf[2]);
+                if (fl > 1e-4f) { sf[0] /= fl; sf[1] /= fl; sf[2] /= fl; }
+                float ad = sa[0]*sf[0] + sa[1]*sf[1] + sa[2]*sf[2];
+                for (int i = 0; i < 3; i++) sa[i] -= ad * sf[i];
+                float al = sqrtf(sa[0]*sa[0] + sa[1]*sa[1] + sa[2]*sa[2]);
+                if (al > 1e-4f) { sa[0] /= al; sa[1] /= al; sa[2] /= al; }
+                sn[0] = sf[1]*sa[2] - sf[2]*sa[1]; sn[1] = sf[2]*sa[0] - sf[0]*sa[2]; sn[2] = sf[0]*sa[1] - sf[1]*sa[0];
+            }
+            g_ik_seen[h] = now;
+        }
+        if (now - g_ik_seen[h] <= 0.25) {
+            memcpy(out[h], g_ik_sm[h], sizeof(float) * 12);
+            ok[h] = 1; any = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_ik_lock);
+    return any;
+}
+
+int vx_xros_vr_hand_curls(float out[2][6], float weap_out[8]) {
+    static float sm_curls[2][6] = { { 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.0f }, { 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.0f } };
+    float S[134], J[2 * HW_JOINTS]; double t, now = CACurrentMediaTime();
+    pthread_mutex_lock(&g_ik_lock);
+    memcpy(S, g_ik_skel, sizeof S); memcpy(J, g_ik_joints, sizeof J); t = g_ik_time;
+    if (weap_out) memcpy(weap_out, g_ik_weap, sizeof g_ik_weap);
+    if (now - t <= 0.25) {
+        for (int h = 0; h < 2; h++) {
+            const float *sk = S + h * 67;
+            const float *hj = J + h * HW_JOINTS;
+            float raw[6]; memcpy(raw, sm_curls[h], sizeof raw);
+            int got = 0;
+            if (sk[0] > 0.5f) {
+                const float *W  = sk + 1 + 1 * 3;
+                const float *TT = sk + 1 + 5 * 3;
+                const float *IK = sk + 1 + 7 * 3,  *IT = sk + 1 + 9 * 3;
+                const float *MK = sk + 1 + 11 * 3, *MT = sk + 1 + 13 * 3;
+                const float *RK = sk + 1 + 15 * 3, *RT = sk + 1 + 17 * 3;
+                const float *LK = sk + 1 + 19 * 3, *LT = sk + 1 + 21 * 3;
+                float d_mw = dist3(MK, W);
+                if (d_mw > 0.02f) {
+                    const float *ks[4] = { IK, MK, RK, LK }, *ts[4] = { IT, MT, RT, LT };
+                    float avg = 0;
+                    for (int f = 0; f < 4; f++) {
+                        float dk = dist3(ks[f], W);
+                        float r = dk > 0.02f ? dist3(ts[f], W) / dk : 1.55f;
+                        raw[1 + f] = fminf(1.0f, fmaxf(0.0f, (1.76f - r) / (1.76f - 1.04f)));
+                        avg += raw[1 + f] * 0.25f;
+                    }
+                    float rt = dist3(TT, MK) / d_mw;
+                    raw[0] = fminf(1.0f, fmaxf(0.0f, (0.95f - rt) / (0.95f - 0.42f)));
+                    float kw = dist3(IK, LK);
+                    float sp = kw > 0.02f ? dist3(IT, LT) / kw : 1.2f;
+                    raw[5] = fminf(1.0f, fmaxf(0.0f, (sp - 1.08f) / (1.65f - 1.08f))) * (1.0f - 0.75f * avg);
+                    got = 1;
+                }
+            } else if (hj[0] > 0.5f) {
+                const float *pt = hj + 1;
+                const float *W = pt + HW_WRIST * 3, *IK = pt + HW_INDEX_K * 3, *MK = pt + HW_MIDDLE_K * 3, *LK = pt + HW_LITTLE_K * 3;
+                const float *IT = pt + HW_INDEX_T * 3, *MT = pt + HW_MIDDLE_T * 3, *RT = pt + HW_RING_T * 3, *LT = pt + HW_LITTLE_T * 3;
+                float km = dist3(MK, W), ki = dist3(IK, W), kl = dist3(LK, W);
+                if (km > 0.02f && ki > 0.02f && kl > 0.02f) {
+                    float rs[4] = { dist3(IT, W) / ki, dist3(MT, W) / km, dist3(RT, W) / km, dist3(LT, W) / kl };
+                    float avg = 0;
+                    for (int f = 0; f < 4; f++) {
+                        raw[1 + f] = fminf(1.0f, fmaxf(0.0f, (1.76f - rs[f]) / (1.76f - 1.04f)));
+                        avg += raw[1 + f] * 0.25f;
+                    }
+                    raw[0] = avg;
+                    float kw = dist3(IK, LK);
+                    float sp = kw > 0.02f ? dist3(IT, LT) / kw : 1.2f;
+                    raw[5] = fminf(1.0f, fmaxf(0.0f, (sp - 1.08f) / (1.65f - 1.08f))) * (1.0f - 0.75f * avg);
+                    got = 1;
+                }
+            }
+            if (got) {
+                for (int c = 0; c < 6; c++) sm_curls[h][c] += (raw[c] - sm_curls[h][c]) * 0.35f;
+            }
+        }
+    }
+    memcpy(out, sm_curls, sizeof sm_curls);
+    pthread_mutex_unlock(&g_ik_lock);
+    return 1;
+}
+
 void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
     config();
-    if (!C.hand) return;
+    pthread_mutex_lock(&g_ik_lock); memcpy(g_ik_head, head, sizeof g_ik_head); memcpy(g_ik_joints, g_joints, sizeof g_ik_joints); memcpy(g_ik_skel, g_skel, sizeof g_ik_skel); g_ik_time = CACurrentMediaTime(); pthread_mutex_unlock(&g_ik_lock);
+    if (!C.hand) { pthread_mutex_lock(&g_lock); g_vm_active = 0; memset(g_vm_delta, 0, sizeof g_vm_delta); memset(g_vm_rot, 0, sizeof g_vm_rot); pthread_mutex_unlock(&g_lock); return; }
     if (g_hand_stats_reset) { g_hand_stats_reset = 0; g_clicks = g_rclicks = g_drags = g_scroll_notches = g_escs = 0; g_tracked_frames[0] = g_tracked_frames[1] = 0; g_hand_frames = 0; }
     g_hand_frames++;
     for (int b = 0; b < 2; b++) if (g_up_at[b] > 0 && now >= g_up_at[b]) { g_up_at[b] = 0; vx_xros_hand_button(b, 0); }
@@ -2694,6 +3188,416 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             both_since = 0; both_armed = 0;
         }
     }
+    // (VX Mac, h68: the game's actions from the hands' motion in vr mode's 3D view - hand_gestures.h; VXMAC_GESTURES=0 turns them off)
+    {
+        static int on = -1, labels; static hand_gestures hg; static double up_at[HG_N]; static int act[HG_N];
+        if (on < 0) {
+            const char *e = getenv("VXMAC_GESTURES"); on = !(e && !strcmp(e, "0"));
+            e = getenv("VXMAC_GESTURE_LABELS"); labels = e && !strcmp(e, "1");
+            e = getenv("VXMAC_GESTURE_LEFTY"); hg.lefty = e && !strcmp(e, "1");
+            // (the game's default bindings: Reload R, QuickMelee Q, CombatGadget the middle button, UseConsumable X;
+            //  VXMAC_GESTURE_KEYS="reload=15,melee=14,grenade=m2,heal=1b" - a HID keyboard usage in hex, or m0-m2 a mouse button)
+            act[0] = 0x15; act[1] = 0x14; act[2] = -3; act[3] = 0x1B; act[4] = 0x09; act[5] = 0x2B;
+            static const char *names[HG_N] = { "reload", "melee", "grenade", "heal", "interact", "scan" };
+            if ((e = getenv("VXMAC_GESTURE_KEYS")))
+                for (int i = 0; i < HG_N; i++) {
+                    char k[16]; snprintf(k, sizeof k, "%s=", names[i]);
+                    const char *v = strstr(e, k); if (!v) continue;
+                    v += strlen(k);
+                    act[i] = v[0] == 'm' ? -1 - (int)strtol(v + 1, NULL, 10) : (int)strtol(v, NULL, 16);
+                }
+            if (on && (e = getenv("VXMAC_GESTURE_TUNE"))) hand_gestures_tune(e);
+            if (on) { char pr[512]; hand_gestures_params(pr, sizeof pr); vx_log("VR: hand gesture thresholds %s", pr); }
+            if (on) vx_log("VR: hand gestures on (gun hand %s): reload %s%x, melee %s%x, grenade %s%x, heal %s%x", hg.lefty ? "left" : "right",
+                           act[0] < 0 ? "mouse " : "key 0x", act[0] < 0 ? -1 - act[0] : act[0], act[1] < 0 ? "mouse " : "key 0x", act[1] < 0 ? -1 - act[1] : act[1],
+                           act[2] < 0 ? "mouse " : "key 0x", act[2] < 0 ? -1 - act[2] : act[2], act[3] < 0 ? "mouse " : "key 0x", act[3] < 0 ? -1 - act[3] : act[3]);
+        }
+        for (int i = 0; i < HG_N; i++) if (up_at[i] > 0 && now >= up_at[i]) {
+            up_at[i] = 0;
+            if (act[i] < 0) vx_xros_hand_button(-1 - act[i], 0); else vx_xros_hand_key(act[i], 0);
+        }
+        // (the first VXMAC_HAND_RECORD=5 minutes of hands with the gestures on, each frame a CSV line - time, vr, the
+        //  head's 16, the hands' 20, the gestures made - in Documents/hand_record.csv, for tests/hand_gestures_replay.c)
+        static FILE *rec; static double rec_until = -1;
+        if (on && rec_until < 0) {
+            const char *e = getenv("VXMAC_HAND_RECORD"); double mins = e && *e ? atof(e) : 5;
+            rec_until = 0;
+            if (mins > 0 && getenv("HOME")) {
+                char path[1024]; snprintf(path, sizeof path, "%s/Documents/hand_record.csv", getenv("HOME"));
+                if ((rec = fopen(path, "w"))) { rec_until = now + mins * 60; vx_log("VR: hand record to %s for %.0f min", path, mins); }
+            }
+        }
+        // (h70: the magazine by hand - hand_weapon.h; VXMAC_MAG=1. It takes the place of the reload gesture above.)
+        static int mag = -1, mag_labels; static hand_weapon hw; static int mact[HW_EV_N]; static double mup_at[HW_EV_N];
+        static FILE *prec; static double prec_until = -1;
+        if (mag < 0) {
+            const char *e = getenv("VXMAC_MAG"); mag = !(e && !strcmp(e, "0"));
+            e = getenv("VXMAC_HAND_MODE");
+            hw.mode = e && !strcmp(e, "bare") ? HW_MODE_BARE : e && !strcmp(e, "hybrid") ? HW_MODE_HYBRID : HW_MODE_AUTO;
+            e = getenv("VXMAC_AUTO_MAG"); hand_weapon_set_auto_mag(&hw, !(e && !strcmp(e, "0")));
+            e = getenv("VXMAC_MAG_RACK"); hw.rack = !(e && !strcmp(e, "0"));
+            e = getenv("VXMAC_GESTURE_LEFTY"); hw.lefty = e && !strcmp(e, "1");
+            e = getenv("VXMAC_GESTURE_LABELS"); mag_labels = !(e && !strcmp(e, "0"));
+            // (the keys: the game's reload (R) when the magazine is in (and racked); VXMAC_MAG_KEYS="out=..,grab=..,
+            //  in=..,rack=..,done=15,cancel=.." gives a step its own key - for the VX Hands mod - a HID usage in hex or m0-m2)
+            for (int i = 0; i < HW_EV_N; i++) mact[i] = 0;
+            mact[4] = 0x15;
+            static const char *names[HW_EV_N] = { "out", "grab", "in", "rack", "done", "cancel" };
+            if ((e = getenv("VXMAC_MAG_KEYS")))
+                for (int i = 0; i < HW_EV_N; i++) {
+                    char k[16]; snprintf(k, sizeof k, "%s=", names[i]);
+                    const char *v = strstr(e, k); if (!v) continue;
+                    v += strlen(k);
+                    mact[i] = v[0] == 'm' ? -1 - (int)strtol(v + 1, NULL, 10) : (int)strtol(v, NULL, 16);
+                }
+            if (mag && (e = getenv("VXMAC_MAG_TUNE"))) hand_weapon_tune(e);
+            if (mag) { char pr[512]; hand_weapon_params(pr, sizeof pr); vx_log("VR: magazine by hand on (gun hand %s, rack %d, done key 0x%x): %s", hw.lefty ? "left" : "right", hw.rack, mact[4], pr); }
+        }
+        for (int i = 0; i < HW_EV_N; i++) if (mup_at[i] > 0 && now >= mup_at[i]) {
+            mup_at[i] = 0;
+            if (mact[i] < 0) vx_xros_hand_button(-1 - mact[i], 0); else vx_xros_hand_key(mact[i], 0);
+        }
+        if (mag && prec_until < 0) {            // (the joints' record: Documents/hand_pose_record.csv, tests/hand_weapon_replay.c)
+            const char *e = getenv("VXMAC_HAND_RECORD"); double mins = e && *e ? atof(e) : 5;
+            prec_until = 0;
+            if (mins > 0 && getenv("HOME")) {
+                char path[1024]; snprintf(path, sizeof path, "%s/Documents/hand_pose_record.csv", getenv("HOME"));
+                if ((prec = fopen(path, "w"))) { prec_until = now + mins * 60; vx_log("VR: hand pose record to %s for %.0f min", path, mins); }
+            }
+        }
+        unsigned controller, cycles; double controller_time;
+        pthread_mutex_lock(&g_lock); controller = g_controller_buttons; controller_time = g_controller_time; cycles = g_weapon_cycles; g_weapon_cycles = 0; pthread_mutex_unlock(&g_lock);
+        if (now - controller_time > .25) controller = 0;
+        hw.weapon_type = (hw.weapon_type + cycles % HW_WPN_N) % HW_WPN_N;
+        hand_weapon_set_controller(&hw, controller, controller_time);
+        hand_weapon_set_arms(&hw, g_arms);
+        int mb = 0;
+        if (mag && vr) {
+            mb = hand_weapon_update(&hw, head, g_joints, now);
+            for (int i = 0; i < HW_EV_N; i++) if (mb & (1 << i)) {
+                vx_log("VR: magazine %s (%s)", hand_weapon_event_name(1 << i), hand_weapon_state_name(hw.state));
+                if (mact[i] && !mup_at[i]) {
+                    if (mact[i] < 0) vx_xros_hand_button(-1 - mact[i], 1); else vx_xros_hand_key(mact[i], 1);
+                    mup_at[i] = now + 0.08;
+                }
+            }
+            int shown = mb & ~HW_EV_DONE; if (hw.rack && (mb & HW_EV_RACK)) shown = HW_EV_RACK;
+            if (mag_labels && shown) {          // (a short label for the step: out, a new one, in, racked, cancelled)
+                static const char *ms[8][HW_EV_N] = {
+                    { "Magazine out", "New magazine", "Magazine in", "Chambered", "", "Reload cancelled" },
+                    { "マガジンを抜いた", "新しいマガジン", "マガジンを差した", "装填", "", "リロード中止" },
+                    { "弹匣已取出", "新弹匣", "弹匣已插入", "已上膛", "", "取消装弹" },
+                    { "彈匣已取出", "新彈匣", "彈匣已插入", "已上膛", "", "取消裝彈" },
+                    { "탄창 분리", "새 탄창", "탄창 장착", "장전 완료", "", "재장전 취소" },
+                    { "Chargeur retiré", "Nouveau chargeur", "Chargeur inséré", "Chambré", "", "Rechargement annulé" },
+                    { "Magazin raus", "Neues Magazin", "Magazin drin", "Durchgeladen", "", "Nachladen abgebrochen" },
+                    { "Cargador fuera", "Cargador nuevo", "Cargador dentro", "Recámara cargada", "", "Recarga cancelada" } };
+                int i = 0; while (i < HW_EV_N - 1 && !(shown & (1 << i))) i++;
+                if (shown & HW_EV_RACK) i = 3;
+                if (ms[ui_lang()][i][0]) {
+                    show_label(ms[ui_lang()][i]);
+                    pthread_mutex_lock(&g_lock); g_label_until = now + 0.7; g_label_big = 0; pthread_mutex_unlock(&g_lock);
+                }
+            }
+        }
+        // (h70b: the gun drawn, put away, aimed and fired by hand - VXMAC_ARMS=1; the trigger only with VXMAC_TRIGGER=1.
+        //  The keys: weapon 1 (1), weapon 2 (2), holster (B), aim held (the right button), trigger held (the left);
+        //  VXMAC_ARMS_KEYS="hip=1e,back=1f,holster=05,aim=m1,trigger=m0")
+        static int arms = -1, trig_on, akey[5], aim_down, trig_down; static double aup_at[3];
+        if (arms < 0) {
+            const char *e = getenv("VXMAC_ARMS"); arms = !(e && !strcmp(e, "0"));
+            e = getenv("VXMAC_TRIGGER"); trig_on = e && !strcmp(e, "1");
+            akey[0] = 0x1E; akey[1] = 0x1F; akey[2] = 0x05; akey[3] = -2; akey[4] = -1;
+            static const char *names[5] = { "hip", "back", "holster", "aim", "trigger" };
+            if ((e = getenv("VXMAC_ARMS_KEYS")))
+                for (int i = 0; i < 5; i++) {
+                    char k[16]; snprintf(k, sizeof k, "%s=", names[i]);
+                    const char *v = strstr(e, k); if (!v) continue;
+                    v += strlen(k);
+                    akey[i] = v[0] == 'm' ? -1 - (int)strtol(v + 1, NULL, 10) : (int)strtol(v, NULL, 16);
+                }
+            if (arms) vx_log("VR: the gun by hand on (draw, holster, aim%s)", trig_on ? ", trigger" : "");
+        }
+        #define AKEY(k, d) do { if ((k) < 0) vx_xros_hand_button(-1 - (k), d); else if (k) vx_xros_hand_key(k, d); } while (0)
+        for (int i = 0; i < 3; i++) if (aup_at[i] > 0 && now >= aup_at[i]) { aup_at[i] = 0; AKEY(akey[i], 0); }
+        int grab = 0;
+        if ((arms || mag) && vr) {
+            if (!mag) hand_weapon_update(&hw, head, g_joints, now);   // (the arms use the magazine's state and the grip's line)
+            int ab = hand_weapon_arms(&hw, head, g_joints, now, trig_on);
+            grab = ab & HW_ARM_INTERACT;
+            for (int i = 0; i < 3; i++) if (arms && (ab & (1 << i)) && !aup_at[i]) {
+                AKEY(akey[i], 1); aup_at[i] = now + 0.08;
+                static const char *an[3] = { "draw (hip)", "draw (back)", "holster" };
+                vx_log("VR: gun %s", an[i]);
+            }
+        }
+        static int auto_draw_done;
+        if (!vr) auto_draw_done = 0;
+        hand_pose *draw_gun = &hw.pose[hw.lefty ? 0 : 1];
+        if (arms && vr && !auto_draw_done && !hw.weapon_drawn && draw_gun->ok &&
+            draw_gun->palm[1] - head[13] > -.38f && !aup_at[0] && !aup_at[1] && !aup_at[2] && akey[0]) {
+            AKEY(akey[0], 1); aup_at[0] = now + .08; hw.weapon_drawn = 1; auto_draw_done = 1;
+            vx_log("VR: gun draw (raised hand)");
+        }
+        static int hand_ads = -1;
+        if (hand_ads < 0) { const char *e = getenv("VXMAC_HAND_ADS"); hand_ads = e && !strcmp(e, "1"); }
+        int want_aim = arms && hand_ads && vr && hw.ads && !hand_weapon_is_hybrid(&hw, now);
+        int want_trig = arms && trig_on && vr && hw.trigger && !hand_weapon_is_hybrid(&hw, now);
+        if (want_aim != aim_down) { aim_down = want_aim; AKEY(akey[3], aim_down); }
+        if (want_trig != trig_down) { trig_down = want_trig; AKEY(akey[4], trig_down); }
+        #undef AKEY
+        pthread_mutex_lock(&g_lock);
+        int off_hand = hw.lefty ? 1 : 0;
+        hand_pose *visual_off = &hw.pose[off_hand];
+        static float last_skel[134], last_palm[2][3]; static double last_skel_at[2];
+        for (int h = 0; h < 2; h++) {
+            float *dst = g_mag_draw.skel + h * 67, *src = g_skel + h * 67;
+            if (src[0] > .5f) {
+                memcpy(dst, src, 67 * sizeof(float)); memcpy(last_skel + h * 67, src, 67 * sizeof(float));
+                if (hw.pose[h].ok) memcpy(last_palm[h], hw.pose[h].palm, sizeof last_palm[h]);
+                else memcpy(last_palm[h], src + 4, sizeof last_palm[h]);
+                last_skel_at[h] = now;
+            } else if (last_skel_at[h] > 0 && now - last_skel_at[h] <= .35 && hw.pose[h].ok) {
+                memcpy(dst, last_skel + h * 67, 67 * sizeof(float));
+                for (int j = 0; j < 22; j++) for (int i = 0; i < 3; i++)
+                    dst[1 + j * 3 + i] += hw.pose[h].palm[i] - last_palm[h][i];
+            } else memset(dst, 0, 67 * sizeof(float));
+            g_mag_draw.pinch[h] = g_hg[h].pinched;
+        }
+        hand_pose *gun = &hw.pose[hw.lefty ? 0 : 1];
+        float rel_g[3] = { gun->palm[0]-head[12], gun->palm[1]-head[13], gun->palm[2]-head[14] };
+        float lp[3] = { vdot(rel_g,head), vdot(rel_g,head+4), vdot(rel_g,head+8) };
+        float rel_o[3] = { visual_off->palm[0]-head[12], visual_off->palm[1]-head[13], visual_off->palm[2]-head[14] };
+        float lo[3] = { vdot(rel_o,head), vdot(rel_o,head+4), vdot(rel_o,head+8) };
+        const float rest_lp[3] = { hw.lefty ? -0.18f : 0.18f, -0.26f, -0.34f };
+        const float rest_lo[3] = { hw.lefty ? 0.18f : -0.18f, -0.26f, -0.34f };
+        int rest_ok = gun->ok && vr, rest_off_ok = visual_off->ok && vr;
+        const float neutral_lf[3] = { 0, 0, -1 }, neutral_lu[3] = { 0, 1, 0 };
+        for(int i=0;i<3;i++) {
+            g_mag_draw.neutral_palm[i]=head[12+i]; g_mag_draw.off_neutral[i]=head[12+i];
+            g_mag_draw.neutral_fwd[i]=g_mag_draw.neutral_up[i]=0;
+            for(int j=0;j<3;j++) { g_mag_draw.neutral_palm[i]+=head[4*j+i]*(rest_ok ? rest_lp[j] : lp[j]); g_mag_draw.neutral_fwd[i]+=head[4*j+i]*neutral_lf[j]; g_mag_draw.neutral_up[i]+=head[4*j+i]*neutral_lu[j]; g_mag_draw.off_neutral[i]+=head[4*j+i]*(rest_off_ok ? rest_lo[j] : lo[j]); }
+        }
+        g_mag_draw.off_ok = visual_off->ok && vr;
+        g_mag_draw.gun_ok = gun->ok && (hw.weapon_drawn || vr);
+        memcpy(g_mag_draw.off_palm, visual_off->palm, sizeof visual_off->palm);
+        memcpy(g_mag_draw.palm, gun->palm, sizeof gun->palm); memcpy(g_mag_draw.fwd, gun->fwd, sizeof gun->fwd);
+        g_mag_draw.two_hand = hw.ads && hw.off_fist;
+        g_mag_draw.weapon_type = hw.weapon_type; g_mag_draw.state = hw.state; g_mag_draw.slide_hold = hw.slide_hold;
+        static double s_slide_t, s_suppress_until;
+        double dt_s = s_slide_t > 0 ? fmin(0.1, fmax(0.0, now - s_slide_t)) : 0.016;
+        s_slide_t = now;
+        if (mb & HW_EV_DONE) s_suppress_until = now + 2.1;
+        if (hw.slide_hold && visual_off->ok) {
+            float raw_p = 0;
+            for (int i = 0; i < 3; i++) raw_p += (hw.grab_at[i] - visual_off->palm[i]) * gun->fwd[i];
+            g_mag_draw.pull = fminf(.068f, fmaxf(0.0f, raw_p));
+        } else {
+            g_mag_draw.pull = fmaxf(0.0f, g_mag_draw.pull - (float)dt_s * 0.80f);
+        }
+        float mag_mode = 0.0f, well_d = 9.0f, drop_prog = 0.0f;
+        if (visual_off->ok && hw.well_ok) well_d = dist3(visual_off->palm, hw.well);
+        if (hw.state == HW_HOLD_OLD || hw.state == HW_HOLD_NEW) {
+            mag_mode = 1.0f;
+        } else if (hw.state == HW_LOADED && hw.pull_ready && visual_off->ok && hw.well_ok) {
+            float rel_w[3] = { visual_off->palm[0] - hw.well[0], visual_off->palm[1] - hw.well[1], visual_off->palm[2] - hw.well[2] };
+            if (dist3(rel_w, hw.pull_at) >= 0.02f) mag_mode = 1.0f;
+        } else if (hw.state == HW_EMPTY) {
+            mag_mode = 2.0f;
+            drop_prog = fminf(1.0f, fmaxf(0.0f, (float)(now - hw.state_at) * 3.0f));
+        }
+        float supp = (now < s_suppress_until || mag_mode > 0.5f || g_mag_draw.pull > 0.002f) ? 1.0f : 0.0f;
+        pthread_mutex_lock(&g_ik_lock);
+        g_ik_slide_pull = g_mag_draw.pull;
+        g_ik_weap[0] = g_mag_draw.pull;
+        g_ik_weap[1] = mag_mode;
+        g_ik_weap[2] = well_d;
+        g_ik_weap[3] = drop_prog;
+        g_ik_weap[4] = supp;
+        pthread_mutex_unlock(&g_ik_lock);
+        const char *game_hands = getenv("VXMAC_GAME_HANDS");
+        static float sm_lp[3], sm_ypr[3], sm_lo[3], sm_oypr[3];
+        static float ref_lp[3], ref_ypr[3], ref_lo[3], ref_oypr[3];
+        static int sm_ok, sm_off_ok;
+        if (!vr || !g_mag_draw.gun_ok) sm_ok = 0;
+        if (!vr || !g_mag_draw.off_ok) sm_off_ok = 0;
+        if (vr && g_mag_draw.gun_ok && !(game_hands && !strcmp(game_hands, "0"))) {
+            float fx = vdot(gun->fwd, head), fy = vdot(gun->fwd, head + 4), fz = -vdot(gun->fwd, head + 8);
+            float ax = vdot(gun->across, head) * (hw.lefty ? -1.f : 1.f), ay = vdot(gun->across, head + 4);
+            float raw_yaw = atan2f(fx, fmaxf(.22f, fz));
+            float raw_pitch = atan2f(fy, fmaxf(.22f, hypotf(fx, fz)));
+            float raw_roll = gun->from_arm ? 0.f : atan2f(ay, ax);
+            if (!sm_ok) {
+                memcpy(sm_lp, lp, sizeof sm_lp);
+                ref_lp[0] = fmaxf(-.22f, fminf(.22f, lp[0]));
+                ref_lp[1] = fmaxf(-.34f, fminf(-.14f, lp[1]));
+                ref_lp[2] = fmaxf(-.42f, fminf(-.24f, lp[2]));
+                sm_ypr[0] = raw_yaw; sm_ypr[1] = raw_pitch; sm_ypr[2] = raw_roll;
+                ref_ypr[0] = fmaxf(-.25f, fminf(.25f, raw_yaw));
+                ref_ypr[1] = fmaxf(-.40f, fminf(-.05f, raw_pitch));
+                ref_ypr[2] = raw_roll;
+                sm_ok = 1;
+            } else {
+                for (int i = 0; i < 3; i++) {
+                    sm_lp[i] += (lp[i] - sm_lp[i]) * 0.35f;
+                    ref_lp[i] += (sm_lp[i] - ref_lp[i]) * 0.008f;
+                }
+                sm_ypr[0] += (raw_yaw - sm_ypr[0]) * 0.35f;
+                sm_ypr[1] += (raw_pitch - sm_ypr[1]) * 0.35f;
+                float rdiff = atan2f(sinf(raw_roll - sm_ypr[2]), cosf(raw_roll - sm_ypr[2]));
+                sm_ypr[2] = atan2f(sinf(sm_ypr[2] + rdiff * 0.25f), cosf(sm_ypr[2] + rdiff * 0.25f));
+                ref_ypr[0] += (fmaxf(-.30f, fminf(.30f, sm_ypr[0])) - ref_ypr[0]) * 0.012f;
+                ref_ypr[1] += (fmaxf(-.45f, fminf(.05f, sm_ypr[1])) - ref_ypr[1]) * 0.012f;
+                float ref_rdiff = atan2f(sinf(sm_ypr[2] - ref_ypr[2]), cosf(sm_ypr[2] - ref_ypr[2]));
+                ref_ypr[2] = atan2f(sinf(ref_ypr[2] + fmaxf(-.02f, fminf(.02f, ref_rdiff * 0.025f))), cosf(ref_ypr[2] + fmaxf(-.02f, fminf(.02f, ref_rdiff * 0.025f))));
+            }
+            float dx = sm_lp[0] - ref_lp[0], dy = sm_lp[1] - ref_lp[1] - g_mag_draw.pull * .4f, dz = -(sm_lp[2] - ref_lp[2]);
+            float droll = atan2f(sinf(sm_ypr[2] - ref_ypr[2]), cosf(sm_ypr[2] - ref_ypr[2]));
+            if (fabsf(droll) < 0.12f) droll = 0.f;
+            else droll = (droll > 0 ? droll - 0.12f : droll + 0.12f) * 0.75f;
+            g_vm_delta[0] = fmaxf(-.24f, fminf(.24f, dx));
+            g_vm_delta[1] = fmaxf(-.20f, fminf(.20f, dy));
+            g_vm_delta[2] = fmaxf(-.16f, fminf(.18f, dz));
+            g_vm_rot[0] = fmaxf(-.65f, fminf(.65f, sm_ypr[0] - ref_ypr[0]));
+            g_vm_rot[1] = fmaxf(-.50f, fminf(.50f, sm_ypr[1] - ref_ypr[1]));
+            g_vm_rot[2] = fmaxf(-.45f, fminf(.45f, droll));
+            g_vm_active = hw.lefty ? -1 : 1;
+            if (g_mag_draw.off_ok) {
+                float ofx = vdot(visual_off->fwd, head), ofy = vdot(visual_off->fwd, head + 4), ofz = -vdot(visual_off->fwd, head + 8);
+                float oax = vdot(visual_off->across, head) * (hw.lefty ? 1.f : -1.f), oay = vdot(visual_off->across, head + 4);
+                float oraw_yaw = atan2f(ofx, fmaxf(.22f, ofz));
+                float oraw_pitch = atan2f(ofy, fmaxf(.22f, hypotf(ofx, ofz)));
+                float oraw_roll = visual_off->from_arm ? 0.f : atan2f(oay, oax);
+                if (!sm_off_ok) {
+                    memcpy(sm_lo, lo, sizeof sm_lo);
+                    ref_lo[0] = fmaxf(-.22f, fminf(.22f, lo[0]));
+                    ref_lo[1] = fmaxf(-.34f, fminf(-.14f, lo[1]));
+                    ref_lo[2] = fmaxf(-.42f, fminf(-.24f, lo[2]));
+                    sm_oypr[0] = oraw_yaw; sm_oypr[1] = oraw_pitch; sm_oypr[2] = oraw_roll;
+                    ref_oypr[0] = fmaxf(-.25f, fminf(.25f, oraw_yaw));
+                    ref_oypr[1] = fmaxf(-.40f, fminf(-.05f, oraw_pitch));
+                    ref_oypr[2] = oraw_roll;
+                    sm_off_ok = 1;
+                } else {
+                    for (int i = 0; i < 3; i++) {
+                        sm_lo[i] += (lo[i] - sm_lo[i]) * 0.35f;
+                        ref_lo[i] += (sm_lo[i] - ref_lo[i]) * 0.008f;
+                    }
+                    sm_oypr[0] += (oraw_yaw - sm_oypr[0]) * 0.35f;
+                    sm_oypr[1] += (oraw_pitch - sm_oypr[1]) * 0.35f;
+                    float ordiff = atan2f(sinf(oraw_roll - sm_oypr[2]), cosf(oraw_roll - sm_oypr[2]));
+                    sm_oypr[2] = atan2f(sinf(sm_oypr[2] + ordiff * 0.25f), cosf(sm_oypr[2] + ordiff * 0.25f));
+                    ref_oypr[0] += (fmaxf(-.30f, fminf(.30f, sm_oypr[0])) - ref_oypr[0]) * 0.012f;
+                    ref_oypr[1] += (fmaxf(-.45f, fminf(.05f, sm_oypr[1])) - ref_oypr[1]) * 0.012f;
+                    float oref_rdiff = atan2f(sinf(sm_oypr[2] - ref_oypr[2]), cosf(sm_oypr[2] - ref_oypr[2]));
+                    ref_oypr[2] = atan2f(sinf(ref_oypr[2] + fmaxf(-.02f, fminf(.02f, oref_rdiff * 0.025f))), cosf(ref_oypr[2] + fmaxf(-.02f, fminf(.02f, oref_rdiff * 0.025f))));
+                }
+                float odx = sm_lo[0] - ref_lo[0], ody = sm_lo[1] - ref_lo[1], odz = -(sm_lo[2] - ref_lo[2]);
+                float odroll = atan2f(sinf(sm_oypr[2] - ref_oypr[2]), cosf(sm_oypr[2] - ref_oypr[2]));
+                if (fabsf(odroll) < 0.12f) odroll = 0.f;
+                else odroll = (odroll > 0 ? odroll - 0.12f : odroll + 0.12f) * 0.75f;
+                g_vm_off_delta[0] = fmaxf(-.24f, fminf(.24f, odx));
+                g_vm_off_delta[1] = fmaxf(-.20f, fminf(.20f, ody));
+                g_vm_off_delta[2] = fmaxf(-.16f, fminf(.18f, odz));
+                g_vm_off_rot[0] = fmaxf(-.65f, fminf(.65f, sm_oypr[0] - ref_oypr[0]));
+                g_vm_off_rot[1] = fmaxf(-.50f, fminf(.50f, sm_oypr[1] - ref_oypr[1]));
+                g_vm_off_rot[2] = fmaxf(-.45f, fminf(.45f, odroll));
+                g_vm_off_active = 1;
+            } else {
+                g_vm_off_active = 0; memset(g_vm_off_delta, 0, sizeof g_vm_off_delta); memset(g_vm_off_rot, 0, sizeof g_vm_off_rot);
+            }
+        } else {
+            g_vm_active = g_vm_off_active = 0;
+            memset(g_vm_delta, 0, sizeof g_vm_delta); memset(g_vm_rot, 0, sizeof g_vm_rot);
+            memset(g_vm_off_delta, 0, sizeof g_vm_off_delta); memset(g_vm_off_rot, 0, sizeof g_vm_off_rot);
+        }
+        g_mag_draw.on = vr && ((mag || arms) || g_mag_draw.skel[0] || g_mag_draw.skel[67]);
+        int reloading = hw.mag_shown || hw.state != HW_LOADED;
+        g_mag_draw.ring = reloading && hw.well_ok;
+        g_mag_draw.lit = hw.near_well; g_mag_draw.mag = reloading && visual_off->ok && hw.mag_shown; g_mag_draw.holding = hw.mag_shown;
+        memcpy(g_mag_draw.well, hw.well, sizeof hw.well); memcpy(g_mag_draw.grip_dir, hw.grip_dir, sizeof hw.grip_dir);
+        if (visual_off->ok) for (int i = 0; i < 3; i++) {
+            g_mag_draw.mag_at[i] = visual_off->palm[i]; g_mag_draw.mag_up[i] = -visual_off->across[i];
+            if (hw.state == HW_HOLD_NEW && hw.well_ok) {
+                float distance = dist3(visual_off->palm, hw.well);
+                float t = fmaxf(0, fminf(1, (0.12f - distance) / 0.12f));
+                g_mag_draw.mag_at[i] += t * (hw.well[i] - visual_off->palm[i]);
+            }
+        }
+        g_hand_draw_zone = vr && (hw.draw_zone || hw.draw_from || hw.in_hip);
+        {
+            static int enabled = -1; static float applied_y, applied_p;
+            if (enabled < 0) { const char *e = getenv("VXMAC_HAND_AIM"); enabled = e && !strcmp(e, "1"); }
+            float target_y=0, target_p=0;
+            if (enabled && vr && gun->ok && gun->from_arm != 2 && rest_ok) {
+                target_y=fmaxf(-14.f,fminf(14.f,-(lp[0]-rest_lp[0])*55.f));
+                target_p=fmaxf(-10.f,fminf(10.f,(lp[1]-rest_lp[1])*50.f));
+            } else { target_y=applied_y*.8f; target_p=applied_p*.8f; }
+            g_hand_aim_y += target_y-applied_y; g_hand_aim_p += target_p-applied_p;
+            applied_y=target_y; applied_p=target_p;
+        }
+        pthread_mutex_unlock(&g_lock);
+        if (prec) {
+            if (now < prec_until) {
+                fprintf(prec, "%.4f,%d", now, vr);
+                for (int i = 0; i < 16; i++) fprintf(prec, ",%.4f", head[i]);
+                for (int i = 0; i < 2 * HW_JOINTS; i++) fprintf(prec, ",%.4f", g_joints[i]);
+                fprintf(prec, ",%d\n", mb);
+                static double pflushed; if (now - pflushed > 2) { pflushed = now; fflush(prec); }
+            } else { fclose(prec); prec = NULL; vx_log("VR: hand pose record done"); }
+        }
+        int b = 0;
+        if (on && vr && !mag && !arms) hand_weapon_update(&hw, head, g_joints, now);
+        float gesture_hands[20]; memcpy(gesture_hands, hands, sizeof gesture_hands);
+        for (int h = 0; h < 2; h++) if (hw.pose[h].ok && hw.pose[h].from_arm) {
+            hand_gestures_arm_pose(gesture_hands, h, hw.pose[h].palm, hw.pose[h].across);
+        }
+        if ((on || grab) && vr) {
+            hg.suppress_interact = (mag && hw.state != HW_LOADED) || (arms && (hw.ads || hw.draw_from));
+            hand_gestures_set_controller(&hg, hand_weapon_is_hybrid(&hw, now), hw.lefty ?
+                !!(controller & (HW_BTN_R_GRAB | HW_BTN_R_TRIG | HW_BTN_ACT_Y)) :
+                !!(controller & (HW_BTN_L_GRAB | HW_BTN_L_TRIG | HW_BTN_ACT_X)));
+            b = on ? hand_gestures_update(&hg, head, gesture_hands, now) : 0;
+            if (grab && (!hg.last[4] || now - hg.last[4] >= .45)) { b |= HG_INTERACT; hg.last[4] = now; hg.count[4]++; }
+            if (mag) b &= ~HG_RELOAD;           // (h70: the magazine by hand reloads instead)
+            for (int i = 0; i < HG_N; i++) if ((b & (1 << i)) && !up_at[i]) {
+                if (i != 5) { if (act[i] < 0) vx_xros_hand_button(-1 - act[i], 1); else vx_xros_hand_key(act[i], 1); }
+                if (i != 5) up_at[i] = now + 0.08;  // scanner stays down until the hand leaves the temple
+                vx_log("VR: hand gesture %s", hand_gesture_name(1 << i));
+                if (labels) {                       // (a short label: the gesture was seen, whatever the game makes of the key)
+                    static const char *gs[8][HG_N] = {
+                        { "Reload", "Melee", "Grenade", "Heal", "Grab / interact", "Scan" }, { "リロード", "近接攻撃", "グレネード", "回復", "拾う / 操作", "スキャン" },
+                        { "装弹", "近战", "手雷", "治疗", "拾取 / 互动", "扫描" }, { "裝彈", "近戰", "手榴彈", "治療", "拾取 / 互動", "掃描" }, { "재장전", "근접 공격", "수류탄", "회복", "잡기 / 상호작용", "스캔" },
+                        { "Recharger", "Mêlée", "Grenade", "Soin", "Saisir / interagir", "Scanner" }, { "Nachladen", "Nahkampf", "Granate", "Heilen", "Greifen / interagieren", "Scannen" },
+                        { "Recargar", "Cuerpo a cuerpo", "Granada", "Curar", "Agarrar / interactuar", "Escanear" } };
+                    show_label(gs[ui_lang()][i]);
+                    pthread_mutex_lock(&g_lock); g_label_until = now + 0.7; g_label_big = 0; pthread_mutex_unlock(&g_lock);
+                }
+            }
+        }
+        static int climb_up, climb_down;
+        int climb = on && vr && hg.climbing ? (hg.climb_dir > 0 ? 1 : -1) : 0;
+        if ((climb > 0) != climb_up) { climb_up = climb > 0; vx_xros_hand_key(0x1a, climb_up); }
+        if ((climb < 0) != climb_down) { climb_down = climb < 0; vx_xros_hand_key(0x16, climb_down); }
+        static int scan_down;
+        int want_scan = on && vr && (hg.scan_latched || hg.scan_button_latched);
+        if (want_scan != scan_down) {
+            scan_down = want_scan;
+            if (act[5] < 0) vx_xros_hand_button(-1 - act[5], want_scan); else if (act[5]) vx_xros_hand_key(act[5], want_scan);
+        }
+        if (rec) {
+            if (now < rec_until) {
+                fprintf(rec, "%.4f,%d", now, vr);
+                for (int i = 0; i < 16; i++) fprintf(rec, ",%.4f", head[i]);
+                for (int i = 0; i < 20; i++) fprintf(rec, ",%.4f", hands[i]);
+                fprintf(rec, ",%d\n", b);
+                static double flushed; if (now - flushed > 2) { flushed = now; fflush(rec); }   // (an app ended early keeps all but 2 s)
+            } else { fclose(rec); rec = NULL; vx_log("VR: hand record done"); }
+        }
+        if (on || mag || arms) snprintf(g_gesture_stats, sizeof g_gesture_stats, ",\"gestures\":[%u,%u,%u,%u,%u,%u],\"magazine\":[%u,%u,%u,%u,%u,%u],\"gun\":[%u,%u,%u,%u,%u]",
+                                hg.count[0], hg.count[1], hg.count[2], hg.count[3], hg.count[4], hg.count[5], hw.count[0], hw.count[1], hw.count[2], hw.count[3], hw.count[4], hw.count[5],
+                                hw.arm_count[0], hw.arm_count[1], hw.arm_count[2], hw.ads_count, hw.shots);
+    }
     // the pointer moves unless the primary hand is in a pinch that has not become a drag
     int frozen = prim >= 0 && g_hg[prim].pinched && g_hg[prim].phase != 2;
     if (hit && !frozen) {
@@ -2711,8 +3615,8 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
     g_cursor_dot[0] = g_cur_u; g_cursor_dot[1] = g_cur_v; g_cursor_dot[2] = on; g_cursor_dot[3] = prim >= 0 && g_hg[prim].pinched;
     pthread_mutex_unlock(&g_lock);
     snprintf(g_hand_stats, sizeof g_hand_stats, "\"hands\":{\"frames\":%u,\"left_tracked\":%u,\"right_tracked\":%u,\"pointer_on\":%d,"
-             "\"pointer\":[%.3f,%.3f],\"clicks\":%u,\"right_clicks\":%u,\"drags\":%u,\"wheel_notches\":%u,\"esc\":%u}",
-             g_hand_frames, g_tracked_frames[0], g_tracked_frames[1], on, g_cur_u, g_cur_v, g_clicks, g_rclicks, g_drags, g_scroll_notches, g_escs);
+             "\"pointer\":[%.3f,%.3f],\"clicks\":%u,\"right_clicks\":%u,\"drags\":%u,\"wheel_notches\":%u,\"esc\":%u%s}",
+             g_hand_frames, g_tracked_frames[0], g_tracked_frames[1], on, g_cur_u, g_cur_v, g_clicks, g_rclicks, g_drags, g_scroll_notches, g_escs, g_gesture_stats);
 }
 
 void vx_xros_vr_stats(char *out, unsigned size) {

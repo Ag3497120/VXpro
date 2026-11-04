@@ -28,6 +28,8 @@ targets:
       - path: Assets.xcassets
       - path: ../vr/xros_vr.m
       - path: ../vr/warp_core.m
+      - path: ../vr/hand_gestures.c
+      - path: ../vr/hand_weapon.c
       - path: ../vr/vxmac_vr_glue.m
     settings:
       base:

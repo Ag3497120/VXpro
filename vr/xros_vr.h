@@ -47,6 +47,21 @@ void vx_xros_vr_sensitivity(float factor);
 // room's frame (tracked 0/1, the thumb's tip, the index finger's tip, the pointing anchor), the head as above, now in
 // seconds (VXRT_HAND, xros_vr.m: the pointer on the screen, pinches as clicks, drags and the wheel).
 void vx_xros_vr_hands(const float head[16], const float hands[20], double now);
+// (VX Mac, h70) Just before vx_xros_vr_hands: per hand (left, right) 25 floats - tracked, then the wrist, the index,
+// middle and little fingers' knuckles, the middle, ring, little and index fingers' tips (vr/hand_weapon.h HW_JOINTS) -
+// for the gun handled by hand (VXMAC_MAG=1, VXMAC_ARMS=1).
+void vx_xros_vr_hand_joints(const float joints[50]);
+void vx_xros_vr_hand_skeleton(const float skel[134]);
+unsigned vx_xros_vr_controller_buttons(double now);
+#ifndef VX_HAND_BUTTONS_DEFINED
+#define VX_HAND_BUTTONS_DEFINED
+enum { HW_BTN_L_GRAB = 1u << 0, HW_BTN_L_TRIG = 1u << 1, HW_BTN_R_GRAB = 1u << 2,
+       HW_BTN_R_TRIG = 1u << 3, HW_BTN_ACT_A = 1u << 4, HW_BTN_ACT_B = 1u << 5,
+       HW_BTN_ACT_X = 1u << 6, HW_BTN_ACT_Y = 1u << 7, HW_BTN_ACTIVE = 1u << 15 };
+#endif
+void vx_xros_vr_hand_arms(const float arms[14]);
+void vx_xros_vr_controller_state(unsigned btns, double now);
+void vx_xros_vr_cycle_weapon_type(void);
 // After the eyes: cb's completion lets the slot be written again (NULL: the frame was cancelled, nothing encoded).
 void vx_xros_vr_end_frame(void *cb);
 // One line of JSON fields for the app's log (per second: compositor frames, game frames, warp GPU time, slot age...).

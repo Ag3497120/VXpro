@@ -29,6 +29,7 @@ struct VXMacApp: App {
                 VXMacImmersiveRenderer.start(layerRenderer)
             }
         }
+        .upperLimbVisibility(getenv("VXMAC_PASSTHROUGH_HANDS").map { String(cString: $0) == "1" } == true ? .automatic : .hidden)
         .immersionStyle(selection: .constant(.full), in: .full)
     }
 }

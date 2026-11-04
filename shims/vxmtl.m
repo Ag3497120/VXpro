@@ -347,7 +347,7 @@ static id h_prce(id self, SEL s, MTLRenderPassDescriptor *pd) {
         objc_setAssociatedObject(e, kPassCB, self, OBJC_ASSOCIATION_ASSIGN);
         objc_setAssociatedObject(e, kPassDepth, pd.depthAttachment.texture, OBJC_ASSOCIATION_RETAIN);
         MTLStoreAction sa = pd.depthAttachment.storeAction;
-        objc_setAssociatedObject(e, kPassStore, @(sa == MTLStoreActionStore || sa == MTLStoreActionStoreAndMultisampleResolve), OBJC_ASSOCIATION_RETAIN);
+        objc_setAssociatedObject(e, kPassStore, @((sa == MTLStoreActionStore || sa == MTLStoreActionStoreAndMultisampleResolve) && pd.depthAttachment.loadAction != MTLLoadActionClear && pd.colorAttachments[0].texture != nil), OBJC_ASSOCIATION_RETAIN);
         enc_probe(e);
     }
     return e;
@@ -665,7 +665,7 @@ static id h_rce(id self, SEL s, MTLRenderPassDescriptor *pd) {
         objc_setAssociatedObject(e, kPassCB, self, OBJC_ASSOCIATION_ASSIGN);
         objc_setAssociatedObject(e, kPassDepth, pd.depthAttachment.texture, OBJC_ASSOCIATION_RETAIN);
         MTLStoreAction sa = pd.depthAttachment.storeAction;
-        objc_setAssociatedObject(e, kPassStore, @(sa == MTLStoreActionStore || sa == MTLStoreActionStoreAndMultisampleResolve), OBJC_ASSOCIATION_RETAIN);
+        objc_setAssociatedObject(e, kPassStore, @((sa == MTLStoreActionStore || sa == MTLStoreActionStoreAndMultisampleResolve) && pd.depthAttachment.loadAction != MTLLoadActionClear && pd.colorAttachments[0].texture != nil), OBJC_ASSOCIATION_RETAIN);
         enc_probe(e);
     }
     return e;

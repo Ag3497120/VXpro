@@ -1,0 +1,29 @@
+// VX Hands: observe game input without consuming or changing the action.
+@wrapMethod(PlayerPuppet)
+protected cb function OnGameAttached() -> Bool {
+    let r = OnGameAttached();
+    this.RegisterInputListener(this, 'Reload');
+    this.RegisterInputListener(this, 'Choice1');
+    this.RegisterInputListener(this, 'Vision_Hold');
+    this.RegisterInputListener(this, 'QuickMelee');
+    this.RegisterInputListener(this, 'UseConsumable');
+    return r;
+}
+
+@wrapMethod(PlayerPuppet)
+protected cb function OnAction(action: ListenerAction, consumer: ListenerActionConsumer) -> Bool {
+    if ListenerAction.IsButtonJustPressed(action) {
+        if ListenerAction.GetName(action) == 'Reload' {
+            this.SetWarningMessage("VX Hands: reload requested");
+        } else if ListenerAction.GetName(action) == 'Choice1' {
+            this.SetWarningMessage("VX Hands: interact");
+        } else if ListenerAction.GetName(action) == 'Vision_Hold' {
+            this.SetWarningMessage("VX Hands: scan");
+        } else if ListenerAction.GetName(action) == 'QuickMelee' {
+            this.SetWarningMessage("VX Hands: melee requested");
+        } else if ListenerAction.GetName(action) == 'UseConsumable' {
+            this.SetWarningMessage("VX Hands: consumable");
+        }
+    }
+    return OnAction(action, consumer);
+}

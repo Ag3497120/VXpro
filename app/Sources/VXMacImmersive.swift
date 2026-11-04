@@ -196,17 +196,74 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
     private func feedHands(_ head: simd_float4x4) {
         let (left, right) = handTracking.latestAnchors
         var v = [Float](repeating: 0, count: 20)
+        var j = [Float](repeating: 0, count: 50)      // (h70: the joints for the magazine by hand, vr/hand_weapon.h)
+        var arms = [Float](repeating: 0, count: 14)
+        var skeleton = [Float](repeating: 0, count: 134)
+        let buttons = vx_xros_vr_controller_buttons(CACurrentMediaTime())
         for (k, a) in [left, right].enumerated() {
             guard let a, a.isTracked, let sk = a.handSkeleton else { continue }
             func p(_ j: HandSkeleton.JointName) -> SIMD3<Float> {
                 let m = a.originFromAnchorTransform * sk.joint(j).anchorFromJointTransform
                 return SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z)
             }
+            let elbow = p(.forearmArm), fwrist = p(.forearmWrist)
+            let armOK = simd_distance(elbow, fwrist) > 0.05
+            if armOK {
+                arms[k * 7] = 1
+                for i in 0..<3 { arms[k * 7 + 1 + i] = elbow[i]; arms[k * 7 + 4 + i] = fwrist[i] }
+            }
+            let names: [HandSkeleton.JointName] = [.forearmArm, .wrist,
+                .thumbKnuckle, .thumbIntermediateBase, .thumbIntermediateTip, .thumbTip,
+                .indexFingerMetacarpal, .indexFingerKnuckle, .indexFingerIntermediateBase, .indexFingerTip,
+                .middleFingerMetacarpal, .middleFingerKnuckle, .middleFingerIntermediateBase, .middleFingerTip,
+                .ringFingerMetacarpal, .ringFingerKnuckle, .ringFingerIntermediateBase, .ringFingerTip,
+                .littleFingerMetacarpal, .littleFingerKnuckle, .littleFingerIntermediateBase, .littleFingerTip]
+            let wristPoint = p(.wrist)
+            let direction = fwrist - elbow
+            let forward = simd_length(direction) > 0.001 ? simd_normalize(direction) : SIMD3<Float>(0, 0, -1)
+            let ref = abs(forward.y) < 0.9 ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
+            let across = simd_normalize(simd_cross(forward, ref)) * (k == 0 ? -1 : 1)
+            let normal = simd_normalize(simd_cross(across, forward))
+            let active = (buttons & (1 << 15)) != 0
+            let grab = (buttons & (1 << (k == 0 ? 0 : 2))) != 0
+            let trigger = (buttons & (1 << (k == 0 ? 1 : 3))) != 0
+            skeleton[k * 67] = 1
+            for (n, name) in names.enumerated() {
+                var q = p(name)
+                if n >= 2 && active && armOK && simd_distance(q, wristPoint) < 0.005 {
+                    let finger = n < 6 ? 0 : (n - 6) / 4 + 1
+                    let part = n < 6 ? n - 2 : (n - 6) % 4
+                    let spread: Float = [0.045, 0.027, 0.009, -0.009, -0.027][finger]
+                    let curl = finger == 1 ? trigger : grab
+                    let advance: Float = finger == 0 ? 0.022 : 0.025
+                    let length = Float(part) * (curl ? 0.012 : 0.020)
+                    let bend = curl ? Float(max(0, part - 1)) * 0.015 : 0
+                    q = fwrist + across * spread + forward * (advance + length) - normal * bend
+                }
+                for i in 0..<3 { skeleton[k * 67 + 1 + n * 3 + i] = q[i] }
+            }
             let thumb = p(.thumbTip), index = p(.indexFingerTip)
             let anchor = (p(.indexFingerKnuckle) + p(.thumbKnuckle)) * 0.5
             v[k * 10] = 1
             for i in 0..<3 { v[k * 10 + 1 + i] = thumb[i]; v[k * 10 + 4 + i] = index[i]; v[k * 10 + 7 + i] = anchor[i] }
+            j[k * 25] = 1
+            let wrist = p(.wrist)
+            for (n, name) in [HandSkeleton.JointName.wrist, .indexFingerKnuckle, .middleFingerKnuckle, .littleFingerKnuckle,
+                              .middleFingerTip, .ringFingerTip, .littleFingerTip, .indexFingerTip].enumerated() {
+                var q = p(name)
+                if n > 0 && simd_distance(q, wrist) < 0.005 && armOK {
+                    let d = fwrist - elbow
+                    let f = simd_length(d) > 0.001 ? simd_normalize(d) : SIMD3<Float>(0, 0, -1)
+                    let ref = abs(f.y) < 0.9 ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
+                    let across = simd_normalize(simd_cross(f, ref))
+                    q = n == 0 ? fwrist : fwrist + f * 0.07 + across * (n == 1 ? -0.025 : n == 3 ? 0.025 : 0)
+                }
+                for i in 0..<3 { j[k * 25 + 1 + n * 3 + i] = q[i] }
+            }
         }
+        skeleton.withUnsafeBufferPointer { vx_xros_vr_hand_skeleton($0.baseAddress) }
+        arms.withUnsafeBufferPointer { vx_xros_vr_hand_arms($0.baseAddress) }
+        j.withUnsafeBufferPointer { vx_xros_vr_hand_joints($0.baseAddress) }
         if !handsLogged && (v[0] > 0 || v[10] > 0) {
             handsLogged = true
             vxmac_jlog("input_source", "\"source\":\"hand_tracking\",\"first_hand\":\"\(v[10] > 0 ? "right" : "left")\"")

@@ -4,6 +4,11 @@
 # program) into the app's Frameworks, each signed with the build's identity; each image's <name>.vxmac.plist (its
 # entry point) into Resources. The images are local copies of the user's own program, never in git.
 set -e
+if [ "$PLATFORM_NAME" = xrsimulator ]; then
+  make -C "$SRCROOT/../shims" sim
+else
+  make -C "$SRCROOT/../shims"
+fi
 FW="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"
 RES="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
 mkdir -p "$FW" "$RES"

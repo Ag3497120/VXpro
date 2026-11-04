@@ -821,3 +821,107 @@ BTAudioHALPlugin's XPC handler on a never-idle GCD worker autoreleased into a po
 1.3 GB (~0.95 GB of it BTAudioHALPlugin), footprint 7.8 GB, 374 MB left. Without it (B, VXMAC_AUDIO_HAL=0, 27 min):
 0 plug-ins, malloc 0.22 GB and flat (top stacks +0.00 MB/min), footprint 5.8 GB, 2.4 GB left; the user heard no
 difference (sound, panning, volume). Now the default; VXMAC_AUDIO_HAL=1 restores the HAL path.
+
+## h68: hand gestures for the game's actions (VXMAC_GESTURES=1, off by default)
+
+Half-Life: Alyx-style actions from the hands' motion in vr mode's 3D view (`vr/hand_gestures.{h,c}`, called from
+`vx_xros_vr_hands`). Nothing of the game is read or changed: each gesture is the key press or click the game's
+default bindings already have (2.5.0 `r6/config/inputUserMappings.xml`: `Reload_Button` R, `QuickMelee_Button` Q,
+`CombatGadget_Button` the middle button, `UseConsumable_Button` X), a tap of 80 ms.
+
+| Gesture | Detected as | Sends |
+| --- | --- | --- |
+| reload | the off hand from the chest down to the hip (50 cm below the eyes) within 1.5 s, then to the gun hand (18 cm) within 1.5 s | R |
+| melee | the gun hand's forward speed over 2.2 m/s for two frames, in front of the body | Q |
+| grenade | the off hand at the eyes' height or above, then forward over 2.0 m/s within 0.8 s | middle button |
+| heal | an index finger tip 9 cm from the mouth for 0.4 s | X |
+
+Cooldowns 1.0 / 0.6 / 1.5 / 2.0 s. `VXMAC_GESTURE_LEFTY=1`: the gun hand is the left. `VXMAC_GESTURE_KEYS=
+"reload=15,melee=14,grenade=m2,heal=1b"` (HID keyboard usage in hex, or m0-m2 a mouse button) for changed bindings.
+The vr stats' `hands` gain `gestures` [reload, melee, grenade, heal]; each gesture is logged ("VR: hand gesture ...").
+`tests/hand_gestures_mac.c`: 12 made-up 90 Hz cases - each gesture once, and the look-alikes (an arm resting at the
+side then raised, a 0.75 m/s push, a 90-degree body turn in 0.3 s, a 0.2 s touch at the mouth, tracking lost and
+found 60 cm away, a second punch within the cooldown) seen as none. Not yet tried on the headset: the thresholds
+are first guesses, and whether hand tracking holds during fast punches and throws is unknown.
+
+Tuning on the Mac (h68b): with the gestures on, the first `VXMAC_HAND_RECORD=5` minutes of hands go to
+`Documents/hand_record.csv` (0: none; a line a frame: time, vr, the head's 16, the hands' 20, the gestures made;
+flushed every 2 s). Fetch it with `xcrun devicectl device copy from --device <id> --domain-type appDataContainer
+--domain-identifier <bundle id> --source Documents/hand_record.csv --destination .` and play it through
+the detector with other thresholds: `build/hand_gestures_replay hand_record.csv punch_speed=1.8,mouth_r=0.1
+[--lefty] [--trace]` (each gesture with its time and whether the headset saw it; `--trace` a line a second with the
+gun hand's peak forward speed, the off hand's range against the eyes, the nearest index tip to the mouth, the
+tracked share). The thresholds by name: `hand_gestures_params` (punch_speed, punch_ahead, chest_y, hip_y, hip_side,
+reload_s, at_gun, raised_y, raised_ahead, throw_speed, throw_s, mouth_r, mouth_s, cd_*); on the headset
+`VXMAC_GESTURE_TUNE="punch_speed=1.8"`. `build/hand_gestures_mac rec.csv` writes its made-up cases as a record:
+replayed with the defaults they give the same gestures (the left-handed case only with `--lefty`).
+Each gesture seen shows a short label for 0.7 s in the labels' language ("Reload", "リロード", ...;
+`VXMAC_GESTURE_LABELS=0`: none), so a gesture the game did not act on can be told from one that was not seen.
+
+## h70: the gun handled by hand - magazine, draw, holster, aim, trigger (VXMAC_MAG=1, VXMAC_ARMS=1; off by default)
+
+Stage 3 of the hand controls, still outside the game: Half-Life: Alyx-style handling of the gun from the hands'
+skeleton (`vr/hand_weapon.{h,c}`), each step becoming the keys the game's default bindings have (2.5.0
+`inputUserMappings.xml`: `Reload_Button` R, `WeaponSlot1/2_Button` 1 / 2, `HolsterWeapon_Button` B,
+`RangedADS_Button` the right button, `RangedAttack_Button` the left). Nothing of the game is read or changed.
+
+The hands: `VXMacImmersive.swift` passes per hand the wrist, the index / middle / little fingers' knuckles and the
+middle / ring / little / index fingers' tips (`vx_xros_vr_hand_joints`, 25 floats a hand, before `vx_xros_vr_hands`).
+From them: a hand's grip (the middle, ring and little fingers' curl - each tip's distance from the wrist over its
+knuckle's: ~1.9 straight, ~0.9 a fist; `curl_open` / `curl_fist`), the index finger's curl, the palm, and for the gun
+hand holding a fist the grip's line (index knuckle down to little knuckle) and its bottom (2 cm past the little
+knuckle). Without a fist the grip's bottom is 10 cm below the gun hand.
+
+| Step | Detected as | Sends |
+| --- | --- | --- |
+| magazine out | the off hand's fist closed at the grip's bottom (8 cm), pulled 12 cm away and down the grip's line within 2.5 s | (`out=` key) |
+| new magazine | the off hand's fist closed at a pouch - the hip (50 cm below the eyes) or the chest - while the gun is empty | (`grab=`) |
+| magazine in | the fist brought to the grip's bottom and pushed 3 cm up the grip's line, past its bottom | R (`done=`; `in=`) |
+| slide racked | `VXMAC_MAG_RACK=1`: after in, a fist on the slide (4 cm above the index knuckle) pulled 6 cm back | R then (`rack=`) |
+| cancelled | out but no magazine in within 20 s | (`cancel=`) |
+| draw | `VXMAC_ARMS=1`: a gun-hand fist closed at its hip (weapon 1) or over its shoulder (weapon 2), up in front within 1.5 s | 1 / 2 |
+| holster | the gun hand down from in front to its hip within 1.5 s, opened there | B |
+| aim (held) | the off hand round the gun hand (11 cm, above the grip's bottom) or 12-50 cm ahead in line (a rifle's barrel), gun raised, 0.2 s; let go at 17 cm, lowered, or a magazine out | right button held |
+| trigger (held) | `VXMAC_TRIGGER=1`: the gun hand's fist, raised, its index finger curled under 1.55 (let go at 1.68; smoothed, 2 frames) | left button held |
+
+With `VXMAC_MAG=1` h68's reload gesture is off (the magazine reloads). Keys: `VXMAC_MAG_KEYS="out=..,grab=..,in=..,
+rack=..,done=15,cancel=.."` and `VXMAC_ARMS_KEYS="hip=1e,back=1f,holster=05,aim=m1,trigger=m0"` (HID usage in hex, or
+m0-m2 a mouse button; a step's own key is for the VX Hands mod). Labels 0.7 s for out / new / in / racked /
+cancelled in the 8 label languages. Drawn over each eye while it matters (no depth test, like the label): the
+magazine in the off hand (12 x 3.5 x 2.2 cm along the fist's knuckles, its top red) and the grip's bottom as a ring
+across the grip's line while a magazine is wanted - larger and brighter when the hand is there. The vr stats'
+`hands` gain `magazine` [out, grab, in, rack, done, cancel] and `gun` [draw hip, draw back, holster, aims, shots].
+Thresholds by name (`hand_weapon_params`), on the headset `VXMAC_MAG_TUNE="fist_on=0.5,well_r=0.1"`.
+
+Tests (`tests/hand_weapon_mac.c`, made-up skeletons at 90 Hz): 28 cases - a reload from the hip and from the chest,
+the rack, the gun hand open, the body turned 90 degrees, left-handed; and the look-alikes as nothing: a fist at the
+hip with the gun loaded, the grip held and let go, a two-handed grip held 4 s while turning then let go, a fist pulled
+sideways off the grip, the old magazine grabbed again, walking with a fist at the hip, a slow draw, the trigger off or
+lowered, no aim during a whole reload. Then 6 cases x 20 seeds with tracking noise (5 mm a joint, curl +-0.08, 2 % of
+frames lost): 0 wrong; `HW_NOISE=0.010,0.08,5`: 0 wrong, 15 mm: 1 aim of 20 cut. The noise found two faults now fixed
+(h70c): a gun hand lost for one frame restarted a magazine half in (5 of 20 reloads failed), and a lost frame let go
+of the aim and the trigger (an extra shot).
+
+Tuning (as h68b): with `VXMAC_MAG=1` the first `VXMAC_HAND_RECORD=5` minutes of joints go to
+`Documents/hand_pose_record.csv` (time, vr, the head's 16, the joints' 50, the magazine steps); `build/hand_weapon_replay
+hand_pose_record.csv [fist_on=0.5,...] [--lefty] [--rack] [--trace]` plays it (`--trace`: each state change and a line a
+second with both hands' grip range, the off hand's nearest approach to the grip's bottom, its height range, the tracked
+share). Not yet on the headset: the curl ratios (1.9 / 0.9) and every distance are first guesses, and whether hand
+tracking keeps a fist's fingers and two hands close together (a two-handed grip, a magazine at the grip) is unknown.
+
+
+### h71: hand interaction and reusable buffers
+
+With `VXMAC_GESTURES=1`, an open off hand held in the forward reach zone for 0.12 s and then pinched sends interact (F). Defaults are 0.22 m forward, -0.52 to +0.05 m relative to the eyes, and 0.055 m open / 0.028 m closed thumb-index distance. The eight thresholds `interact_reach`, `interact_y_lo`, `interact_y_hi`, `interact_open`, `interact_pinch`, `interact_dwell`, `temple_r`, and `temple_s` are available through `VXMAC_GESTURE_TUNE`. An off index within 0.13 m of the temple for 0.40 s holds scan (Tab) until it leaves. The interact and scan bindings can be changed with `VXMAC_GESTURE_KEYS`.
+
+With `VXMAC_MAG=1` or `VXMAC_ARMS=1`, a full-joint open hand held forward for 0.12 s and closed also sends interact. It excludes nearby gun hands, magazine handling, aiming and drawing; the gun hand is eligible only when no weapon is inferred to be drawn. Pinch and full-joint events share the interaction binding and cooldown. These inferred gestures still need headset calibration and game testing.
+
+The REDmod script registers Reload, Choice1, Vision_Hold, QuickMelee, and UseConsumable listeners and shows brief feedback while passing actions through. Compiler and in-game behavior have not been verified.
+
+The follow profiler uses four shared buffers and floor fitting uses two, with each held through GPU completion and CPU analysis; a full pool skips the sample. Depth capture uses three buffers held until the present command buffer completes; it still copies every matching writing pass because the last pass can contain newer depth or the texture can be aliased. FSR depth conversion reuses a private buffer per presentation slot. No FPS improvement is claimed without measurements.
+
+### h72: arm continuation and hybrid hand controls
+
+The presenter uses tracked `forearmArm` and `forearmWrist` joints to reconstruct a palm when finger joints are unavailable. When the whole hand is briefly occluded, its last motion continues from an estimated shoulder, limited to a 0.72 m reach and 0.35 s. These are estimates, so actions should be verified on the headset.
+
+`VXMAC_HAND_MODE=auto|hybrid|bare` selects controller-assisted or finger-based handling (default `auto`; controller activity selects hybrid for five seconds). Hybrid uses controller triggers for firing and aiming, grab buttons or hand motion for reload, draw and interaction, and an off-hand button at the temple for scanning. It works alongside the existing `VXMAC_MAG`, `VXMAC_ARMS`, `VXMAC_TRIGGER`, and `VXMAC_GESTURES` switches. Inputs remain external presenter input; no game memory or binary is inspected or modified.

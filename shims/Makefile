@@ -35,7 +35,7 @@ $(OUT)/libvxgk.dylib: vxgk.m | $(OUT)
 	$(CC) $(CFLAGS) $(DY) vxgk.m -o $@ -Wl,-reexport_framework,GameKit -framework Foundation
 $(OUT)/libvxcurl.dylib: vxcurl.c $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxcurl.c -o $@ $(OUT)/libvxkit.dylib
-$(OUT)/libvxmtl.dylib: vxmtl.m vxpipe.m vxprof.m vxprof.h $(OUT)/libvxkit.dylib
+$(OUT)/libvxmtl.dylib: vxmtl.m vxpipe.m vrik.inc vrik_table.h vxprof.m vxprof.h $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxmtl.m vxpipe.m vxprof.m -o $@ -Wl,-reexport_framework,Metal -framework Foundation -framework QuartzCore $(OUT)/libvxkit.dylib
 $(OUT)/libvxmtlfx.dylib: vxmtlfx.m $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxmtlfx.m -o $@ $(FXLINK) -framework Foundation -framework Metal -framework QuartzCore $(OUT)/libvxkit.dylib

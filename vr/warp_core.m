@@ -9,7 +9,11 @@
 // (struct W: vxw_params, then the output's size, B's block grid (the map), the output's block grid (the keys) and the
 //  key's index bits)
 typedef struct { vxw_params p; uint32_t ow, oh, mw, mh, kw, kh, bits, flags2, kbs; float dr[4]; float hr[16]; uint32_t hn; float vig[4];
-                 float ip[4]; uint32_t iflags; float ilod; } vxw_gpu_params;
+                 float vmd[4]; float vmr[4]; float ip[4]; uint32_t iflags; float ilod; } vxw_gpu_params;
+_Static_assert(offsetof(vxw_gpu_params, vmd) == offsetof(vxw_gpu_params, vig) + 4 * sizeof(float) &&
+               offsetof(vxw_gpu_params, vmr) == offsetof(vxw_gpu_params, vmd) + 4 * sizeof(float) &&
+               offsetof(vxw_gpu_params, ip) == offsetof(vxw_gpu_params, vmr) + 4 * sizeof(float) &&
+               offsetof(vxw_gpu_params, ip) == 336, "warp parameter layout");
 // (ip / iflags / ilod: method 3's layers (ilod: B's mip level at the layers' size), read only by the VXW_INTERP library; without the layers the shaders get the bytes up
 //  to ip, as before)
 // (kbs: output pixels per key block, 2 or more: a block of B (2 x 2) must cover a key block's neighbours, or holes stay
@@ -22,7 +26,7 @@ static const char *g_vxw_msl =
     "using namespace metal;\n"
     "struct W { uint w, h, flags; float t, sx, sy, tx, ty, za, zb; float rot[9]; float pos[3];\n"
     "           float eye, S, pop, zc, conv, thr; float dt[4]; float dnear; float cam[9];\n"
-    "           uint ow, oh, mw, mh, kw, kh, bits, flags2, kbs; float dr[4]; float hr[16]; uint hn; float vig[4];\n"
+    "           uint ow, oh, mw, mh, kw, kh, bits, flags2, kbs; float dr[4]; float hr[16]; uint hn; float vig[4]; float vmd[4]; float vmr[4];\n"
     // (VX Mac, method 3: only in the second library, compiled with VXW_INTERP (vxw_set_interp); the default library's
     //  source preprocesses to exactly what it was before. ip: the model's motion unit in B's pixels (x, y), the conf
     //  weight's share (min(t, 1)), the conf fade of the motion (long gaps); iflags 1: the layers are used)
@@ -33,6 +37,7 @@ static const char *g_vxw_msl =
     // the distance of a depth value (FSR2: view depth = z_a / (d - z_b), its sign the view space's handedness)
     "static float vxw_dist(float d, constant W &p) {\n"
     "    if (p.flags & 16) d = 1 - d;\n"
+    "    if (!(p.flags & 16) && d > 0.9001f) return clamp(0.004f / max(d - 0.90f, 0.005f), 0.48f, 0.88f);\n"
     "    float z = abs(p.za / (d - p.zb));\n"
     "    return isfinite(z) ? max(z, 1e-6f) : 1e30f;\n"            // (d == z_b: infinitely far)
     "}\n"
@@ -103,18 +108,33 @@ static const char *g_vxw_msl =
     // (VX Mac, h28: the nearest of the block's 3 x 3 depth samples (a min filter: the foreground wins at edges) - one
     //  sample gave stair steps and doubled edges where a block straddled a wall's or a tube's edge)
     "    uint2 dsz = uint2(dp.get_width(), dp.get_height()); uint2 dc = vxw_at(uv, dsz);\n"
-    "    float z = 1e30f;\n"
-    "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) z = min(z, vxw_dist(dp.read(uint2(clamp(int2(dc) + int2(x, y), int2(0), int2(dsz) - 1))).r, p));\n"
+    "    float z = 1e30f, dmax = 0;\n"
+    "    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {\n"
+    "        float dr = dp.read(uint2(clamp(int2(dc) + int2(x, y), int2(0), int2(dsz) - 1))).r; dmax = max(dmax, dr); z = min(z, vxw_dist(dr, p));\n"
+    "    }\n"
+    "    bool fg_vm = !(p.flags & 16) && dmax > 0.9001f;\n"
+    "    if (fg_vm) m = 0;\n"
     // (q: where it lands, in output pixels; the target's frustum: dt (left, right, up, down tangents) or B's own)
     "    float2 q = (pc + p.t * m) * osz / sz;\n"
+    "    bool is_vm = false;\n"
     "    if (p.flags & 1) {\n"                                      // (the pose: unprojected, moved, projected)
     "        float2 qb = pc + p.t * m;\n"
     "        float2 ndc = float2(qb.x / sz.x * 2 - 1, 1 - qb.y / sz.y * 2);\n"
     "        float zz = min(z, 1e6f);\n"
     "        float3 X = float3(ndc.x * p.tx * zz, ndc.y * p.ty * zz, zz);\n"
-    "        float3 Y = float3(p.rot[0] * X.x + p.rot[1] * X.y + p.rot[2] * X.z + p.pos[0],\n"
-    "                          p.rot[3] * X.x + p.rot[4] * X.y + p.rot[5] * X.z + p.pos[1],\n"
-    "                          p.rot[6] * X.x + p.rot[7] * X.y + p.rot[8] * X.z + p.pos[2]);\n"
+    "        is_vm = abs(p.vmd[3]) > 0.5f && fg_vm && uv.y > 0.25f && (p.vmd[3] < 0 ? uv.x < 0.88f : uv.x > 0.12f);\n"
+    "        if (is_vm) {\n"
+    "            float3 piv = float3(p.vmd[3] < 0 ? -0.15f : 0.15f, -0.18f, 0.38f), v = X - piv;\n"
+    "            float cy = cos(p.vmr[0]), sy = sin(p.vmr[0]), cp = cos(p.vmr[1]), sp = sin(p.vmr[1]), cr = cos(p.vmr[2]), sr = sin(p.vmr[2]);\n"
+    "            v = float3(cy * v.x + sy * v.z, v.y, -sy * v.x + cy * v.z);\n"
+    "            v = float3(v.x, cp * v.y - sp * v.z, sp * v.y + cp * v.z);\n"
+    "            v = float3(cr * v.x - sr * v.y, sr * v.x + cr * v.y, v.z);\n"
+    "            X = piv + v + float3(p.vmd[0], p.vmd[1], p.vmd[2]); X.z = max(X.z, 0.15f);\n"
+    "        }\n"
+    "        float3 wp = fg_vm ? float3(clamp(p.pos[0], -0.02f, 0.02f), 0.0f, 0.0f) : float3(p.pos[0], p.pos[1], p.pos[2]);\n"
+    "        float3 Y = float3(p.rot[0] * X.x + p.rot[1] * X.y + p.rot[2] * X.z + wp.x,\n"
+    "                          p.rot[3] * X.x + p.rot[4] * X.y + p.rot[5] * X.z + wp.y,\n"
+    "                          p.rot[6] * X.x + p.rot[7] * X.y + p.rot[8] * X.z + wp.z);\n"
     "        if (Y.z <= 1e-5f) { map.write(float4(0, 0, z, 0), g); return; }\n"   // (behind the new view: lands nowhere)
     "        float4 f = p.dt[0] + p.dt[1] > 0 ? float4(p.dt[0], p.dt[1], p.dt[2], p.dt[3]) : float4(p.tx, p.tx, p.ty, p.ty);\n"
     "        q = float2((Y.x / Y.z + f.x) / (f.x + f.y) * osz.x, (f.z - Y.y / Y.z) / (f.z + f.w) * osz.y);\n"
@@ -127,13 +147,16 @@ static const char *g_vxw_msl =
     "    map.write(float4(q * sz / osz - pc, z, 1), g);\n"     // (the displacement in B's pixels)
     "    atomic_fetch_max_explicit(mx, uint(min(length(m), 4095.0f) * 16), memory_order_relaxed);\n"
     "    int2 tb = int2(floor(q / float(p.kbs)));\n"
-    "    if (any(tb < 0) || tb.x >= int(p.kw) || tb.y >= int(p.kh)) return;\n"
     // (in front: the nearest, by the log of the inverse distance in the key's high bits)
     "    float top = float((1u << (32 - p.bits)) - 1);\n"
     "    float pr = clamp((log2(1 / z) + 40) * (top / 64), 0.0f, top - 1);\n"
     // (flat, an overlay is in front of everything: nothing moving covers the HUD)
     "    if (still && !(p.flags & 3)) pr = top;\n"
-    "    atomic_fetch_max_explicit(&key[uint(tb.y) * p.kw + uint(tb.x)], (uint(pr) << p.bits) | (g.y * p.mw + g.x + 1), memory_order_relaxed);\n"
+    "    int splat = (fg_vm || is_vm) ? 1 : 0;\n"
+    "    for (int y = 0; y <= splat; y++) for (int x = 0; x <= splat; x++) {\n"
+    "        int2 t = tb + int2(x, y); if (any(t < 0) || t.x >= int(p.kw) || t.y >= int(p.kh)) continue;\n"
+    "        atomic_fetch_max_explicit(&key[uint(t.y) * p.kw + uint(t.x)], (uint(pr) << p.bits) | (g.y * p.mw + g.x + 1), memory_order_relaxed);\n"
+    "    }\n"
     "}\n"
     // 2: each output block's displacement: the block that won it, or (a hole) the farthest landed in the nearest ring
     "kernel void vxw_resolve(texture2d<float> map [[texture(0)]], texture2d<float, access::write> disp [[texture(1)]],\n"
@@ -159,14 +182,22 @@ static const char *g_vxw_msl =
     "    uint mask = (1u << p.bits) - 1, k = key[g.y * p.kw + g.x];\n"
     "    if (!k) {\n"
     "        uint best = 0xffffffffu;\n"
-    "        for (int r = 1; r <= 16 && best == 0xffffffffu; r *= 2)\n"
+    "        for (int r = 1; r <= 32 && best == 0xffffffffu; r *= 2)\n"
     "            for (int d = 0; d < 9; d++) {\n"
     "                if (d == 4) continue;\n"
     "                int2 q = int2(g) + int2(d % 3 - 1, d / 3 - 1) * r;\n"
     "                if (any(q < 0) || q.x >= int(p.kw) || q.y >= int(p.kh)) continue;\n"
     "                uint k2 = key[uint(q.y) * p.kw + uint(q.x)];\n"
+    "                if (k2 && abs(p.vmd[3]) > 0.5f) { uint i = (k2 & mask) - 1; if (map.read(uint2(i % p.mw, i / p.mw)).z < 0.85f) continue; }\n"
     "                if (k2 && (k2 >> p.bits) < (best >> p.bits)) best = k2;\n"
     "            }\n"
+    "        if (best == 0xffffffffu && abs(p.vmd[3]) > 0.5f) {\n"
+    "            for (int r = 1; r <= 32 && best == 0xffffffffu; r *= 2) for (int d = 0; d < 9; d++) {\n"
+    "                if (d == 4) continue; int2 q = int2(g) + int2(d % 3 - 1, d / 3 - 1) * r;\n"
+    "                if (any(q < 0) || q.x >= int(p.kw) || q.y >= int(p.kh)) continue;\n"
+    "                uint k2 = key[uint(q.y) * p.kw + uint(q.x)]; if (k2 && (k2 >> p.bits) < (best >> p.bits)) best = k2;\n"
+    "            }\n"
+    "        }\n"
     "        k = best == 0xffffffffu ? 0 : best;\n"
     // (nothing landed anywhere near: outside what the frame shows, h2b's black halves and clamped streaks; the gather
     //  draws the border there)
@@ -182,15 +213,17 @@ static const char *g_vxw_msl =
     // (VX Mac, method 3: with the model's layers a hole keeps the background's displacement and is marked (w = 1): the
     //  gather shows the model's fill there - the colour behind what moved away - instead of stretching a block)
     "#if VXW_INTERP\n"
-    "    if (p.iflags & 1) { disp.write(float4(dsp, isfinite(v.z) ? v.z : 1e30f, k && !key[g.y * p.kw + g.x] ? 1 : 0), g); return; }\n"
+    "    if ((p.iflags & 1) && abs(p.vmd[3]) <= 0.5f) { disp.write(float4(dsp, isfinite(v.z) ? v.z : 1e30f, k && !key[g.y * p.kw + g.x] ? 1 : 0), g); return; }\n"
     "#endif\n"
-    "    if (k && !key[g.y * p.kw + g.x]) {\n"
+    "    float mark = 0;\n"
+    "    if (k) {\n"
     "        float2 sc = gc - dsp;\n"
     "        uint2 sb = uint2(clamp(int2(floor(sc * 0.5f)), int2(0), int2(p.mw, p.mh) - 1));\n"
     "        float4 o = map.read(sb);\n"
-    "        if (o.z < 0.9f * v.z) dsp = gc - (float2(src) * 2 + 1);\n"
+    "        if (abs(p.vmd[3]) > 0.5f && v.z >= 0.85f && o.z < 0.85f) mark = 2;\n"
+    "        else if (!key[g.y * p.kw + g.x] && o.z < 0.9f * v.z) dsp = gc - (float2(src) * 2 + 1);\n"
     "    }\n"
-    "    disp.write(float4(dsp, isfinite(v.z) ? v.z : 1e30f, 0), g);\n"   // (z: the distance there, for the depth out)
+    "    disp.write(float4(dsp, isfinite(v.z) ? v.z : 1e30f, mark), g);\n"
     "}\n"
     // 3: each output pixel: B sampled its block's displacement back
     // (the depth out: reversed infinite, dnear / distance; dnear 0: B's own depth value moved with it)
@@ -261,6 +294,19 @@ static const char *g_vxw_msl =
     "    }\n"
     "    return vxw_edge(c, su, p);\n"
     "}\n"
+    "static float3 vxw_vm_fill(texture2d<float> b, texture2d<float> dp, float2 su, float z, constant W &p, float3 c) {\n"
+    "    if (abs(p.vmd[3]) <= 0.5f || (p.flags & 16) || z < 0.85f || any(su < 0) || any(su > 1)) return c;\n"
+    "    uint2 ds = uint2(dp.get_width(), dp.get_height());\n"
+    "    if (dp.read(vxw_at(su, ds)).r <= 0.895f) return c;\n"
+    "    constexpr sampler s(filter::linear, mip_filter::linear, address::clamp_to_edge);\n"
+    "    float3 sum = 0; float ws = 0;\n"
+    "    for (int r = 1; r <= 15 && ws == 0; r++) for (int k = 0; k < 8; k++) {\n"
+    "        float a = float(k) * 0.78539816f; float2 q = su + float2(cos(a), sin(a)) * (0.03f * float(r));\n"
+    "        if (any(q < 0) || any(q > 1)) continue;\n"
+    "        if (dp.read(vxw_at(q, ds)).r <= 0.895f) { float w = 1.0f / float(r); sum += w * b.sample(s, q, level(0)).rgb; ws += w; }\n"
+    "    }\n"
+    "    return ws > 0 ? sum / ws : b.sample(s, float2(clamp(su.x - 0.25f, 0.05f, 0.95f), max(0.08f, su.y - 0.35f)), level(2.0f)).rgb;\n"
+    "}\n"
     // (VX Mac, method 3: B's colour weighted by the model's conf against its fill (the training composite,
     //  tools/interp_model.py composite: fg * coverage + fill * (1 - coverage), coverage = min(2 conf, 1)), the conf's
     //  share growing with t up to one interval (at B's own time B is exact). The fill is the model's size (416x240 for a
@@ -324,16 +370,16 @@ static const char *g_vxw_msl =
     "#if VXW_INTERP\n"
     "                       texture2d<float> il [[texture(6)]],\n"
     "#endif\n"
-    "                       uint2 g [[thread_position_in_grid]]) {\n"
+    "                       texture2d<float> dp [[texture(7)]], uint2 g [[thread_position_in_grid]]) {\n"
     "    if (g.x >= p.ow || g.y >= p.oh) return;\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
     "    float4 v = vxw_dispf(disp, float2(g) + 0.5f, p);\n"
     "    float2 pb = (float2(g) + 0.5f) * float2(p.w, p.h) / float2(p.ow, p.oh);\n"
     "    float2 su = (pb - v.xy) / float2(p.w, p.h);\n"
     "#if VXW_INTERP\n"
-    "    o.write(float4(vxw_visor(vxw_icol(b, dt, hm, il, su, v.w, p), su, (float2(g) + 0.5f) / float2(p.ow, p.oh), p), 1), g);\n"
+    "    o.write(float4(vxw_visor(vxw_vm_fill(b, dp, su, v.z, p, vxw_icol(b, dt, hm, il, su, v.w < 1.5f ? v.w : 0, p)), su, (float2(g) + 0.5f) / float2(p.ow, p.oh), p), 1), g);\n"
     "#else\n"
-    "    o.write(float4(vxw_visor(vxw_col(b, dt, hm, su, p), su, (float2(g) + 0.5f) / float2(p.ow, p.oh), p), 1), g);\n"
+    "    o.write(float4(vxw_visor(vxw_vm_fill(b, dp, su, v.z, p, vxw_col(b, dt, hm, su, p)), su, (float2(g) + 0.5f) / float2(p.ow, p.oh), p), 1), g);\n"
     "#endif\n"
     "    if (p.flags2 & 1) od.write(float4(vxw_out_depth(v.z, p)), g);\n"
     "}\n"
@@ -346,17 +392,17 @@ static const char *g_vxw_msl =
     "#if VXW_INTERP\n"
     "                              texture2d<float> il [[texture(4)]],\n"
     "#endif\n"
-    "                              constant W &p [[buffer(1)]]) {\n"
+    "                              texture2d<float> dp [[texture(5)]], constant W &p [[buffer(1)]]) {\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
     "    uint2 g = min(uint2(in.uv * float2(p.ow, p.oh)), uint2(p.ow, p.oh) - 1);\n"
     "#if VXW_INTERP\n"
     "    float4 vi = vxw_dispf(disp, in.uv * float2(p.ow, p.oh), p);\n"
     "    float2 su = in.uv - vi.xy / float2(p.w, p.h);\n"
-    "    return float4(vxw_visor(vxw_icol(b, dt, hm, il, su, vi.w, p), su, in.uv, p), 1);\n"
+    "    return float4(vxw_visor(vxw_vm_fill(b, dp, su, vi.z, p, vxw_icol(b, dt, hm, il, su, vi.w < 1.5f ? vi.w : 0, p)), su, in.uv, p), 1);\n"
     "#else\n"
-    "    float2 v = vxw_dispf(disp, in.uv * float2(p.ow, p.oh), p).xy;\n"
-    "    float2 su = in.uv - v / float2(p.w, p.h);\n"
-    "    return float4(vxw_visor(vxw_col(b, dt, hm, su, p), su, in.uv, p), 1);\n"
+    "    float4 v = vxw_dispf(disp, in.uv * float2(p.ow, p.oh), p);\n"
+    "    float2 su = in.uv - v.xy / float2(p.w, p.h);\n"
+    "    return float4(vxw_visor(vxw_vm_fill(b, dp, su, v.z, p, vxw_col(b, dt, hm, su, p)), su, in.uv, p), 1);\n"
     "#endif\n"
     "}\n"
     // (with a depth attachment: the depth out as the fragment's depth)
@@ -365,15 +411,15 @@ static const char *g_vxw_msl =
     "#if VXW_INTERP\n"
     "                                texture2d<float> il [[texture(4)]],\n"
     "#endif\n"
-    "                                constant W &p [[buffer(1)]]) {\n"
+    "                                texture2d<float> dp [[texture(5)]], constant W &p [[buffer(1)]]) {\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
     "    uint2 g = min(uint2(in.uv * float2(p.ow, p.oh)), uint2(p.ow, p.oh) - 1);\n"
     "    float4 v = vxw_dispf(disp, in.uv * float2(p.ow, p.oh), p);\n"
     "    float2 su = in.uv - v.xy / float2(p.w, p.h);\n"
     "#if VXW_INTERP\n"
-    "    FD o; o.c = float4(vxw_visor(vxw_icol(b, dt, hm, il, su, v.w, p), su, in.uv, p), 1); o.d = vxw_out_depth(v.z, p); return o;\n"
+    "    FD o; o.c = float4(vxw_visor(vxw_vm_fill(b, dp, su, v.z, p, vxw_icol(b, dt, hm, il, su, v.w < 1.5f ? v.w : 0, p)), su, in.uv, p), 1); o.d = vxw_out_depth(v.z, p); return o;\n"
     "#else\n"
-    "    FD o; o.c = float4(vxw_visor(vxw_col(b, dt, hm, su, p), su, in.uv, p), 1); o.d = vxw_out_depth(v.z, p); return o;\n"
+    "    FD o; o.c = float4(vxw_visor(vxw_vm_fill(b, dp, su, v.z, p, vxw_col(b, dt, hm, su, p)), su, in.uv, p), 1); o.d = vxw_out_depth(v.z, p); return o;\n"
     "#endif\n"
     "}\n"
     // the stereo screen plane: the pct-th of 16x16 samples of inverse depth (z_a / z), smoothed in st[0]; st[1] this frame's
@@ -382,7 +428,7 @@ static const char *g_vxw_msl =
     "    threadgroup float v[256];\n"
     "    uint2 ds = uint2(dp.get_width(), dp.get_height());\n"
     "    uint2 q = min(uint2(((i & 15) * 2 + 1) * ds.x / 32, ((i >> 4) * 2 + 1) * ds.y / 32), ds - 1);\n"
-    "    v[i] = p.za / vxw_dist(dp.read(q).r, p);\n"
+    "    v[i] = p.za / max(vxw_dist(dp.read(q).r, p), 1.2f);\n"
     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "    for (uint k = 2; k <= 256; k <<= 1)\n"
     "        for (uint j = k >> 1; j > 0; j >>= 1) {\n"
@@ -413,6 +459,7 @@ struct vxw_core {
     __strong id<MTLTexture> detail; float drect[4];                 // (vxw_set_detail: for the next encodes)
     __strong id<MTLRasterizationRateMap> rrm;                       // (vxw_set_rate_map: the target's foveation)
     __strong id<MTLTexture> hud_mask;                               // (vxw_set_hud_mask)
+    float vmd[4], vmr[4];
     float hud_rects[16]; uint32_t hud_n;                            // (vxw_set_hud_rects)
     // per frame size (B's: the map) and output size (the keys, the displacements)
     uint32_t w, h, ow, oh, mw, mh, kw, kh, bits, kbs;
@@ -548,6 +595,7 @@ int vxw_encode_eye(vxw_core *c, void *command_buffer, const vxw_params *p, void 
     if (ion) { memcpy(P.ip, c->ip, sizeof P.ip); P.ip[0] *= 16.0f * (float)p->w / (float)il.width; P.ip[1] *= 16.0f * (float)p->h / (float)il.height; P.iflags = 1;
                float lod = log2f((float)p->w / (float)il.width); P.ilod = lod > 0 && b.mipmapLevelCount > 1 ? fminf(lod, (float)(b.mipmapLevelCount - 1)) : 0; }
     NSUInteger plen = ion ? sizeof P : offsetof(vxw_gpu_params, ip);
+    memcpy(P.vmd, c->vmd, sizeof P.vmd); memcpy(P.vmr, c->vmr, sizeof P.vmr);
     memcpy(P.hr, c->hud_rects, sizeof P.hr);
     {   // (h57h: the head-locked vignette - margin inside the frame's coverage and feather, degrees; VXMAC_VIGNETTE=0 off)
         static float m = -1, f = 8; static int on = 1;   // (6 deg inside the frame, 8 deg feather: ~85 % dark at the frame's edge)
@@ -596,6 +644,7 @@ int vxw_encode_eye(vxw_core *c, void *command_buffer, const vxw_params *p, void 
         [enc setTexture:od ? od : c->dummy atIndex:3];
         [enc setTexture:dt ? dt : c->dummy_rd atIndex:4];
         [enc setTexture:hm ? hm : c->dummy_rd atIndex:5];
+        [enc setTexture:depth atIndex:7];
         if (ion) [enc setTexture:il atIndex:6];
         [enc dispatchThreads:MTLSizeMake(ow, oh, 1) threadsPerThreadgroup:tg];
         [enc endEncoding];
@@ -623,6 +672,7 @@ int vxw_encode_eye(vxw_core *c, void *command_buffer, const vxw_params *p, void 
         [re setFragmentTexture:c->disp atIndex:1];
         [re setFragmentTexture:dt ? dt : c->dummy_rd atIndex:2];
         [re setFragmentTexture:hm ? hm : c->dummy_rd atIndex:3];
+        [re setFragmentTexture:depth atIndex:5];
         if (ion) [re setFragmentTexture:il atIndex:4];
         [re setFragmentBytes:&P length:plen atIndex:1];
         [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -696,6 +746,13 @@ void vxw_set_hud_rects(vxw_core *c, const float *rects, int n) {
     if (!c) return;
     c->hud_n = n < 0 ? 0 : n > 4 ? 4 : (uint32_t)n;
     if (c->hud_n) memcpy(c->hud_rects, rects, c->hud_n * 4 * sizeof(float));
+}
+void vxw_set_viewmodel(vxw_core *c, const float delta[3], const float rot[3]) {
+    if (!c) return;
+    memset(c->vmd, 0, sizeof c->vmd); memset(c->vmr, 0, sizeof c->vmr);
+    if (!delta || !rot) return;
+    memcpy(c->vmd, delta, 3 * sizeof(float)); memcpy(c->vmr, rot, 3 * sizeof(float));
+    const char *left = getenv("VXMAC_GESTURE_LEFTY"); c->vmd[3] = left && !strcmp(left, "1") ? -1.f : 1.f;
 }
 void vxw_set_rate_map(vxw_core *c, void *map) { if (c) c->rrm = (__bridge id<MTLRasterizationRateMap>)map; }
 

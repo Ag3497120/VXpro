@@ -73,7 +73,8 @@ static const void *kHash = &kHash;
 typedef id (*fn_imp)(id, SEL, id) __attribute__((ns_returns_retained));
 typedef id (*fn_c_imp)(id, SEL, id, id, NSError **) __attribute__((ns_returns_retained));
 static fn_imp o_fn; static fn_c_imp o_fn_c;
-static void fn_tag(id l, id f) { if (f && l) { id h = objc_getAssociatedObject(l, kHash); if (h) objc_setAssociatedObject(f, kHash, h, OBJC_ASSOCIATION_RETAIN); } }
+static const void *kLibData = &kLibData;
+static void fn_tag(id l, id f) { if (f && l) { id h = objc_getAssociatedObject(l, kHash); if (h) objc_setAssociatedObject(f, kHash, h, OBJC_ASSOCIATION_RETAIN); id d = objc_getAssociatedObject(l, kLibData); if (d) objc_setAssociatedObject(f, kLibData, d, OBJC_ASSOCIATION_RETAIN); } }
 __attribute__((ns_returns_retained)) static id h_fn(id self, SEL s, id n) { id f = o_fn(self, s, n); fn_tag(self, f); return f; }
 static const void *kConst;
 __attribute__((ns_returns_retained)) static id h_fn_c(id self, SEL s, id n, id cv, NSError **e) { id f = o_fn_c(self, s, n, cv, e); fn_tag(self, f); if (f && cv) objc_setAssociatedObject(f, kConst, @1, OBJC_ASSOCIATION_RETAIN); return f; }
@@ -203,9 +204,26 @@ static int is_ui_vs(id<MTLFunction> f) {   // (h51: the game's UI vertex shaders
     NSString *h = f ? objc_getAssociatedObject(f, kHash) : nil;
     return h && [set containsObject:h];
 }
+// (VRIK: a skinned vertex shader reads bone i of a draw at <bone buffer> + isd.x + i * isd.y, isd = its per-instance
+//  attribute instance_skinning_data0 (from the shaders' AIR); where that attribute comes from is kept with the pipeline)
+static const void *kISD = &kISD;
+static void vrik_pipe_note(id p, MTLRenderPipelineDescriptor *d) {
+    id<MTLFunction> f = d.vertexFunction; if (!f || !d.vertexDescriptor) return;
+    for (MTLVertexAttribute *a in f.vertexAttributes) {
+        if (![a.name isEqualToString:@"instance_skinning_data0"] || !a.active) continue;
+        MTLVertexAttributeDescriptor *A = d.vertexDescriptor.attributes[a.attributeIndex];
+        MTLVertexBufferLayoutDescriptor *L = d.vertexDescriptor.layouts[A.bufferIndex];
+        NSInteger it0 = -1;
+        for (MTLVertexAttribute *b in f.vertexAttributes) if ([b.name isEqualToString:@"instance_transform0"] && b.active && d.vertexDescriptor.attributes[b.attributeIndex].bufferIndex == A.bufferIndex) it0 = (NSInteger)d.vertexDescriptor.attributes[b.attributeIndex].offset;
+        objc_setAssociatedObject(p, kISD, @[ @(A.bufferIndex), @(A.offset), @(L.stride), @(L.stepFunction), @(L.stepRate), @(A.format), @(it0) ], OBJC_ASSOCIATION_RETAIN);
+        return;
+    }
+}
 static void render_note(id p, MTLRenderPipelineDescriptor *d, MTLRenderPipelineReflection *r, const char *how) {
     if (!p) return;
     live_tag(p, &g_rp_made, &g_rp_live, NULL, 0);
+    vrik_pipe_note(p, d);
+    if (d.vertexFunction) { id ld = objc_getAssociatedObject(d.vertexFunction, kLibData), lh = objc_getAssociatedObject(d.vertexFunction, kHash); if (ld) objc_setAssociatedObject(p, kLibData, ld, OBJC_ASSOCIATION_RETAIN); if (lh) objc_setAssociatedObject(p, kHash, lh, OBJC_ASSOCIATION_RETAIN); }
     if (is_ui_vs(d.vertexFunction)) { vxmtl_ui_pipe_add((__bridge void *)p); wui_twin(p, d, d.fragmentFunction); }
     if (vxprof_on() == 1) { id<MTLFunction> kf = d.fragmentFunction ?: d.vertexFunction; vxprof_pipe_key(p, kf ? objc_getAssociatedObject(kf, kHash) : nil, d.fragmentFunction ? 'f' : 'v'); }
     if (!g_f) return;
@@ -630,17 +648,26 @@ static void pass_begin(id e, NSString *head, int compute) {
 }
 static const char *load_s(MTLLoadAction a) { return a == MTLLoadActionClear ? "clear" : a == MTLLoadActionLoad ? "load" : "dontcare"; }
 static const char *store_s(MTLStoreAction a) { return a == MTLStoreActionStore ? "store" : a == MTLStoreActionDontCare ? "dontcare" : a == MTLStoreActionMultisampleResolve ? "resolve" : "other"; }
-static const void *kCamPass = &kCamPass;
-static void cam_pass_note(id e, MTLRenderPassDescriptor *pd) {   // (h52: the frame's first G-buffer pass: depth + 3 colour targets or more)
-    static _Atomic unsigned cframe;
-    if (!pd.depthAttachment.texture || !pd.colorAttachments[2].texture || !pd.colorAttachments[1].texture || !pd.colorAttachments[0].texture) return;
-    unsigned fr = atomic_load(&g_frame);
-    if (atomic_exchange(&cframe, fr) == fr) return;
-    objc_setAssociatedObject(e, kCamPass, @1, OBJC_ASSOCIATION_RETAIN);
+static const void *kEncVM = &kEncVM;
+@interface VXEncVM : NSObject { @public int vp_fg, draw_idx; id<MTLBuffer> original, vb0; NSUInteger offset, vb0_off, vb0_stride; NSData *bytes; id pipe; int had_fg, cam_ok; float cam_m[16], cam_tx, cam_ty; __strong id vbuf[31]; NSUInteger voff[31], vst[31]; NSMutableDictionary *vbytes; }
+@end
+@implementation VXEncVM
+@end
+static atomic_uint g_vm_last_frame;
+int vxpipe_viewmodel_active(void) {
+    unsigned last = atomic_load(&g_vm_last_frame), now = atomic_load(&g_frame);
+    return last && now - last <= 2;
 }
-void vxpipe_enc_clear(id e) { if (objc_getAssociatedObject(e, kCamPass)) objc_setAssociatedObject(e, kCamPass, nil, OBJC_ASSOCIATION_ASSIGN); }   // (h64: vxmtl's enc_clear)
+static const void *kCamPass = &kCamPass;
+static _Atomic unsigned g_cframe;
+static void cam_pass_note(id e, MTLRenderPassDescriptor *pd) {   // (h52: the frame's first G-buffer pass: depth + 3 colour targets or more)
+    if (!pd.depthAttachment.texture || !pd.colorAttachments[2].texture || !pd.colorAttachments[1].texture || !pd.colorAttachments[0].texture) return;
+    if (atomic_load(&g_cframe) == atomic_load(&g_frame)) return;
+    objc_setAssociatedObject(e, kCamPass, @((int)pd.depthAttachment.loadAction + 1), OBJC_ASSOCIATION_RETAIN);
+}
+void vxpipe_enc_clear(id e) { objc_setAssociatedObject(e, kCamPass, nil, OBJC_ASSOCIATION_ASSIGN); objc_setAssociatedObject(e, kEncVM, nil, OBJC_ASSOCIATION_ASSIGN); }   // (h64: vxmtl's enc_clear)
 void vxpipe_render_begin(id e, MTLRenderPassDescriptor *pd) {
-    if (e) cam_pass_note(e, pd);
+    if (e) { cam_pass_note(e, pd); if (pd.depthAttachment.texture.width >= 1024) objc_setAssociatedObject(e, kEncVM, [VXEncVM new], OBJC_ASSOCIATION_RETAIN); }
     if (!g_f || !e || !atomic_load(&g_dump)) return;
     NSMutableString *h = [NSMutableString string];
     for (int i = 0; i < 8; i++) {
@@ -674,7 +701,17 @@ static void pass_end(id e) {
     out("%s #%u f%u label=%s%s | pipes%s | reads%s", r.compute ? "CPASS" : "RPASS", r.n, r.frame, s8(lab), r.head.UTF8String,
         r.pipes.length ? r.pipes.UTF8String : " -", r.reads.length ? r.reads.UTF8String : " -");
 }
-void vxpipe_render_end(id e) { if (g_f) pass_end(e); }
+static void cam_commit(const float m[16], float tx, float ty);
+void vxpipe_render_end(id e) {
+    VXEncVM *vm = e ? objc_getAssociatedObject(e, kEncVM) : nil;
+    if (vm && vm->cam_ok && !vm->had_fg) {
+        unsigned fr = atomic_load(&g_frame);
+        if (atomic_exchange(&g_cframe, fr) != fr) cam_commit(vm->cam_m, vm->cam_tx, vm->cam_ty);
+    } else if (vm && vm->cam_ok && atomic_load(&g_frame) - atomic_load(&g_cframe) > 3) {   // (no world-only encoder lately: the view still, not the foreground's projection)
+        atomic_store(&g_cframe, atomic_load(&g_frame)); cam_commit(vm->cam_m, 0, 0);
+    } else if (vm && vm->cam_ok) { static atomic_uint n; if (atomic_fetch_add(&n, 1) < 10) vxmac_log("Metal: a foreground encoder's camera skipped (fov %.1f)", 2 * atanf(vm->cam_tx) * 57.2958f); }
+    if (g_f) pass_end(e);
+}
 
 // ---- (h51) the scene's constants for the camera (dumped frames only) ------------------------------------------------
 // The converted shaders (Metal shader converter) read their root signature from the top-level argument buffer, bound
@@ -777,15 +814,15 @@ static float g_gcam[16], g_gtan[2]; static uint64_t g_gcam_seq; static unsigned 
 //  at the wrong rate and stretched on each turn. Now the frame's own tangents, every frame (sprint / zoom change them))
 int vxmtl_game_tan(float *tx, float *ty) { pthread_mutex_lock(&g_gcl); int ok = g_gtan[0] > 0; if (ok) { *tx = g_gtan[0]; *ty = g_gtan[1]; } pthread_mutex_unlock(&g_gcl); return ok; }
 uint64_t vxmtl_game_camera(float m[16]) { pthread_mutex_lock(&g_gcl); uint64_t q = g_gcam_seq; if (q) memcpy(m, g_gcam, sizeof g_gcam); pthread_mutex_unlock(&g_gcl); return q; }
-static void cam_read(const uint8_t *tl, size_t n) {
+static int cam_parse(const uint8_t *tl, size_t n, float m[16], float *otx, float *oty) {
     static int on = -1; if (on < 0) { const char *v = getenv("VXMAC_GAME_CAM"); on = !(v && !strcmp(v, "0")); }
-    if (!on || !tl || n < 8) return;
+    if (!on || !tl || n < 8) return 0;
     // (the place, 2.3.2's by default: top-level word 0, table byte 24, matrix byte 320; VXMAC_CAM_PATH=<word>:<table
     //  byte>:<matrix byte> for another build (tools/cbv_find.py prints it))
     static unsigned qw = 0, tb = 24, mb = 320; static dispatch_once_t once;
     dispatch_once(&once, ^{ const char *e = getenv("VXMAC_CAM_PATH"); if (e && sscanf(e, "%u:%u:%u", &qw, &tb, &mb) == 3) vxmac_log("Metal: the camera's place from VXMAC_CAM_PATH: %u:%u:%u", qw, tb, mb); });
-    if (n < (qw + 1) * 8) return;
-    float m[16]; int ok = 0;
+    if (n < (qw + 1) * 8) return 0;
+    int ok = 0; *otx = 0; *oty = 0;
     pthread_mutex_lock(&g_brl);
     uint64_t v; memcpy(&v, tl + qw * 8, 8);
     uint64_t av, base; const uint8_t *d = buf_at(v, &av, &base);
@@ -794,10 +831,12 @@ static void cam_read(const uint8_t *tl, size_t n) {
         const uint8_t *c = buf_at(v2, &av, &base);
         if (c && av >= mb + 64) { memcpy(m, c + mb, 64); ok = 1; }
         if (c && av >= 192 && mb == 320) {   // (2.3.2 / 2.5.0's layout: the projection at byte 128)
-            float p0, p5; memcpy(&p0, c + 128, 4); memcpy(&p5, c + 148, 4);
+            float proj[16]; memcpy(proj, c + 128, sizeof proj);
+            static atomic_uint matrices_logged; unsigned mi = atomic_fetch_add(&matrices_logged, 1);
+            if (mi < 10) vxmac_log("Metal: camera projection P #%u: [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f]", mi + 1, proj[0], proj[1], proj[2], proj[3], proj[4], proj[5], proj[6], proj[7], proj[8], proj[9], proj[10], proj[11], proj[12], proj[13], proj[14], proj[15]);
+            float p0 = proj[0], p5 = proj[5];
             if (p0 > 0.2f && p0 < 5 && p5 > 0.2f && p5 < 8) {
-                pthread_mutex_lock(&g_gcl); float o = g_gtan[0]; g_gtan[0] = 1 / p0; g_gtan[1] = 1 / p5; pthread_mutex_unlock(&g_gcl);
-                if (fabsf(o - 1 / p0) > 0.01f) vxmac_log("Metal: the game's projection: horizontal %.1f deg, vertical %.1f deg", 2 * atanf(1 / p0) * 57.2958f, 2 * atanf(1 / p5) * 57.2958f);
+                *otx = 1 / p0; *oty = 1 / p5;
             }
         }
     }
@@ -808,10 +847,280 @@ static void cam_read(const uint8_t *tl, size_t n) {
         if (ok && fabsf(m[4]*m[8] + m[5]*m[9] + m[6]*m[10]) > 0.02f) ok = 0;
         if (ok && fabsf(m[15] - 1) > 1e-3f) ok = 0;
     }
-    if (!ok) { if (g_gcam_bad++ < 10) vxmac_log("Metal: the game's camera: no rotation at the known place this frame (%lu)", g_gcam_bad); return; }
-    pthread_mutex_lock(&g_gcl); memcpy(g_gcam, m, sizeof m); g_gcam_seq++; uint64_t q = g_gcam_seq; pthread_mutex_unlock(&g_gcl);
-    if (q == 1) vxmac_log("Metal: the game's camera read from its view constants (forward %.3f %.3f %.3f)", m[8], m[9], m[10]);
+    if (!ok) { if (g_gcam_bad++ < 10) vxmac_log("Metal: the game's camera: no rotation at the known place this frame (%lu)", g_gcam_bad); return 0; }
+    return 1;
 }
+// (the world's camera, committed once a frame: the view always, the tangents when the constants had a projection)
+static void cam_commit(const float m[16], float tx, float ty) {
+    pthread_mutex_lock(&g_gcl); memcpy(g_gcam, m, 64); g_gcam_seq++; uint64_t q = g_gcam_seq; float o = g_gtan[0]; if (tx > 0) { g_gtan[0] = tx; g_gtan[1] = ty; } pthread_mutex_unlock(&g_gcl);
+    if (q == 1) vxmac_log("Metal: the game's camera read from its view constants (forward %.3f %.3f %.3f)", m[8], m[9], m[10]);
+    if (tx > 0 && fabsf(o - tx) > 0.01f) vxmac_log("Metal: the game's projection: horizontal %.1f deg, vertical %.1f deg (f%u)", 2 * atanf(tx) * 57.2958f, 2 * atanf(ty) * 57.2958f, atomic_load(&g_frame));
+}
+static void vm_mul(float out[16], const float a[16], const float b[16]) {
+    float t[16];
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) {
+        t[r*4+c] = 0; for (int k = 0; k < 4; k++) t[r*4+c] += a[r*4+k] * b[k*4+c];
+    }
+    memcpy(out, t, sizeof t);
+}
+// ---- (VRIK step 1) find V's bone palette in the foreground (hands / weapon) draws ----------------------------------
+// A skinned draw's vertex stage reads its bones as an array of 3x4 (48 bytes) or 4x4 (64 bytes) matrices whose 3x3 parts
+// are rotations. For the first draws of the foreground pass (every 600 frames) every address in the top-level buffer and
+// one level below (descriptor tables) is followed, and each run of 4 or more consecutive rotation matrices is logged:
+// "VRIK palette draw#d path tl.qW[.tK] +off stride S bones N vb0stride V" - where to write the solved arm bones.
+static int vrik_isrot(const float *m, int stride_f) {
+    (void)stride_f;
+    for (int r = 0; r < 3; r++) { float l = m[r*4]*m[r*4] + m[r*4+1]*m[r*4+1] + m[r*4+2]*m[r*4+2]; if (!isfinite(l) || fabsf(l - 1) > 0.03f) return 0; }
+    if (fabsf(m[0]*m[4] + m[1]*m[5] + m[2]*m[6]) > 0.03f) return 0;
+    if (fabsf(m[4]*m[8] + m[5]*m[9] + m[6]*m[10]) > 0.03f) return 0;
+    for (int r = 0; r < 3; r++) if (!isfinite(m[r*4+3]) || fabsf(m[r*4+3]) > 50) return 0;
+    return 1;
+}
+static int vrik_run(const uint8_t *c, size_t av, size_t o, int st) {
+    int nb = 0;
+    while (nb < 512 && o + (size_t)(nb + 1) * st <= av && vrik_isrot((const float *)(c + o + (size_t)nb * st), st / 4)) nb++;
+    return nb;
+}
+// (step 1b: the bones live in one big shared buffer the CPU rewrites each frame, the table points at its start; the
+//  draw's own place in it must be a root constant. Every 32-bit word of the draw's top-level buffer and tables that is
+//  not an address is tried as an offset (x1, x16, x48, x64) into each big buffer the draw points at)
+static void vrik_scan(int draw, const uint8_t *tl, size_t n, VXEncVM *vm) {
+    static unsigned last_frame; unsigned fr = atomic_load(&g_frame);
+    static int ndraw;
+    if (draw == 0) { if (fr - last_frame < 600 && last_frame) return; last_frame = fr; ndraw = 0; }
+    else if (last_frame != fr || ndraw >= 48) return;
+    ndraw++;
+    if (n > 512) n = 512;
+    pthread_mutex_lock(&g_brl);
+    const uint8_t *big[8]; size_t biglen[8]; char bigname[8][24]; int nbig = 0;
+    const uint8_t *src[16]; size_t srclen[16]; char srcname[16][16]; int nsrc = 0;
+    src[nsrc] = tl; srclen[nsrc] = n; snprintf(srcname[nsrc], 16, "tl"); nsrc++;
+    for (size_t q = 0; q + 8 <= n; q += 8) {
+        uint64_t v; memcpy(&v, tl + q, 8);
+        uint64_t av, base; const uint8_t *c = buf_at(v, &av, &base);
+        if (!c) continue;
+        size_t m = av < 1024 ? (size_t)av : 1024;
+        if (nsrc < 16) { src[nsrc] = c; srclen[nsrc] = m; snprintf(srcname[nsrc], 16, "q%zu", q / 8); nsrc++; }
+        for (size_t k = 0; k + 8 <= m; k += 8) {
+            uint64_t v2; memcpy(&v2, c + k, 8);
+            uint64_t av2, b2; const uint8_t *c2 = buf_at(v2, &av2, &b2);
+            if (!c2 || av2 < (1u << 20)) continue;
+            int dup = 0; for (int i = 0; i < nbig; i++) if (big[i] == c2) dup = 1;
+            if (!dup && nbig < 8) { big[nbig] = c2; biglen[nbig] = (size_t)(av2 > (64u << 20) ? (64u << 20) : av2); snprintf(bigname[nbig], 24, "q%zu.t%zu+%llx", q / 8, k, (unsigned long long)(v2 - b2)); nbig++; }
+        }
+    }
+    char line[1024]; int ln = snprintf(line, sizeof line, "VRIK draw#%d f%u tl:", draw, fr);
+    for (size_t q = 0; q + 4 <= 64 && q + 4 <= n; q += 4) { uint32_t w; memcpy(&w, tl + q, 4); ln += snprintf(line + ln, sizeof line - ln, " %08x", w); }
+    vxmac_log("%s", line);
+    static const int muls[4] = { 1, 16, 48, 64 };
+    int hits = 0;
+    for (int si = 0; si < nsrc && hits < 12; si++) for (size_t q = 0; q + 4 <= srclen[si] && hits < 12; q += 4) {
+        uint32_t w; memcpy(&w, src[si] + q, 4);
+        if (w < 1 || w > (64u << 20)) continue;
+        for (int bi = 0; bi < nbig; bi++) for (int mi = 0; mi < 4; mi++) {
+            size_t o = (size_t)w * muls[mi]; if (o & 15) continue; if (o + 48 * 8 > biglen[bi]) continue;
+            for (int st = 48; st <= 64; st += 16) {
+                int nb = vrik_run(big[bi], biglen[bi], o, st);
+                if (nb >= 8) {
+                    const float *f = (const float *)(big[bi] + o);
+                    vxmac_log("VRIK bones draw#%d %s+%zu=%u x%d -> %s @%zu stride %d bones %d t0=%.3f %.3f %.3f", draw, srcname[si], q, w, muls[mi], bigname[bi], o, st, nb, f[3], f[7], f[11]);
+                    hits++;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_brl);
+}
+// (VRIK step 2: each skinned foreground draw's bones - the draw's skinning data, the bone buffer the shader reads
+//  (top-level +48 -> table entry 2 (24-byte entries) -> its address), the bones' translations. Every 600 frames, the
+//  foreground draws of one frame)
+// (VRIK step 3: the raw bones of each skinned foreground mesh every 20 frames for 3000 frames - their joints are solved
+//  offline from many poses: two bones meeting at a joint j move it alike, S_a j = S_b j)
+static void vrik_dump(VXEncVM *vm, NSArray *isd_i, NSUInteger count, NSUInteger bi, id ib, NSUInteger io) {
+    static unsigned first, lastf; static NSMutableSet *seen; unsigned fr = atomic_load(&g_frame);
+    if (!first) first = fr;
+    if (fr - first > 9000 || fr % 30) return;
+    if (fr != lastf) { lastf = fr; seen = [NSMutableSet set]; }
+    NSString *key = [NSString stringWithFormat:@"%@:%p:%lu:%lu", objc_getAssociatedObject(vm->pipe, kHash), (__bridge void *)ib, (unsigned long)io, (unsigned long)count];
+    if ([seen containsObject:key] || seen.count >= 4) return;
+    [seen addObject:key];
+    NSUInteger bidx = [isd_i[0] unsignedIntegerValue], aoff = [isd_i[1] unsignedIntegerValue], lst = [isd_i[2] unsignedIntegerValue], step = [isd_i[3] unsignedIntegerValue], rate = [isd_i[4] unsignedIntegerValue]; NSInteger it0 = [isd_i[6] integerValue];
+    if (lst == MTLBufferLayoutStrideDynamic && bidx < 31) lst = vm->vst[bidx];
+    NSUInteger el = step == MTLVertexStepFunctionPerInstance ? bi / (rate ? rate : 1) : 0;
+    const uint8_t *ip = NULL; size_t ia = 0;
+    NSData *bd = bidx < 31 ? vm->vbytes[@(bidx)] : nil;
+    if (bd) { ip = bd.bytes; ia = bd.length; } else if (bidx < 31 && vm->vbuf[bidx]) { id<MTLBuffer> b = vm->vbuf[bidx]; if (b.storageMode == MTLStorageModeShared && vm->voff[bidx] < b.length) { ip = (const uint8_t *)b.contents + vm->voff[bidx]; ia = b.length - vm->voff[bidx]; } }
+    if (!ip || el * lst + aoff + 16 > ia) return;
+    uint32_t isd[4]; memcpy(isd, ip + el * lst + aoff, 16);
+    float itf[12] = {0}; if (it0 >= 0 && el * lst + (size_t)it0 + 48 <= ia) memcpy(itf, ip + el * lst + it0, 48);
+    const uint8_t *tl = NULL; size_t n = 0;
+    if (vm->bytes) { tl = vm->bytes.bytes; n = vm->bytes.length; }
+    else if (vm->original && vm->original.storageMode == MTLStorageModeShared && vm->offset < vm->original.length) { tl = (const uint8_t *)vm->original.contents + vm->offset; n = vm->original.length - vm->offset; }
+    if (!tl || n < 56 || isd[1] != 48) return;
+    float view[16]; vxmtl_game_camera(view);
+    pthread_mutex_lock(&g_brl);
+    uint64_t ta; memcpy(&ta, tl + 48, 8); uint64_t av, base; const uint8_t *t = buf_at(ta, &av, &base); const uint8_t *bb = NULL;
+    if (t && av >= 72) { uint64_t ba; memcpy(&ba, t + 48, 8); bb = buf_at(ba, &av, &base); }
+    int nb = 0, nrot = 0;   // (bones until clearly not a transform - twist / scale bones are not pure rotations)
+    if (bb) while (nb < 96 && (uint64_t)isd[0] + (uint64_t)(nb + 1) * 48 <= av) {
+        const float *f = (const float *)(bb + isd[0] + (size_t)nb * 48); int ok = 1;
+        for (int k = 0; k < 12; k++) if (!isfinite(f[k]) || fabsf(f[k]) > 100) ok = 0;
+        float l0 = f[0]*f[0] + f[1]*f[1] + f[2]*f[2]; if (l0 < 0.25f || l0 > 4) ok = 0;
+        if (!ok) break;
+        if (vrik_isrot(f, 4)) nrot++;
+        nb++;
+    }
+    // (binary, to Documents/vrik_bones.bin - a log line holds 1 KB: 'VRK3', frame, key hash, nb, itf[12], view[16], bones[nb][12])
+    if (nb >= 4 && nrot * 2 >= nb) {
+        static FILE *bf; static pthread_mutex_t bl = PTHREAD_MUTEX_INITIALIZER; static long written;
+        pthread_mutex_lock(&bl);
+        if (!bf) { NSString *pth = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"vrik_bones.bin"]; bf = fopen(pth.fileSystemRepresentation, "wb"); }
+        if (bf && written < (64L << 20)) {
+            uint32_t hdr[4] = { 0x334b5256u, fr, 0, (uint32_t)nb }; uint64_t kh = fnv(key.UTF8String, strlen(key.UTF8String), 0xcbf29ce484222325ULL);
+            fwrite(hdr, 4, 2, bf); fwrite(&kh, 8, 1, bf); fwrite(&hdr[3], 4, 1, bf); fwrite(itf, 4, 12, bf); fwrite(view, 4, 16, bf); fwrite(bb + isd[0], 48, nb, bf);
+            written += 16 + 4 + 112 + nb * 48; fflush(bf);
+        }
+        pthread_mutex_unlock(&bl);
+    }
+    pthread_mutex_unlock(&g_brl);
+}
+static void vrik_draw_(id e, NSUInteger count, NSUInteger inst, NSUInteger bi, id ib, NSUInteger io);
+#include "vrik.inc"   // (V's arms by the player's hands: two-bone IK on the bone buffer)
+// (the VRIK diagnostics: off unless VXMAC_VRIK_DIAG=1 - their dumps made the app be killed on the headset)
+static int vrik_diag(void) { static int on = -1; if (on < 0) { const char *v = getenv("VXMAC_VRIK_DIAG"); on = v && !strcmp(v, "1"); } return on; }
+static void vrik_draw(id e, NSUInteger count, NSUInteger inst, NSUInteger bi, id ib, NSUInteger io) { @autoreleasepool { vrik_apply(e, count, bi, ib, io); } if (!vrik_diag()) return; @autoreleasepool { vrik_draw_(e, count, inst, bi, ib, io); } }
+static void vrik_draw_(id e, NSUInteger count, NSUInteger inst, NSUInteger bi, id ib, NSUInteger io) {
+    VXEncVM *vm = objc_getAssociatedObject(e, kEncVM);
+    if (!vm || !vm->vp_fg || !vm->pipe) return;
+    @autoreleasepool { NSArray *isd_d = objc_getAssociatedObject(vm->pipe, kISD); if (isd_d) vrik_dump(vm, isd_d, count, bi, ib, io); }
+    static unsigned sframe; static int nd; unsigned fr = atomic_load(&g_frame);
+    if (fr != sframe) { if (fr - sframe < 600 && sframe) return; sframe = fr; nd = 0; }
+    if (nd >= 40) return;
+    nd++;
+    NSArray *isd_i = objc_getAssociatedObject(vm->pipe, kISD);
+    NSString *h = objc_getAssociatedObject(vm->pipe, kHash);
+    if (!isd_i) { vxmac_log("VRIK2 f%u draw count %lu inst %lu vs %s: not skinned", fr, (unsigned long)count, (unsigned long)inst, h.UTF8String ?: "-"); return; }
+    NSUInteger bidx = [isd_i[0] unsignedIntegerValue], aoff = [isd_i[1] unsignedIntegerValue], lst = [isd_i[2] unsignedIntegerValue], step = [isd_i[3] unsignedIntegerValue], rate = [isd_i[4] unsignedIntegerValue];
+    if (lst == MTLBufferLayoutStrideDynamic && bidx < 31) lst = vm->vst[bidx];
+    NSUInteger el = step == MTLVertexStepFunctionPerInstance ? bi / (rate ? rate : 1) : 0;
+    uint32_t isd[4] = {0}; int have = 0;
+    NSData *bd = bidx < 31 ? vm->vbytes[@(bidx)] : nil;
+    if (bd) { size_t o = el * lst + aoff; if (o + 16 <= bd.length) { memcpy(isd, (const uint8_t *)bd.bytes + o, 16); have = 1; } }
+    else if (bidx < 31 && vm->vbuf[bidx]) { id<MTLBuffer> b = vm->vbuf[bidx]; size_t o = vm->voff[bidx] + el * lst + aoff; if (b.storageMode == MTLStorageModeShared && o + 16 <= b.length) { memcpy(isd, (const uint8_t *)b.contents + o, 16); have = 1; } }
+    const uint8_t *tl = NULL; size_t n = 0;
+    if (vm->bytes) { tl = vm->bytes.bytes; n = vm->bytes.length; }
+    else if (vm->original && vm->original.storageMode == MTLStorageModeShared && vm->offset < vm->original.length) { tl = (const uint8_t *)vm->original.contents + vm->offset; n = vm->original.length - vm->offset; }
+    char line[1400]; int ln = snprintf(line, sizeof line, "VRIK2 f%u draw count %lu inst %lu bi %lu vs %s isd buf%lu+%lu stride %lu step %lu: %s %u %u %u %u",
+        fr, (unsigned long)count, (unsigned long)inst, (unsigned long)bi, h.UTF8String ?: "-", (unsigned long)bidx, (unsigned long)aoff, (unsigned long)lst, (unsigned long)step, have ? "isd" : "no isd", isd[0], isd[1], isd[2], isd[3]);
+    if (have && tl && n >= 56) {
+        pthread_mutex_lock(&g_brl);
+        uint64_t ta; memcpy(&ta, tl + 48, 8); uint64_t av, base; const uint8_t *t = buf_at(ta, &av, &base);
+        if (t && av >= 72) {
+            uint64_t ba; memcpy(&ba, t + 48, 8); const uint8_t *bb = buf_at(ba, &av, &base);
+            ln += snprintf(line + ln, sizeof line - ln, " bonebuf %llx(+%llx len %llu)", (unsigned long long)ba, (unsigned long long)(ba - base), (unsigned long long)av);
+            if (bb && isd[1] >= 48 && isd[1] <= 256) {
+                int nb = 0; while (nb < 128 && (uint64_t)isd[0] + (uint64_t)(nb + 1) * isd[1] <= av && vrik_isrot((const float *)(bb + isd[0] + (size_t)nb * isd[1]), 4)) nb++;
+                ln += snprintf(line + ln, sizeof line - ln, " rot %d t:", nb);
+                for (int i = 0; i < 48 && (uint64_t)isd[0] + (uint64_t)(i + 1) * isd[1] <= av && ln < (int)sizeof line - 40; i++) { const float *f = (const float *)(bb + isd[0] + (size_t)i * isd[1]); ln += snprintf(line + ln, sizeof line - ln, " %d(%.2f,%.2f,%.2f)", i, f[3], f[7], f[11]); }
+            }
+        } else ln += snprintf(line + ln, sizeof line - ln, " no table");
+        pthread_mutex_unlock(&g_brl);
+    }
+    vxmac_log("%s", line);
+}
+static int vrik_on(void);
+static void vm_bind(id e, VXEncVM *vm) {
+    if (!vm || !vm->vp_fg) return;
+    if (vrik_on()) return;   // (VRIK moves the arms' bones themselves: no whole-viewmodel offset)
+    const uint8_t *tl = NULL; size_t n = 0;
+    if (vm->bytes) { tl = vm->bytes.bytes; n = vm->bytes.length; }
+    else if (vm->original && vm->original.storageMode == MTLStorageModeShared && vm->offset < vm->original.length) {
+        tl = (const uint8_t *)vm->original.contents + vm->offset; n = vm->original.length - vm->offset;
+    }
+    if (!tl || n < 8) return;
+    if (vrik_diag()) vrik_scan(vm->draw_idx, tl, n, vm);
+    if (vrik_diag() && vm->pipe) {   // (VRIK: each foreground vertex shader once, to Documents/vxvs/<hash>.metallib - how it reads its bones)
+        static NSMutableSet *done; static pthread_mutex_t dl = PTHREAD_MUTEX_INITIALIZER;
+        NSString *h = objc_getAssociatedObject(vm->pipe, kHash); id ld = objc_getAssociatedObject(vm->pipe, kLibData);
+        pthread_mutex_lock(&dl); if (!done) done = [NSMutableSet set];
+        int fresh = h && ![done containsObject:h] && done.count < 64; if (fresh) [done addObject:h]; pthread_mutex_unlock(&dl);
+        if (fresh) {
+            NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"vxvs"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+            int ok = 0;
+            if (ld) { NSData *nd = (NSData *)ld; ok = [nd writeToFile:[dir stringByAppendingPathComponent:[h stringByAppendingString:@".metallib"]] atomically:NO]; }
+            vxmac_log("VRIK vs draw#%d f%u hash %s bytes %s", vm->draw_idx, atomic_load(&g_frame), h.UTF8String, ok ? "saved" : (ld ? "write failed" : "not kept"));
+        }
+    }
+    static int (*poses)(float *, float *, float *, float *, int *);
+    static int (*pose)(float *, float *);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        poses = dlsym(RTLD_DEFAULT, "vx_xros_vr_viewmodel_poses");
+        pose = dlsym(RTLD_DEFAULT, "vx_xros_vr_viewmodel_pose");
+    });
+    float g_delta[3]={0}, g_rot[3]={0}, o_delta[3]={0}, o_rot[3]={0}; int off_ok = 0;
+    int side = poses ? poses(g_delta, g_rot, o_delta, o_rot, &off_ok) : (pose ? pose(g_delta, g_rot) : 0);
+    if (!side) return;
+    int cur_draw = vm->draw_idx++;
+    // Keep each draw's argument data alive until the command buffer has completed.
+    id<MTLBuffer> shadow = [[e device] newBufferWithLength:16384 options:MTLResourceStorageModeShared];
+    if (!shadow) return;
+    uint8_t *dst = shadow.contents, *table = dst + 4096, *constants = dst + 8192;
+    memset(dst, 0, 16384); memcpy(dst, tl, n < 4096 ? n : 4096);
+    uint64_t addr, av, base; memcpy(&addr, tl, 8);
+    pthread_mutex_lock(&g_brl);
+    const uint8_t *d = buf_at(addr, &av, &base); int ok = d && av >= 32;
+    size_t tbl_len = (ok && av < 4096) ? (size_t)av : 4096;
+    if (ok) { memcpy(table, d, tbl_len); memcpy(&addr, d + 24, 8); const uint8_t *c = buf_at(addr, &av, &base); ok = c && av >= 512; if (ok) memcpy(constants, c, av < 2048 ? (size_t)av : 2048); }
+    pthread_mutex_unlock(&g_brl);
+    if (!ok) return;
+    float p[16], v[16]; memcpy(p, constants + 128, 64); memcpy(v, constants + 320, 64);
+    for (int r = 0; r < 3; r++) { float l = 0; for (int c = 0; c < 3; c++) l += v[r*4+c]*v[r*4+c]; if (!(fabsf(l-1) < .02f)) return; }
+    if (fabsf(v[15] - 1) > .001f || !isfinite(p[0]) || fabsf(p[0]) < .2f) return;
+    // Single consistent transform across all foreground pass draws so the weapon and hands never vibrate or tear apart across sub-meshes
+    const float *delta = g_delta;
+    const float *rot = g_rot;
+    float piv_side = (float)side;
+    float yaw=fmaxf(-.75f,fminf(.75f,rot[0]));
+    float pitch=fmaxf(-.55f,fminf(.55f,-rot[1]));
+    float roll=fmaxf(-.55f,fminf(.55f,-rot[2]));
+    float sh_delta[3]={
+        fmaxf(-.24f,fminf(.24f,delta[0])),
+        fmaxf(-.20f,fminf(.20f,delta[1])),
+        fmaxf(-.16f,fminf(.18f,delta[2]))
+    };
+    float cy=cosf(yaw), sy=sinf(yaw), cp=cosf(pitch), sp=sinf(pitch), cr=cosf(roll), sr=sinf(roll);
+    float ry[16]={cy,0,sy,0, 0,1,0,0, -sy,0,cy,0, 0,0,0,1};
+    float rx[16]={1,0,0,0, 0,cp,-sp,0, 0,sp,cp,0, 0,0,0,1};
+    float rz[16]={cr,-sr,0,0, sr,cr,0,0, 0,0,1,0, 0,0,0,1};
+    float m[16], tmp[16], pivot[3]={piv_side < 0 ? -.14f : .14f, -.16f, .28f};
+    vm_mul(tmp, rx, ry); vm_mul(m, rz, tmp);
+    for (int r=0;r<3;r++) m[r*4+3] = pivot[r] + sh_delta[r] - (m[r*4]*pivot[0]+m[r*4+1]*pivot[1]+m[r*4+2]*pivot[2]);
+    for (int i=0;i<2;i++) { memcpy(v, constants + 320 + i*64, 64); vm_mul(v,m,v); memcpy(constants + 320 + i*64,v,64); vm_mul(tmp,p,v); memcpy(constants + (i ? 448 : 0),tmp,64); memcpy(constants + (i ? 256 : 192),tmp,64); }
+    addr = shadow.gpuAddress + 4096; memcpy(dst,&addr,8); addr = shadow.gpuAddress + 8192; memcpy(table+24,&addr,8);
+    [e useResource:shadow usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+    o_svb2(e, @selector(setVertexBuffer:offset:atIndex:), shadow, 0, 2);
+    atomic_store(&g_vm_last_frame, atomic_load(&g_frame));
+    static atomic_uint logged; unsigned lg = atomic_fetch_add(&logged,1);
+    if (lg < 12 || (lg % 300 == 0 && (fabsf(delta[0]) > .02f || fabsf(rot[0]) > .08f || fabsf(rot[2]) > .08f)))
+        vxmac_log("Metal: 3D viewmodel CBV draw#%d (dx=%.3f dy=%.3f dz=%.3f yaw=%.2f pitch=%.2f roll=%.2f)",cur_draw,delta[0],delta[1],delta[2],yaw,pitch,roll);
+}
+typedef void (*vm_vp_imp)(id, SEL, MTLViewport);
+static vm_vp_imp o_vm_vp;
+static void vm_viewport(id e, MTLViewport v) {
+    VXEncVM *vm = objc_getAssociatedObject(e,kEncVM); if (!vm) return;
+    static atomic_uint logged;
+    if (!((fabs(v.znear)<1e-4 && fabs(v.zfar-1)<1e-4) || (fabs(v.znear-1)<1e-4 && fabs(v.zfar)<1e-4)) && atomic_fetch_add(&logged,1)<12)
+        vxmac_log("Metal: scene viewport znear=%.4f zfar=%.4f",v.znear,v.zfar);
+    int fg = fabs(v.zfar-v.znear)<=.25 && ((v.znear>=.8 && v.znear<=1) || (v.zfar>=.8 && v.zfar<=1 && v.znear>.01));
+    if (fg) vm->had_fg = 1;
+    if (fg != vm->vp_fg) { vm->vp_fg=fg; if (fg) vm->draw_idx=0; if (vm->original) o_svb2(e,@selector(setVertexBuffer:offset:atIndex:),vm->original,vm->offset,2); else if (vm->bytes) o_svy2(e,@selector(setVertexBytes:length:atIndex:),vm->bytes.bytes,vm->bytes.length,2); vm_bind(e,vm); }
+}
+typedef void (*vm_vps_imp)(id, SEL, const MTLViewport *, NSUInteger);
+static vm_vps_imp o_vm_vps;
+static void h_vm_vp(id e, SEL s, MTLViewport v) { o_vm_vp(e, s, v); vm_viewport(e, v); }
+static void h_vm_vps(id e, SEL s, const MTLViewport *v, NSUInteger n) { o_vm_vps(e, s, v, n); if (v && n) vm_viewport(e, v[0]); }
 static void ui_bind(id e, int stage, id buf, NSUInteger off, NSUInteger idx, const void *bytes, NSUInteger len, int offonly) {
     VXPassRec *r = g_f ? rec(e) : nil;
     if (!r || !r.ui || stage) return;
@@ -822,11 +1131,47 @@ static void ui_bind(id e, int stage, id buf, NSUInteger off, NSUInteger idx, con
 }
 static void tl_note(id e, int stage, id buf, NSUInteger off, NSUInteger idx, const void *bytes, NSUInteger len, int offonly) {
     ui_bind(e, stage, buf, off, idx, bytes, len, offonly);
+    if (stage == 0 && idx < 31) {
+        VXEncVM *vm = objc_getAssociatedObject(e, kEncVM);
+        if (vm) {
+            if (bytes) { if (!vm->vbytes) vm->vbytes = [NSMutableDictionary dictionary]; vm->vbytes[@(idx)] = [NSData dataWithBytes:bytes length:len < 65536 ? len : 65536]; vm->vbuf[idx] = nil; vm->voff[idx] = 0; }
+            else if (offonly) vm->voff[idx] = off;
+            else { vm->vbuf[idx] = buf; vm->voff[idx] = off; [vm->vbytes removeObjectForKey:@(idx)]; }
+        }
+    }
+    if (stage == 0 && idx == 0) {
+        VXEncVM *vm = objc_getAssociatedObject(e, kEncVM);
+        if (vm) {
+            if (offonly) vm->vb0_off = off;
+            else if (buf) { vm->vb0 = buf; vm->vb0_off = off; }
+        }
+    }
     if (idx != 2) return;
+    // (the camera first, from the game's own unmodified binding, and never from the foreground (hands / weapon) pass:
+    //  its fixed 105 deg projection alternated with the world's 84 deg while aiming - the whole frame shook)
+    // (the camera from the game's own unmodified binding. A frame's G-buffer is drawn by several parallel encoders, on
+    //  several threads: the one with the hands / weapon (the foreground depth range) carries a projection of its own (105 deg
+    //  while the world's is 84 deg aiming) - the frame shook as either won the race. Each encoder's first reading is kept
+    //  with it; at its end it is committed only when the encoder drew nothing in the foreground range, once a frame)
     if (stage == 0 && objc_getAssociatedObject(e, kCamPass)) {
         objc_setAssociatedObject(e, kCamPass, nil, OBJC_ASSOCIATION_RETAIN);
-        if (bytes) cam_read(bytes, len);
-        else if (buf && !offonly) { id<MTLBuffer> b = buf; if (b.storageMode == MTLStorageModeShared && off + 8 <= b.length) cam_read((const uint8_t *)b.contents + off, b.length - off); }
+        VXEncVM *cvm = objc_getAssociatedObject(e, kEncVM);
+        float m[16], tx, ty; int got = 0;
+        if (bytes) got = cam_parse(bytes, len, m, &tx, &ty);
+        else if (buf && !offonly) { id<MTLBuffer> b = buf; if (b.storageMode == MTLStorageModeShared && off + 8 <= b.length) got = cam_parse((const uint8_t *)b.contents + off, b.length - off, m, &tx, &ty); }
+        if (got) {
+            if (cvm) { memcpy(cvm->cam_m, m, 64); cvm->cam_tx = tx; cvm->cam_ty = ty; cvm->cam_ok = 1; }
+            else if (atomic_exchange(&g_cframe, atomic_load(&g_frame)) != atomic_load(&g_frame)) cam_commit(m, tx, ty);
+        }
+    }
+    if (stage == 0) {
+        VXEncVM *vm = objc_getAssociatedObject(e, kEncVM);
+        if (vm) {
+            if (bytes) { vm->bytes = [NSData dataWithBytes:bytes length:len]; vm->original = nil; }
+            else if (offonly) { vm->offset = off; }
+            else { vm->original = buf; vm->offset = off; vm->bytes = nil; }
+            vm_bind(e, vm);
+        }
     }
     if (!g_f) return;
     VXPassRec *r = rec(e);
@@ -844,7 +1189,7 @@ static void tl_note(id e, int stage, id buf, NSUInteger off, NSUInteger idx, con
 }
 static void h_svb2(id self, SEL s, id b, NSUInteger o, NSUInteger i) { o_svb2(self, s, b, o, i); tl_note(self, 0, b, o, i, NULL, 0, 0); }
 static void h_sfb2(id self, SEL s, id b, NSUInteger o, NSUInteger i) { o_sfb2(self, s, b, o, i); tl_note(self, 1, b, o, i, NULL, 0, 0); }
-static void h_svo2(id self, SEL s, NSUInteger o, NSUInteger i) { o_svo2(self, s, o, i); tl_note(self, 0, nil, o, i, NULL, 0, 1); }
+static void h_svo2(id self, SEL s, NSUInteger o, NSUInteger i) { VXEncVM *vm = i == 2 ? objc_getAssociatedObject(self, kEncVM) : nil; if (vm && vm->original) o_svb2(self, @selector(setVertexBuffer:offset:atIndex:), vm->original, o, i); else o_svo2(self, s, o, i); tl_note(self, 0, nil, o, i, NULL, 0, 1); }
 static void h_sfo2(id self, SEL s, NSUInteger o, NSUInteger i) { o_sfo2(self, s, o, i); tl_note(self, 1, nil, o, i, NULL, 0, 1); }
 static void h_svy2(id self, SEL s, const void *b, NSUInteger l, NSUInteger i) { o_svy2(self, s, b, l, i); tl_note(self, 0, nil, 0, i, b, l, 0); }
 static void h_sfy2(id self, SEL s, const void *b, NSUInteger l, NSUInteger i) { o_sfy2(self, s, b, l, i); tl_note(self, 1, nil, 0, i, b, l, 0); }
@@ -923,12 +1268,16 @@ typedef void (*sbs_imp)(id, SEL, id, NSUInteger, NSUInteger, NSUInteger);
 typedef void (*sbos_imp)(id, SEL, NSUInteger, NSUInteger, NSUInteger);
 typedef void (*sbys_imp)(id, SEL, const void *, NSUInteger, NSUInteger, NSUInteger);
 static sbs_imp o_svbs; static sbos_imp o_svos; static sbys_imp o_svys;
-static void h_svbs(id self, SEL s, id b, NSUInteger o, NSUInteger st, NSUInteger i) { o_svbs(self, s, b, o, st, i); ui_bind(self, 0, b, o, i, NULL, 0, 0); VXPassRec *r = g_f ? rec(self) : nil; if (r && r.ui) r.vb[[NSString stringWithFormat:@"s%lu", (unsigned long)i]] = @(st); }
-static void h_svos(id self, SEL s, NSUInteger o, NSUInteger st, NSUInteger i) { o_svos(self, s, o, st, i); ui_bind(self, 0, nil, o, i, NULL, 0, 1); VXPassRec *r = g_f ? rec(self) : nil; if (r && r.ui) r.vb[[NSString stringWithFormat:@"s%lu", (unsigned long)i]] = @(st); }
-static void h_svys(id self, SEL s, const void *b, NSUInteger l, NSUInteger st, NSUInteger i) { o_svys(self, s, b, l, st, i); ui_bind(self, 0, nil, 0, i, b, l, 0); VXPassRec *r = g_f ? rec(self) : nil; if (r && r.ui) r.vb[[NSString stringWithFormat:@"s%lu", (unsigned long)i]] = @(st); }
+static void h_svbs(id self, SEL s, id b, NSUInteger o, NSUInteger st, NSUInteger i) { o_svbs(self, s, b, o, st, i); if (i < 31) { VXEncVM *v = objc_getAssociatedObject(self, kEncVM); if (v) v->vst[i] = st; } if (i == 0) { VXEncVM *vm = objc_getAssociatedObject(self, kEncVM); if (vm) vm->vb0_stride = st; } tl_note(self, 0, b, o, i, NULL, 0, 0); VXPassRec *r = g_f ? rec(self) : nil; if (r && r.ui) r.vb[[NSString stringWithFormat:@"s%lu", (unsigned long)i]] = @(st); }
+static void h_svos(id self, SEL s, NSUInteger o, NSUInteger st, NSUInteger i) { if (i < 31) { VXEncVM *v = objc_getAssociatedObject(self, kEncVM); if (v) v->vst[i] = st; } VXEncVM *vm = i == 2 ? objc_getAssociatedObject(self, kEncVM) : nil; if (i == 0) { VXEncVM *v0 = objc_getAssociatedObject(self, kEncVM); if (v0) v0->vb0_stride = st; } if (vm && vm->original) o_svbs(self, @selector(setVertexBuffer:offset:attributeStride:atIndex:), vm->original, o, st, i); else o_svos(self, s, o, st, i); tl_note(self, 0, nil, o, i, NULL, 0, 1); VXPassRec *r = g_f ? rec(self) : nil; if (r && r.ui) r.vb[[NSString stringWithFormat:@"s%lu", (unsigned long)i]] = @(st); }
+static void h_svys(id self, SEL s, const void *b, NSUInteger l, NSUInteger st, NSUInteger i) { o_svys(self, s, b, l, st, i); tl_note(self, 0, nil, 0, i, b, l, 0); VXPassRec *r = g_f ? rec(self) : nil; if (r && r.ui) r.vb[[NSString stringWithFormat:@"s%lu", (unsigned long)i]] = @(st); }
 static void install_tl(Class rc) {
 #define S(c, sel, h, o) (o = (__typeof__(o))swap(c, @selector(sel), (IMP)h))
-    if (g_f) { S(rc, setVertexBuffer:offset:attributeStride:atIndex:, h_svbs, o_svbs); S(rc, setVertexBufferOffset:attributeStride:atIndex:, h_svos, o_svos); S(rc, setVertexBytes:length:attributeStride:atIndex:, h_svys, o_svys); }
+    S(rc, setVertexBuffer:offset:attributeStride:atIndex:, h_svbs, o_svbs);
+    S(rc, setVertexBufferOffset:attributeStride:atIndex:, h_svos, o_svos);
+    S(rc, setVertexBytes:length:attributeStride:atIndex:, h_svys, o_svys);
+    S(rc, setViewport:, h_vm_vp, o_vm_vp);
+    S(rc, setViewports:count:, h_vm_vps, o_vm_vps);
     S(rc, setVertexBuffer:offset:atIndex:, h_svb2, o_svb2);
     S(rc, setFragmentBuffer:offset:atIndex:, h_sfb2, o_sfb2);
     S(rc, setVertexBufferOffset:atIndex:, h_svo2, o_svo2);
@@ -959,7 +1308,7 @@ static void pipe_add(id e, id p) {
 }
 void vxmtl_ui_pipe_set(id enc, id p);   // (vxmtl.m)
 static int wui_pipe(id e, id p, id *use);
-static void h_rps(id self, SEL s, id p) { id use = p; if (tl_rec_any() && wui_pipe(self, p, &use)) o_rps(self, s, use); else o_rps(self, s, p); vxmtl_ui_pipe_set(self, p); if (vxprof_live) vxprof_pipe(self, p); if (g_f) { pipe_add(self, p); VXPassRec *r = rec(self); if (r && r.ui) r.curpipe = p; } }
+static void h_rps(id self, SEL s, id p) { { VXEncVM *vm = objc_getAssociatedObject(self, kEncVM); if (vm) vm->pipe = p; } id use = p; if (tl_rec_any() && wui_pipe(self, p, &use)) o_rps(self, s, use); else o_rps(self, s, p); vxmtl_ui_pipe_set(self, p); if (vxprof_live) vxprof_pipe(self, p); if (g_f) { pipe_add(self, p); VXPassRec *r = rec(self); if (r && r.ui) r.curpipe = p; } }
 static void h_rft(id self, SEL s, id t, NSUInteger i) { o_rft(self, s, t, i); rec_read(self, t, "(f)"); }
 static void h_rvt(id self, SEL s, id t, NSUInteger i) { o_rvt(self, s, t, i); rec_read(self, t, "(v)"); }
 static void h_rfts(id self, SEL s, const id __unsafe_unretained *t, NSRange r) { o_rfts(self, s, t, r); for (NSUInteger i = 0; t && i < r.length; i++) rec_read(self, t[i], "(f)"); }
@@ -1054,7 +1403,9 @@ static void wbind(NSMutableDictionary *t, NSUInteger i, id buf, NSUInteger off, 
     if (offonly) { NSArray *o = t[k]; if (o && ![o[0] isKindOfClass:[NSData class]]) t[k] = @[ o[0], @(off), @(stride ? stride : [o[2] unsignedIntegerValue]) ]; return; }
     if (buf) t[k] = @[ buf, @(off), @(stride) ]; else [t removeObjectForKey:k];
 }
+static void vrik_draw(id e, NSUInteger count, NSUInteger inst, NSUInteger bi, id ib, NSUInteger io);
 static void wdraw(id e, int kind, NSUInteger a0, NSUInteger a1, NSUInteger a2, NSUInteger inst, id ib, NSUInteger io, NSInteger base, NSUInteger bi) {
+    vrik_draw(e, kind ? a1 : a2, inst, bi, ib, io);
     VXUIRec *r = wrec(e);
     if (r && !r.segment) r.npre++;
     if (!r || r.segment || !r.pipe || r.draws.count >= 64) return;
@@ -1119,6 +1470,7 @@ typedef void (*w_h_imp)(id, SEL, id, MTLRenderStages);
 typedef void (*w_hs_imp)(id, SEL, const id __unsafe_unretained *, NSUInteger, MTLRenderStages);
 typedef void (*w_sc_imp)(id, SEL, MTLScissorRect);
 typedef void (*w_vp_imp)(id, SEL, MTLViewport);
+typedef void (*w_vps_imp)(id, SEL, const MTLViewport *, NSUInteger);
 typedef void (*w_dp_imp)(id, SEL, MTLPrimitiveType, NSUInteger, NSUInteger);
 typedef void (*w_dpi_imp)(id, SEL, MTLPrimitiveType, NSUInteger, NSUInteger, NSUInteger);
 typedef void (*w_dpib_imp)(id, SEL, MTLPrimitiveType, NSUInteger, NSUInteger, NSUInteger, NSUInteger);
@@ -1127,6 +1479,7 @@ typedef void (*w_dxi_imp)(id, SEL, MTLPrimitiveType, NSUInteger, MTLIndexType, i
 typedef void (*w_dxib_imp)(id, SEL, MTLPrimitiveType, NSUInteger, MTLIndexType, id, NSUInteger, NSUInteger, NSInteger, NSUInteger);
 static w_b_imp w_vb, w_fb; static w_bo_imp w_vbo, w_fbo; static w_by_imp w_vby, w_fby; static w_bs_imp w_vbs; static w_bos_imp w_vbos; static w_bys_imp w_vbys;
 static w_t_imp w_vt, w_ft, w_fs; static w_u_imp w_u; static w_us_imp w_us; static w_h_imp w_h; static w_hs_imp w_hs; static w_sc_imp w_sc; static w_vp_imp w_vp;
+static w_vps_imp w_vps;
 static w_dp_imp w_dp; static w_dpi_imp w_dpi; static w_dpib_imp w_dpib; static w_dx_imp w_dx; static w_dxi_imp w_dxi; static w_dxib_imp w_dxib;
 #define R_ if (tl_rec == (__bridge void *)self) { VXUIRec *r = objc_getAssociatedObject(self, kUIRec); if (r && !r.segment)
 static void wh_vb(id self, SEL s, id b, NSUInteger o, NSUInteger i) { w_vb(self, s, b, o, i); R_ wbind(r.vb, i, b, o, 0, NULL, 0, 0); } }
@@ -1147,6 +1500,7 @@ static void wh_h(id self, SEL s, id h, MTLRenderStages st) { w_h(self, s, h, st)
 static void wh_hs(id self, SEL s, const id __unsafe_unretained *h, NSUInteger n, MTLRenderStages st) { w_hs(self, s, h, n, st); R_ { for (NSUInteger i = 0; h && i < n; i++) if (h[i]) [r.heaps addObject:@[ h[i], @(st) ]]; } } }
 static void wh_sc(id self, SEL s, MTLScissorRect v) { w_sc(self, s, v); R_ r.scissor = [NSValue valueWithBytes:&v objCType:@encode(MTLScissorRect)]; } }
 static void wh_vp(id self, SEL s, MTLViewport v) { w_vp(self, s, v); R_ r.viewport = [NSValue valueWithBytes:&v objCType:@encode(MTLViewport)]; } }
+static void wh_vps(id self, SEL s, const MTLViewport *v, NSUInteger n) { w_vps(self, s, v, n); if (v && n) { R_ r.viewport = [NSValue valueWithBytes:&v[0] objCType:@encode(MTLViewport)]; } } }
 static void wh_dp(id self, SEL s, MTLPrimitiveType t, NSUInteger v, NSUInteger c) { w_dp(self, s, t, v, c); wdraw(self, 0, t, v, c, 1, nil, 0, 0, 0); }
 static void wh_dpi(id self, SEL s, MTLPrimitiveType t, NSUInteger v, NSUInteger c, NSUInteger i) { w_dpi(self, s, t, v, c, i); wdraw(self, 0, t, v, c, i, nil, 0, 0, 0); }
 static void wh_dpib(id self, SEL s, MTLPrimitiveType t, NSUInteger v, NSUInteger c, NSUInteger i, NSUInteger bi) { w_dpib(self, s, t, v, c, i, bi); wdraw(self, 0, t, v, c, i, nil, 0, 0, bi); }
@@ -1166,7 +1520,7 @@ static void install_wui(Class rc) {
     S(setVertexTexture:atIndex:, wh_vt, w_vt); S(setFragmentTexture:atIndex:, wh_ft, w_ft); S(setFragmentSamplerState:atIndex:, wh_fs, w_fs);
     S(useResource:usage:stages:, wh_u, w_u); S(useResources:count:usage:stages:, wh_us, w_us);
     S(useHeap:stages:, wh_h, w_h); S(useHeaps:count:stages:, wh_hs, w_hs);
-    S(setScissorRect:, wh_sc, w_sc); S(setViewport:, wh_vp, w_vp);
+    S(setScissorRect:, wh_sc, w_sc); S(setViewport:, wh_vp, w_vp); S(setViewports:count:, wh_vps, w_vps);
     S(drawPrimitives:vertexStart:vertexCount:, wh_dp, w_dp); S(drawPrimitives:vertexStart:vertexCount:instanceCount:, wh_dpi, w_dpi);
     S(drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:, wh_dpib, w_dpib);
     S(drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:, wh_dx, w_dx);

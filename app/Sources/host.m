@@ -197,6 +197,10 @@ void vx_xros_vr_add_camera_offset(float dyaw, float dpitch);
 enum { kCols = 160, kRows = 90 };
 static id<MTLComputePipelineState> g_prof_pso;
 static dispatch_queue_t g_prof_q;
+// A slot remains busy through CPU analysis, not just GPU completion.
+static id<MTLBuffer> g_prof_buf[4];
+static unsigned g_prof_busy;
+static pthread_mutex_t g_prof_lock = PTHREAD_MUTEX_INITIALIZER;
 static float g_prev_prof[kCols + kRows]; static int g_have_prev;
 static double g_win_start, g_win_sent, g_win_seen; static float g_last_yaw, g_last_pitch;
 static unsigned g_follow_windows; static _Atomic unsigned g_stick_frames;
@@ -229,12 +233,14 @@ int vxmac_stick_active(void) { return stick_active(); }   // (h57b: for the pres
 // (h64: the player's combat input now - bit 1 aiming (a controller's left trigger, the mouse's right button), bit 2
 //  firing (the right trigger, the mouse's left button). The presenter's detectors hold still while it is down: ADS moves
 //  the game's camera to the sights and narrows its FOV, recoil and aim assist turn it - none of it is the head's)
+static BOOL raw_btn_pressed(GCControllerButtonInput *b);
+static float raw_btn_value(GCControllerButtonInput *b);
 int vxmac_combat_input(void) {
     int r = 0;
     for (GCController *c in GCController.controllers) {
         GCExtendedGamepad *g = c.extendedGamepad; if (!g) continue;
-        if (g.leftTrigger.value > 0.2f) r |= 1;
-        if (g.rightTrigger.value > 0.2f) r |= 2;
+        if (raw_btn_value(g.leftTrigger) > 0.2f) r |= 1;
+        if (raw_btn_value(g.rightTrigger) > 0.2f) r |= 2;
     }
     GCMouseInput *mi = GCMouse.current.mouseInput;
     if (mi) { if (mi.rightButton.pressed) r |= 1; if (mi.leftButton.pressed) r |= 2; }
@@ -322,14 +328,26 @@ static void follow_encode(id<MTLCommandBuffer> cb, id<MTLTexture> t) {
         g_prof_q = dispatch_queue_create("vxmac follow", DISPATCH_QUEUE_SERIAL);
         if (!g_prof_pso) { jlog("vr_follow_error", "\"what\":\"pipeline\""); return; }
     }
-    id<MTLBuffer> b = [cb.device newBufferWithLength:(kCols + kRows) * sizeof(float) options:MTLResourceStorageModeShared];
+    pthread_mutex_lock(&g_prof_lock);
+    int slot = -1;
+    for (int i = 0; i < 4; i++) if (!(g_prof_busy & (1u << i))) { slot = i; g_prof_busy |= 1u << i; break; }
+    if (slot >= 0 && !g_prof_buf[slot])
+        g_prof_buf[slot] = [cb.device newBufferWithLength:(kCols + kRows) * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b = slot >= 0 ? g_prof_buf[slot] : nil;
+    if (slot >= 0 && !b) g_prof_busy &= ~(1u << slot);
+    pthread_mutex_unlock(&g_prof_lock);
+    if (!b) return; // The profiler must never stall presentation.
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    if (!e) { pthread_mutex_lock(&g_prof_lock); g_prof_busy &= ~(1u << slot); pthread_mutex_unlock(&g_prof_lock); return; }
     [e setComputePipelineState:g_prof_pso]; [e setTexture:t atIndex:0]; [e setBuffer:b offset:0 atIndex:0];
     [e dispatchThreads:MTLSizeMake(kCols + kRows, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     [e endEncoding];
     float yaw = vx_xros_vr_sent_yaw(), pitch = vx_xros_vr_sent_pitch(); int stick = stick_active(); uint64_t pseq = vx_xros_vr_next_seq();
     id<MTLBuffer> vm = (__bridge id<MTLBuffer>)vxmac_vel_latest_mean();
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { (void)c; dispatch_async(g_prof_q, ^{ follow_sample((const float *)b.contents, yaw, pitch, stick, vm ? (const float *)vm.contents : NULL, pseq); }); }];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { dispatch_async(g_prof_q, ^{
+        if (c.status == MTLCommandBufferStatusCompleted) follow_sample((const float *)b.contents, yaw, pitch, stick, vm ? (const float *)vm.contents : NULL, pseq);
+        pthread_mutex_lock(&g_prof_lock); g_prof_busy &= ~(1u << slot); pthread_mutex_unlock(&g_prof_lock);
+    }); }];
 }
 void vxmac_npu_frame(void *cb, void *tex, uint32_t w, uint32_t h);
 void vxmac_npu_stats(char *out, unsigned size);
@@ -407,21 +425,65 @@ static void watch_mouse(GCMouse *m) {
 // -[GCControllerAxisInput value] for the right sticks' y axes, and the handlers set on right sticks get y = 0.
 // VXMAC_STICK_PITCH=1: the stick's pitch kept.
 int vx_xros_vr_driving(void);
-static NSHashTable *g_right_y, *g_right_pads;
+static NSHashTable *g_right_y, *g_right_pads, *g_vr_btns, *g_vr_axes, *g_vr_pads;
 static _Atomic unsigned long g_stick_y_zeroed;   // (reads of the right stick's y answered 0, for the stats)
 static int stick_pitch_blocked(void) {
     static int keep = -1; if (keep < 0) { const char *e = getenv("VXMAC_STICK_PITCH"); keep = e && !strcmp(e, "1"); }
-    int vx_xros_vr_aim_mode(void);   // (h64: warp mode 7 - the gun aims with the stick: its pitch reaches the game)
-    return !keep && vx_xros_vr_driving() && !vx_xros_vr_aim_mode();
+    return !keep && vx_xros_vr_driving();
 }
 static void note_controller(GCController *c) {
-    GCExtendedGamepad *g = c.extendedGamepad; if (!g) return;
-    @synchronized (g_right_pads) { [g_right_pads addObject:g.rightThumbstick]; [g_right_y addObject:g.rightThumbstick.yAxis]; }
+    GCExtendedGamepad *g = c.extendedGamepad;
+    GCMicroGamepad *m = c.microGamepad;
+    @synchronized (g_right_pads) {
+        if (g) {
+            [g_right_pads addObject:g.rightThumbstick]; [g_right_y addObject:g.rightThumbstick.yAxis];
+            [g_vr_pads addObject:g.leftThumbstick]; [g_vr_pads addObject:g.rightThumbstick]; [g_vr_pads addObject:g.dpad];
+            for (GCControllerDirectionPad *pad in @[g.leftThumbstick, g.rightThumbstick, g.dpad]) {
+                [g_vr_axes addObject:pad.xAxis]; [g_vr_axes addObject:pad.yAxis];
+            }
+            GCControllerButtonInput *buttons[] = { g.leftShoulder, g.rightShoulder, g.leftTrigger, g.rightTrigger,
+                g.buttonA, g.buttonB, g.buttonX, g.buttonY, g.dpad.up, g.dpad.down, g.dpad.left, g.dpad.right, g.leftThumbstickButton, g.rightThumbstickButton };
+            for (unsigned i = 0; i < sizeof buttons / sizeof *buttons; i++) if (buttons[i]) [g_vr_btns addObject:buttons[i]];
+        }
+        if (m) { if (m.buttonA) [g_vr_btns addObject:m.buttonA]; if (m.buttonX) [g_vr_btns addObject:m.buttonX]; }
+    }
+}
+typedef BOOL (*btn_pressed_imp)(id, SEL);
+typedef float (*btn_value_imp)(id, SEL);
+typedef void (*btn_handler_imp)(id, SEL, id);
+static btn_pressed_imp o_btn_pressed;
+static btn_value_imp o_btn_value;
+static btn_handler_imp o_set_btn_pressed_handler, o_set_btn_value_handler;
+static int vr_buttons_blocked(void) {
+    static int block = -1; if (block < 0) { const char *e = getenv("VXMAC_BLOCK_PAD_BTNS"); block = e && !strcmp(e, "1"); }
+    return block && vx_xros_vr_driving();
+}
+static int vr_axes_blocked(void) {
+    static int block = -1; if (block < 0) { const char *e = getenv("VXMAC_BLOCK_PAD_AXES"); block = e && !strcmp(e, "1"); }
+    return block && vx_xros_vr_driving();
+}
+static BOOL blocked_btn(id b) {
+    if (!vr_buttons_blocked()) return NO;
+    BOOL blocked; @synchronized (g_right_pads) { blocked = [g_vr_btns containsObject:b]; } return blocked;
+}
+static BOOL raw_btn_pressed(GCControllerButtonInput *b) { return b && (o_btn_pressed ? o_btn_pressed(b, @selector(isPressed)) : b.pressed); }
+static float raw_btn_value(GCControllerButtonInput *b) { return b ? (o_btn_value ? o_btn_value(b, @selector(value)) : b.value) : 0; }
+static BOOL h_btn_pressed(id self, SEL s) { return blocked_btn(self) ? NO : o_btn_pressed(self, s); }
+static float h_btn_value(id self, SEL s) { return blocked_btn(self) ? 0 : o_btn_value(self, s); }
+static void h_set_btn_pressed_handler(id self, SEL s, GCControllerButtonValueChangedHandler h) {
+    if (!h) { o_set_btn_pressed_handler(self, s, nil); return; }
+    o_set_btn_pressed_handler(self, s, ^(GCControllerButtonInput *b, float v, BOOL p) { BOOL z = blocked_btn(b); h(b, z ? 0 : v, z ? NO : p); });
+}
+static void h_set_btn_value_handler(id self, SEL s, GCControllerButtonValueChangedHandler h) {
+    if (!h) { o_set_btn_value_handler(self, s, nil); return; }
+    o_set_btn_value_handler(self, s, ^(GCControllerButtonInput *b, float v, BOOL p) { BOOL z = blocked_btn(b); h(b, z ? 0 : v, z ? NO : p); });
 }
 typedef float (*axis_imp)(id, SEL);
 static axis_imp o_axis_value;
 static float h_axis_value(id self, SEL s) {
     float v = o_axis_value(self, s);
+    BOOL blocked; @synchronized (g_right_pads) { blocked = [g_vr_axes containsObject:self]; }
+    if (blocked && vr_axes_blocked()) return 0;
     if (v != 0 && stick_pitch_blocked()) { BOOL r; @synchronized (g_right_pads) { r = [g_right_y containsObject:self]; } if (r) { g_stick_y_zeroed++; return 0; } }
     return v;
 }
@@ -431,6 +493,8 @@ static void h_set_pad_handler(id self, SEL s, GCControllerDirectionPadValueChang
     if (!h) { o_set_pad_handler(self, s, h); return; }
     __weak id pad = self;
     GCControllerDirectionPadValueChangedHandler wrapped = ^(GCControllerDirectionPad *d, float x, float y) {
+        BOOL blocked; @synchronized (g_right_pads) { blocked = [g_vr_pads containsObject:pad]; }
+        if (blocked && vr_axes_blocked()) { h(d, 0, 0); return; }
         BOOL r = NO; if (y != 0 && stick_pitch_blocked()) { @synchronized (g_right_pads) { r = [g_right_pads containsObject:pad]; } }
         if (r) g_stick_y_zeroed++;
         h(d, x, r ? 0 : y);
@@ -442,6 +506,8 @@ static void h_set_axis_handler(id self, SEL s, GCControllerAxisValueChangedHandl
     if (!h) { o_set_axis_handler(self, s, h); return; }
     __weak id axis = self;
     GCControllerAxisValueChangedHandler wrapped = ^(GCControllerAxisInput *a, float v) {
+        BOOL blocked; @synchronized (g_right_pads) { blocked = [g_vr_axes containsObject:axis]; }
+        if (blocked && vr_axes_blocked()) { h(a, 0); return; }
         BOOL r = NO; if (v != 0 && stick_pitch_blocked()) { @synchronized (g_right_pads) { r = [g_right_y containsObject:axis]; } }
         if (r) g_stick_y_zeroed++;
         h(a, r ? 0 : v);
@@ -450,7 +516,12 @@ static void h_set_axis_handler(id self, SEL s, GCControllerAxisValueChangedHandl
 }
 static void stick_pitch_setup(void) {
     o_set_axis_handler = (sethandler_imp)method_setImplementation(class_getInstanceMethod([GCControllerAxisInput class], @selector(setValueChangedHandler:)), (IMP)h_set_axis_handler);
-    g_right_y = [NSHashTable weakObjectsHashTable]; g_right_pads = [NSHashTable weakObjectsHashTable];
+    g_vr_axes = [NSHashTable weakObjectsHashTable]; g_vr_pads = [NSHashTable weakObjectsHashTable];
+    g_right_y = [NSHashTable weakObjectsHashTable]; g_right_pads = [NSHashTable weakObjectsHashTable]; g_vr_btns = [NSHashTable weakObjectsHashTable];
+    o_btn_pressed = (btn_pressed_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(isPressed)), (IMP)h_btn_pressed);
+    o_btn_value = (btn_value_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(value)), (IMP)h_btn_value);
+    o_set_btn_pressed_handler = (btn_handler_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(setPressedChangedHandler:)), (IMP)h_set_btn_pressed_handler);
+    o_set_btn_value_handler = (btn_handler_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(setValueChangedHandler:)), (IMP)h_set_btn_value_handler);
     o_axis_value = (axis_imp)method_setImplementation(class_getInstanceMethod([GCControllerAxisInput class], @selector(value)), (IMP)h_axis_value);
     o_set_pad_handler = (sethandler_imp)method_setImplementation(class_getInstanceMethod([GCControllerDirectionPad class], @selector(setValueChangedHandler:)), (IMP)h_set_pad_handler);
     for (GCController *c in GCController.controllers) note_controller(c);
@@ -458,23 +529,51 @@ static void stick_pitch_setup(void) {
 }
 // (h38: the controller's Home button held 1 s cycles the warp's A/B mode (the presenter's label shows it); polled at
 //  20 Hz. h37's L3 + R3 clashed with the game's own actions; Home is not the game's)
+static float raw_axis(GCControllerAxisInput *axis) { return axis && o_axis_value ? o_axis_value(axis, @selector(value)) : 0; }
 static void warp_mode_poll_start(void) {
     static dispatch_source_t t;
     t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0), 50 * NSEC_PER_MSEC, 10 * NSEC_PER_MSEC);
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0), 11 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(t, ^{
         static double since; static int fired;
-        int both = 0;
+        int both = 0; unsigned hbtns = 0; int active = 0;
         for (GCController *c in GCController.controllers) {
             GCExtendedGamepad *g = c.extendedGamepad;
             if (g && g.buttonHome && g.buttonHome.pressed) both = 1;
+            if (g) {
+                if (raw_btn_pressed(g.leftShoulder) || raw_btn_pressed(g.leftThumbstickButton)) hbtns |= HW_BTN_L_GRAB;
+                if (raw_btn_pressed(g.leftTrigger)) hbtns |= HW_BTN_L_TRIG;
+                if (raw_btn_pressed(g.rightShoulder)) hbtns |= HW_BTN_R_GRAB;
+                if (raw_btn_pressed(g.rightTrigger)) hbtns |= HW_BTN_R_TRIG;
+                if (raw_btn_pressed(g.buttonA)) hbtns |= HW_BTN_ACT_A;
+                if (raw_btn_pressed(g.buttonB)) hbtns |= HW_BTN_ACT_B;
+                if (raw_btn_pressed(g.buttonX)) hbtns |= HW_BTN_ACT_X;
+                if (raw_btn_pressed(g.buttonY)) hbtns |= HW_BTN_ACT_Y;
+                if (fabsf(raw_axis(g.leftThumbstick.xAxis)) > .15f || fabsf(raw_axis(g.leftThumbstick.yAxis)) > .15f ||
+                    fabsf(raw_axis(g.rightThumbstick.xAxis)) > .15f || fabsf(raw_axis(g.rightThumbstick.yAxis)) > .15f ||
+                    fabsf(g.dpad.xAxis.value) > .15f || fabsf(g.dpad.yAxis.value) > .15f) active = 1;
+            }
+            GCMicroGamepad *m = c.microGamepad;
+            if (m && !g) {
+                if (raw_btn_pressed(m.buttonA)) hbtns |= HW_BTN_ACT_A;
+                if (raw_btn_pressed(m.buttonX)) hbtns |= HW_BTN_ACT_X;
+                if (fabsf(m.dpad.xAxis.value) > .15f || fabsf(m.dpad.yAxis.value) > .15f) active = 1;
+            }
             // (h49: any controller input - the presenter's pinch gestures wait 2 s after it)
-            if (g && (g.buttonA.pressed || g.buttonB.pressed || g.buttonX.pressed || g.buttonY.pressed || g.leftShoulder.pressed || g.rightShoulder.pressed ||
-                      g.leftTrigger.pressed || g.rightTrigger.pressed || fabsf(g.leftThumbstick.xAxis.value) > 0.2f || fabsf(g.leftThumbstick.yAxis.value) > 0.2f ||
-                      fabsf(g.rightThumbstick.xAxis.value) > 0.2f || fabsf(g.rightThumbstick.yAxis.value) > 0.2f || g.dpad.up.pressed || g.dpad.down.pressed ||
+            if (g && (raw_btn_pressed(g.buttonA) || raw_btn_pressed(g.buttonB) || raw_btn_pressed(g.buttonX) || raw_btn_pressed(g.buttonY) || raw_btn_pressed(g.leftShoulder) || raw_btn_pressed(g.rightShoulder) ||
+                      raw_btn_pressed(g.leftTrigger) || raw_btn_pressed(g.rightTrigger) || fabsf(raw_axis(g.leftThumbstick.xAxis)) > 0.2f || fabsf(raw_axis(g.leftThumbstick.yAxis)) > 0.2f ||
+                      fabsf(raw_axis(g.rightThumbstick.xAxis)) > 0.2f || fabsf(raw_axis(g.rightThumbstick.yAxis)) > 0.2f || g.dpad.up.pressed || g.dpad.down.pressed ||
                       g.dpad.left.pressed || g.dpad.right.pressed)) { void vx_xros_vr_controller_touch(void); vx_xros_vr_controller_touch(); }
         }
         double now = CACurrentMediaTime();
+        static double ctrl_last_active;
+        if (active || hbtns) ctrl_last_active = now;
+        if (ctrl_last_active > 0 && now - ctrl_last_active < 5) hbtns |= HW_BTN_ACTIVE;
+        vx_xros_vr_controller_state(hbtns, now);
+        static int cycle_down;
+        int cycle = !!(hbtns & HW_BTN_ACT_Y);
+        if (cycle && !cycle_down) vx_xros_vr_cycle_weapon_type();
+        cycle_down = cycle;
         if (!both) { since = 0; fired = 0; return; }
         if (!since) since = now;
         if (!fired && now - since >= 1.0) { fired = 1; void vx_xros_vr_cycle_warp_mode(void); vx_xros_vr_cycle_warp_mode(); }

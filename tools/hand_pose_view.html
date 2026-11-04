@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand Pose Viewer</title>
+<!-- VX Mac h70: a hand pose record played through vr/hand_weapon.c (tests/hand_weapon_replay.c --json out.json) seen in
+     3D - both hands' joints, the grip's bottom as a ring, the magazine in the off hand, the state and the steps - to
+     see where a reload was not taken. Open the file in a browser and choose the JSON; drag to turn, wheel to zoom. -->
+<style>
+  :root { --bg: #101318; --panel: #181c23; --line: #2a303b; --text: #d8dde6; --dim: #8a93a3; --gun: #4fd1c5;
+          --off: #f6ad55; --ring: #f6e05e; --mag: #63b3ed; --ev: #fc8181; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 -apple-system, system-ui, sans-serif; }
+  header { display: flex; gap: 12px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; }
+  main { display: grid; grid-template-columns: 1fr 280px; height: calc(100vh - 100px); }
+  canvas { width: 100%; height: 100%; display: block; cursor: grab; }
+  aside { border-left: 1px solid var(--line); background: var(--panel); padding: 12px; overflow: auto; }
+  .bar { display: flex; gap: 10px; align-items: center; padding: 8px 16px; border-top: 1px solid var(--line); }
+  input[type=range] { flex: 1; }
+  button, select { background: #222833; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; }
+  .state { font-size: 16px; font-weight: 600; margin: 4px 0 10px; }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 10px; margin: 2px 4px 2px 0; background: #222833; color: var(--dim); }
+  .chip.on { background: #2f855a; color: #fff; }
+  .ev { cursor: pointer; padding: 2px 4px; border-radius: 4px; }
+  .ev:hover { background: #222833; }
+  .legend span { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .dim { color: var(--dim); }
+  @media (max-width: 700px) { main { grid-template-columns: 1fr; height: auto; } canvas { height: 60vh; } aside { border-left: 0; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hand pose viewer</h1>
+  <input type="file" id="file" accept=".json">
+  <span class="dim" id="info">Choose a JSON from <code>hand_weapon_replay ... --json</code></span>
+</header>
+<main>
+  <canvas id="c"></canvas>
+  <aside>
+    <div class="dim">State</div>
+    <div class="state" id="state">-</div>
+    <div><span class="chip" id="near">at grip</span><span class="chip" id="magc">magazine</span><span class="chip" id="ads">aim</span><span class="chip" id="trig">trigger</span></div>
+    <div class="dim" style="margin-top:8px">Grip (curl 0 open .. 1 fist)</div>
+    <div id="grips">-</div>
+    <div class="dim" style="margin-top:8px">Off hand to the grip's bottom</div>
+    <div id="dist">-</div>
+    <p class="legend dim"><span style="background:var(--gun)"></span>gun hand <span style="background:var(--off)"></span>off hand <span style="background:var(--ring)"></span>grip's bottom <span style="background:var(--mag)"></span>magazine</p>
+    <div class="dim">Steps (click to jump)</div>
+    <div id="events"></div>
+  </aside>
+</main>
+<div class="bar">
+  <button id="play">Play</button>
+  <select id="speed"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
+  <input type="range" id="seek" min="0" max="0" value="0">
+  <span id="time" class="dim">0.00 s</span>
+</div>
+<script>
+const STATES = ["loaded", "holding the old magazine", "empty", "holding a new magazine", "in, no round"];
+const EVS = ["out", "grab", "in", "rack", "done", "cancel"];
+const J = 25;            // floats per hand: tracked, 8 points (wrist, index k, middle k, little k, middle t, ring t, little t, index t)
+let data = null, idx = 0, playing = false, last = 0, yaw = 0.6, pitch = 0.35, dist = 1.6;
+const cv = document.getElementById("c"), g = cv.getContext("2d");
+
+document.getElementById("file").onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  f.text().then(t => loadData(f.name, JSON.parse(t)));
+};
+function loadData(name, d) {
+    data = d;
+    const seek = document.getElementById("seek"); seek.max = data.frames.length - 1; seek.value = 0; idx = 0;
+    document.getElementById("info").textContent = `${name}: ${data.frames.length} frames, ${data.frames.at(-1).t.toFixed(1)} s, gun hand ${data.lefty ? "left" : "right"}`;
+    const ev = document.getElementById("events"); ev.innerHTML = "";
+    data.frames.forEach((fr, i) => {
+      for (let b = 0; b < 6; b++) if (fr.ev & (1 << b)) {
+        const d = document.createElement("div"); d.className = "ev"; d.textContent = `${fr.t.toFixed(2)} s  ${EVS[b]}`;
+        d.onclick = () => { idx = Math.max(0, i - 15); seek.value = idx; draw(); }; ev.appendChild(d);
+      }
+    });
+    draw();
+}
+document.getElementById("seek").oninput = e => { idx = +e.target.value; draw(); };
+document.getElementById("play").onclick = () => { playing = !playing; document.getElementById("play").textContent = playing ? "Pause" : "Play"; last = performance.now(); if (playing) requestAnimationFrame(tick); };
+function tick(now) {
+  if (!playing || !data) return;
+  const sp = +document.getElementById("speed").value, dt = (now - last) / 1000 * sp; last = now;
+  const t = data.frames[idx].t + dt; while (idx < data.frames.length - 1 && data.frames[idx + 1].t <= t) idx++;
+  if (idx >= data.frames.length - 1) { playing = false; document.getElementById("play").textContent = "Play"; }
+  document.getElementById("seek").value = idx; draw(); requestAnimationFrame(tick);
+}
+let drag = null;
+cv.onmousedown = e => { drag = [e.clientX, e.clientY, yaw, pitch]; cv.style.cursor = "grabbing"; };
+window.onmouseup = () => { drag = null; cv.style.cursor = "grab"; };
+window.onmousemove = e => { if (!drag) return; yaw = drag[2] + (e.clientX - drag[0]) * 0.01; pitch = Math.max(-1.2, Math.min(1.4, drag[3] + (e.clientY - drag[1]) * 0.01)); draw(); };
+cv.onwheel = e => { e.preventDefault(); dist = Math.max(0.4, Math.min(5, dist * (e.deltaY > 0 ? 1.1 : 0.9))); draw(); };
+window.onresize = draw;
+
+// the camera orbits a point 40 cm ahead of the eyes and 25 cm below them, in the body's frame (the head's yaw)
+function project(fr) {
+  const fx = fr.fwd[0], fz = fr.fwd[1], n = Math.hypot(fx, fz) || 1, F = [fx / n, 0, fz / n], R = [-F[2], 0, F[0]];
+  const c = [fr.eye[0] + F[0] * 0.4, fr.eye[1] - 0.25, fr.eye[2] + F[2] * 0.4];
+  const W = cv.width, H = cv.height, foc = Math.min(W, H) * 1.1;
+  return p => {
+    const d = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+    let x = d[0] * R[0] + d[2] * R[2], y = d[1], z = d[0] * F[0] + d[2] * F[2];   // (body frame: right, up, forward)
+    const cy = Math.cos(yaw), sy = Math.sin(yaw); [x, z] = [x * cy - z * sy, x * sy + z * cy];
+    const cp = Math.cos(pitch), sp = Math.sin(pitch); [y, z] = [y * cp - z * sp, y * sp + z * cp];
+    const zz = dist - z; if (zz < 0.05) return null;               // (looking from behind the eyes towards forward)
+    return [W / 2 + x / zz * foc, H / 2 - y / zz * foc];
+  };
+}
+function pt(fr, h, k) { const o = h * J + 1 + k * 3; return [fr.j[o], fr.j[o + 1], fr.j[o + 2]]; }
+function line(P, a, b, col, w) { const A = P(a), B = P(b); if (!A || !B) return; g.strokeStyle = col; g.lineWidth = w || 2; g.beginPath(); g.moveTo(...A); g.lineTo(...B); g.stroke(); }
+function dot(P, a, col, r) { const A = P(a); if (!A) return; g.fillStyle = col; g.beginPath(); g.arc(A[0], A[1], r || 3, 0, 7); g.fill(); }
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function curl(fr, h) {   // (as hand_pose_from_joints: the middle, ring and little tips' distance from the wrist over the knuckle's)
+  const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  const W = pt(fr, h, 0), MK = pt(fr, h, 2), LK = pt(fr, h, 3), km = d(MK, W), kl = d(LK, W);
+  const r = [d(pt(fr, h, 4), W) / km, d(pt(fr, h, 5), W) / km, d(pt(fr, h, 6), W) / kl];
+  return r.reduce((s, x) => s + Math.min(1, Math.max(0, (1.7 - x) / 0.6)), 0) / 3;
+}
+function draw() {
+  const dpr = devicePixelRatio || 1; cv.width = cv.clientWidth * dpr; cv.height = cv.clientHeight * dpr;
+  g.fillStyle = css("--bg"); g.fillRect(0, 0, cv.width, cv.height);
+  if (!data) return;
+  const fr = data.frames[idx], P = project(fr);
+  document.getElementById("time").textContent = `${fr.t.toFixed(2)} s`;
+  // floor grid 1.6 m below the eyes, and the eyes with their forward
+  for (let i = -5; i <= 5; i++) {
+    const F = fr.fwd, R = [-F[1], F[0]], y = fr.eye[1] - 1.6;
+    const a = [fr.eye[0] + R[0] * i * 0.2 - F[0] * 1, y, fr.eye[2] + R[1] * i * 0.2 - F[1] * 1], b = [a[0] + F[0] * 2, y, a[2] + F[1] * 2];
+    const c = [fr.eye[0] + F[0] * (i * 0.2) - R[0], y, fr.eye[2] + F[1] * (i * 0.2) - R[1]], d = [c[0] + R[0] * 2, y, c[2] + R[1] * 2];
+    line(P, a, b, css("--line"), 1); line(P, c, d, css("--line"), 1);
+  }
+  dot(P, fr.eye, css("--text"), 5); line(P, fr.eye, [fr.eye[0] + fr.fwd[0] * 0.25, fr.eye[1], fr.eye[2] + fr.fwd[1] * 0.25], css("--text"), 2);
+  const gun = data.lefty ? 0 : 1;
+  for (let h = 0; h < 2; h++) {
+    if (fr.j[h * J] < 0.5) continue;
+    const col = h === gun ? css("--gun") : css("--off"), W = pt(fr, h, 0);
+    for (const [k, t] of [[1, 7], [2, 4], [3, 6]]) { line(P, W, pt(fr, h, k), col, 2); line(P, pt(fr, h, k), pt(fr, h, t), col, 2); }
+    line(P, pt(fr, h, 2), pt(fr, h, 5), col, 1.5); line(P, pt(fr, h, 1), pt(fr, h, 3), col, 1);
+    for (let k = 0; k < 8; k++) dot(P, pt(fr, h, k), col, 3);
+  }
+  if (fr.well) {   // the grip's bottom: a ring across the grip's line, and the line up into the gun
+    const c = fr.well.slice(0, 3), gd = fr.well.slice(3), up = [0, 1, 0];
+    let a = [gd[1] * up[2] - gd[2] * up[1], gd[2] * up[0] - gd[0] * up[2], gd[0] * up[1] - gd[1] * up[0]];
+    let an = Math.hypot(...a); if (an < 1e-3) { a = [1, 0, 0]; an = 1; } a = a.map(v => v / an);
+    const b = [gd[1] * a[2] - gd[2] * a[1], gd[2] * a[0] - gd[0] * a[2], gd[0] * a[1] - gd[1] * a[0]];
+    const r = fr.near ? 0.04 : 0.03;
+    for (let k = 0; k < 16; k++) {
+      const t0 = k / 16 * 6.283, t1 = (k + 1) / 16 * 6.283;
+      line(P, c.map((v, i) => v + (a[i] * Math.cos(t0) + b[i] * Math.sin(t0)) * r), c.map((v, i) => v + (a[i] * Math.cos(t1) + b[i] * Math.sin(t1)) * r), css("--ring"), fr.near ? 3 : 1.5);
+    }
+    line(P, c, c.map((v, i) => v + gd[i] * 0.1), css("--ring"), 1);
+  }
+  if (fr.mag && fr.j[(1 - gun) * J] > 0.5) {   // the magazine: along the off hand's knuckles, its top at the index side
+    const IK = pt(fr, 1 - gun, 1), LK = pt(fr, 1 - gun, 3), W = pt(fr, 1 - gun, 0), MK = pt(fr, 1 - gun, 2);
+    const palm = W.map((v, i) => (v + MK[i]) / 2), up = IK.map((v, i) => v - LK[i]), n = Math.hypot(...up);
+    const u = up.map(v => v / n);
+    line(P, palm.map((v, i) => v - u[i] * 0.06), palm.map((v, i) => v + u[i] * 0.06), css("--mag"), 7);
+    dot(P, palm.map((v, i) => v + u[i] * 0.06), css("--ev"), 4);
+  }
+  document.getElementById("state").textContent = STATES[fr.s] || "?";
+  document.getElementById("near").className = "chip" + (fr.near ? " on" : "");
+  document.getElementById("magc").className = "chip" + (fr.mag ? " on" : "");
+  document.getElementById("ads").className = "chip" + (fr.ads ? " on" : "");
+  document.getElementById("trig").className = "chip" + (fr.trig ? " on" : "");
+  const gs = [0, 1].map(h => fr.j[h * J] > 0.5 ? curl(fr, h).toFixed(2) : "lost");
+  document.getElementById("grips").textContent = `left ${gs[0]}   right ${gs[1]}`;
+  if (fr.well && fr.j[(1 - gun) * J] > 0.5) {
+    const W = pt(fr, 1 - gun, 0), MK = pt(fr, 1 - gun, 2), palm = W.map((v, i) => (v + MK[i]) / 2);
+    document.getElementById("dist").textContent = `${(Math.hypot(palm[0] - fr.well[0], palm[1] - fr.well[1], palm[2] - fr.well[2]) * 100).toFixed(1)} cm`;
+  } else document.getElementById("dist").textContent = "-";
+  if (fr.ev) { g.fillStyle = css("--ev"); g.font = `${14 * (devicePixelRatio || 1)}px system-ui`; g.fillText(EVS.filter((_, b) => fr.ev & (1 << b)).join(" + "), 16, 28); }
+}
+draw();
+</script>
+</body>
+</html>
