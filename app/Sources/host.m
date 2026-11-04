@@ -1,6 +1,6 @@
-// VX Mac Host: the macOS program's start and its surroundings on visionOS (docs/DESIGN.md).
+// VX Mac Host: the macOS program's start and its surroundings on visionOS (../../AVP_MAC.md).
 //
-//   xcrun devicectl device process launch --device <id> <bundle id> [-image vxmac_test|Cyberpunk2077]
+//   xcrun devicectl device process launch --device <id> marimokodai.VXMacHost [-image vxmac_test|Cyberpunk2077]
 //        [-present vr|flat] [-data <dir in Documents>] [-gcmouse 0|1] [-- program arguments]
 //
 // The program is one of the images embedded in Frameworks (prepared with tools/macho_prepare.py --as-dylib: the
@@ -543,7 +543,7 @@ static void warp_mode_poll_start(void) {
             if (g) {
                 if (raw_btn_pressed(g.leftShoulder) || raw_btn_pressed(g.leftThumbstickButton)) hbtns |= HW_BTN_L_GRAB;
                 if (raw_btn_pressed(g.leftTrigger)) hbtns |= HW_BTN_L_TRIG;
-                if (raw_btn_pressed(g.rightShoulder)) hbtns |= HW_BTN_R_GRAB;
+                if (raw_btn_pressed(g.rightShoulder) || raw_btn_pressed(g.rightThumbstickButton)) hbtns |= HW_BTN_R_GRAB;
                 if (raw_btn_pressed(g.rightTrigger)) hbtns |= HW_BTN_R_TRIG;
                 if (raw_btn_pressed(g.buttonA)) hbtns |= HW_BTN_ACT_A;
                 if (raw_btn_pressed(g.buttonB)) hbtns |= HW_BTN_ACT_B;

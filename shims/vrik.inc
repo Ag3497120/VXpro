@@ -83,32 +83,30 @@ static int vrik_is_rot(const float *M) {
     return 1;
 }
 
-// Orthogonal bone check allowing muscle/volume helper bone scaling (e.g. *_elbow_bend_A_mscl_JNT when holding a shotgun)
+// Orthogonal bone check allowing muscle/volume helper bone scaling (e.g. *_elbow_bend_A_mscl_JNT when elbow bends)
+// Stops cleanly at the 16-byte inter-palette separator where Row 0 has l2 == 0.
 static int vrik_is_bone(const float *M) {
     float l[3];
     for (int r = 0; r < 3; r++) {
         float l2 = M[r*4]*M[r*4] + M[r*4+1]*M[r*4+1] + M[r*4+2]*M[r*4+2];
-        if (!(l2 >= 0.05f && l2 <= 9.0f && isfinite(M[r*4+3]) && fabsf(M[r*4+3]) < 10.0f)) return 0;
+        if (!(l2 >= 0.04f && l2 <= 9.0f && isfinite(M[r*4+3]) && fabsf(M[r*4+3]) < 10.0f)) return 0;
         l[r] = sqrtf(l2);
     }
-    if (fabsf(v3dot(M, M + 4)) > 0.18f * l[0] * l[1] ||
-        fabsf(v3dot(M, M + 8)) > 0.18f * l[0] * l[2] ||
-        fabsf(v3dot(M + 4, M + 8)) > 0.18f * l[1] * l[2]) return 0;
+    if (fabsf(v3dot(M, M + 4)) > 0.35f * l[0] * l[1] ||
+        fabsf(v3dot(M, M + 8)) > 0.35f * l[0] * l[2] ||
+        fabsf(v3dot(M + 4, M + 8)) > 0.35f * l[1] * l[2]) return 0;
     return 1;
 }
 
-// Palette bone check that traverses scaled muscle bones inside a body palette while stopping cleanly at the 16-byte inter-palette separator
 static int vrik_is_pal_bone(const uint8_t *P, uint32_t k, size_t pav) {
     if ((size_t)(k + 1) * 48 > pav) return 0;
-    const float *M = (const float *)(P + (size_t)k * 48);
-    if (k > 0 && !vrik_is_rot(M) && (size_t)(k + 1) * 48 + 16 <= pav && vrik_is_rot((const float *)(P + (size_t)k * 48 + 16))) return 0;
-    return vrik_is_bone(M);
+    return vrik_is_bone((const float *)(P + (size_t)k * 48));
 }
 
 // (bones of list L at unmodified palette P agree on their rotational arm/hand joints)
-static int vrik_try(const uint8_t *P, uint32_t max_b, uint32_t strict_rot, int L, int rigv) {
+static int vrik_try(const uint8_t *P, uint32_t cap_b, uint32_t max_b, uint32_t strict_rot, int L, int rigv) {
     uint32_t o = vrik_list_off[L], nb = vrik_list_off[L + 1] - o;
-    if (nb > max_b || nb < 16) return -1;
+    if (nb > cap_b || nb < 16) return -1;
     int good = 0, has_arm_pose = 0;
     for (uint32_t i = 0; i < nb; i++) {
         int nm = vrik_list[o + i], j = vrik_list_par[o + i];
@@ -132,16 +130,27 @@ static int vrik_try(const uint8_t *P, uint32_t max_b, uint32_t strict_rot, int L
     int exact_len = (nb == max_b || nb == strict_rot);
     int min_good = exact_len ? 2 : 6;
     if (!has_arm_pose || good < min_good) return -1;
-    return (exact_len ? 100 : 0) + good;
+    return (exact_len ? 100 : 0) + good * 2 + (int)(nb / 4);
 }
 
-static int vrik_identify(const void *ib, NSUInteger io, NSUInteger count, uint32_t isd0, const uint8_t *orig_P, uint32_t max_b, uint32_t strict_rot, int *rigv) {
+static int vrik_identify(const void *ib, NSUInteger io, NSUInteger count, uint32_t isd0, const uint8_t *orig_P, uint32_t cap_b, uint32_t max_b, uint32_t strict_rot, int *rigv) {
     for (int i = 0; i < g_vk_nmesh; i++) {
         if (g_vk_mesh[i].ib == ib && g_vk_mesh[i].io == io && g_vk_mesh[i].count == count && g_vk_mesh[i].isd0 == isd0) {
             int cL = g_vk_mesh[i].list, cv = g_vk_mesh[i].rigv;
-            if (cL < 0 || vrik_try(orig_P, max_b, strict_rot, cL, cv) > 0) {
-                *rigv = cv;
-                return cL;
+            if (cL >= 0) {
+                uint32_t need_nb = vrik_list_off[cL + 1] - vrik_list_off[cL];
+                if (need_nb <= cap_b) {
+                    *rigv = cv;
+                    return cL;
+                }
+            } else {
+                // Previously weapon/non-body; fast return unless it now has body-scale translations
+                int has_body_t = 0;
+                for (uint32_t k = 0; k < max_b && k < 15; k++) {
+                    const float *M = (const float *)(orig_P + (size_t)k * 48);
+                    if (M[3]*M[3] + M[7]*M[7] + M[11]*M[11] > 0.25f) { has_body_t = 1; break; }
+                }
+                if (!has_body_t) { *rigv = 0; return -1; }
             }
             break;
         }
@@ -153,8 +162,8 @@ static int vrik_identify(const void *ib, NSUInteger io, NSUInteger count, uint32
         if (M[3]*M[3] + M[7]*M[7] + M[11]*M[11] > 0.12f) { can_be_body = 1; break; }
     }
     int best = -1, bestv = 0, bestg = 0;
-    if (can_be_body && max_b >= 16) {
-        for (int L = 0; L < VRIK_NLISTS; L++) for (int v = 0; v < 2; v++) { int g = vrik_try(orig_P, max_b, strict_rot, L, v); if (g > bestg) { bestg = g; best = L; bestv = v; } }
+    if (can_be_body && cap_b >= 16) {
+        for (int L = 0; L < VRIK_NLISTS; L++) for (int v = 0; v < 2; v++) { int g = vrik_try(orig_P, cap_b, max_b, strict_rot, L, v); if (g > bestg) { bestg = g; best = L; bestv = v; } }
     }
     int found = 0;
     for (int i = 0; i < g_vk_nmesh; i++) {
@@ -173,7 +182,7 @@ static int vrik_identify(const void *ib, NSUInteger io, NSUInteger count, uint32
 typedef struct { aff orig, mod; int seg; } vrik_known_bone;
 typedef struct {
     uint8_t *P;
-    uint32_t max_b, strict_rot, nb;
+    uint32_t cap_b, max_b, strict_rot, nb;
     NSUInteger count;
     int L, applied, mod_k1, mod_k2;
     unsigned stamp, frame;
@@ -181,9 +190,16 @@ typedef struct {
     aff orig[128];
 } vrik_pal;
 
+// Joy-Con button bitmask passed from host.m -> xros_vr.m -> weap[5]
+#define VRIK_BTN_L_GRAB  (1u << 0)   // Left Joy-Con L shoulder or L3 stick click
+#define VRIK_BTN_L_TRIG  (1u << 1)   // Left Joy-Con ZL trigger
+#define VRIK_BTN_R_GRAB  (1u << 2)   // Right Joy-Con R shoulder or R3 stick click
+#define VRIK_BTN_R_TRIG  (1u << 3)   // Right Joy-Con ZR trigger
+
 static struct {
-    int have_af[2];   // 1 = true LeftArm/RightArm (SA) + LeftForeArm/RightForeArm (SF) captured
-    int have_h[2];    // 1 = true LeftHand/RightHand (SH) captured
+    unsigned solve_frame;
+    int have_af[2];   // 1 = true LeftArm/RightArm (SA) + LeftForeArm/RightForeArm (SF) captured in cur_frame
+    int have_h[2];    // 1 = true LeftHand/RightHand (SH) captured in cur_frame
     aff SA[2], SF[2], SH[2];
     int rigv;
     aff obj, vcam;
@@ -241,18 +257,18 @@ static void vrik_solve_all(void) {
     static float s_hv[2][3] = { { -0.18f, -0.22f, 0.36f }, { 0.18f, -0.22f, 0.36f } };
     static float s_fv[2][3] = { { 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f } };
     static float s_av[2][3] = { { 0.0f, -1.0f, 0.0f }, { 0.0f, 1.0f, 0.0f } };
+    static float s_roll[2]  = { 0.0f, 0.0f };
     static float s_arm_w[2] = { 0.0f, 0.0f };
     static int s_hold_frames[2] = { 0, 0 };
     static int s_init[2] = { 0, 0 };
     static unsigned s_last_frame = 0;
 
-    // Ambidextrous weapon-hand state: s_gun_hand = 1 (Right Hand) or 0 (Left Hand)
-    static int s_gun_hand = 1, s_switch_hold = 0, s_gun_hand_init = 0;
+    // Joy-Con button-driven weapon hand state: s_gun_hand = 1 (Right Hand) or 0 (Left Hand)
+    // Hand-tracking finger curls NEVER switch s_gun_hand so holding Joy-Cons never causes interference.
+    static int s_gun_hand = 1, s_gun_hand_init = 0;
+    static unsigned s_prev_btns = 0;
     if (!s_gun_hand_init) { g_vk.gun_hand = 1; s_gun_hand_init = 1; }
-    float grip[2] = {
-        (g_vk.curls[0][1] + g_vk.curls[0][2] + g_vk.curls[0][3] + g_vk.curls[0][4]) * 0.25f,
-        (g_vk.curls[1][1] + g_vk.curls[1][2] + g_vk.curls[1][3] + g_vk.curls[1][4]) * 0.25f
-    };
+    unsigned ctrl_btns = (unsigned)g_vk.weap[5];
 
     unsigned cur_frame = atomic_load(&g_frame);
     int step_filter = (cur_frame != s_last_frame || (!s_init[0] && ok[0]) || (!s_init[1] && ok[1]));
@@ -298,30 +314,23 @@ static void vrik_solve_all(void) {
             }
         }
 
-        // Ambidextrous weapon hand switching: grip with the non-holding hand while opening the holding hand
-        int gh = s_gun_hand, oh = 1 - gh;
-        if (s_arm_w[oh] > 0.5f) {
-            float dv[3] = { s_hv[0][0] - s_hv[1][0], s_hv[0][1] - s_hv[1][1], s_hv[0][2] - s_hv[1][2] };
-            float dist_v = v3len(dv);
-            int handoff = (dist_v < 0.38f && grip[oh] >= 0.42f && grip[gh] < 0.28f);
-            int direct_switch = (grip[oh] >= 0.52f && (s_arm_w[gh] < 0.2f || grip[gh] < 0.22f));
-            if (handoff || direct_switch) {
-                if (++s_switch_hold >= 7) {
-                    s_gun_hand = oh;
-                    s_switch_hold = 0;
-                    vxmac_log("VRIK: weapon switched to %s hand (1:1 ambidextrous grip)", oh ? "right" : "left");
-                }
-            } else {
-                s_switch_hold = 0;
-            }
-        } else {
-            s_switch_hold = 0;
+        // Joy-Con weapon grab / hand switching:
+        // - Press Left Joy-Con L / L3 (VRIK_BTN_L_GRAB) while R is not held -> grab weapon with Left Hand (s_gun_hand = 0)
+        // - Press Right Joy-Con R / R3 (VRIK_BTN_R_GRAB) while L is not held -> grab weapon with Right Hand (s_gun_hand = 1)
+        unsigned newly_pressed = ctrl_btns & ~s_prev_btns;
+        s_prev_btns = ctrl_btns;
+        if ((newly_pressed & VRIK_BTN_L_GRAB) && !(ctrl_btns & VRIK_BTN_R_GRAB) && s_arm_w[0] > 0.25f && s_gun_hand != 0) {
+            s_gun_hand = 0;
+            vxmac_log("VRIK: weapon grabbed by left hand via Joy-Con L button");
+        } else if ((newly_pressed & VRIK_BTN_R_GRAB) && !(ctrl_btns & VRIK_BTN_L_GRAB) && s_gun_hand != 1) {
+            s_gun_hand = 1;
+            vxmac_log("VRIK: weapon grabbed by right hand via Joy-Con R button");
         }
     }
+    if (s_gun_hand == 0 && s_arm_w[0] < 0.05f && s_arm_w[1] > 0.25f) s_gun_hand = 1;
     g_vk.gun_hand = s_gun_hand;
 
-    float W_orig[2][3] = {{0},{0}}, Tc_out[2][3] = {{0},{0}};
-    float f_anim[2][3] = {{0,1,0},{0,1,0}}, u_anim[2][3] = {{0,0,1},{0,0,1}};
+    float Tc_out[2][3] = {{0},{0}};
     float f_final[2][3] = {{0,1,0},{0,1,0}}, u_final[2][3] = {{0,0,1},{0,0,1}};
     int solved[2] = { 0, 0 };
     g_vk.D[0] = aff_id();
@@ -346,9 +355,8 @@ static void vrik_solve_all(void) {
         for (int i = 0; i < 3; i++) d3[i] = E[i] - S[i]; a = v3len(d3);
         for (int i = 0; i < 3; i++) d3[i] = W[i] - E[i]; b = v3len(d3);
         if (v3len(Ev) > 0.95f || a < 0.18f || a > 0.38f || b < 0.18f || b > 0.38f) continue;
-        memcpy(W_orig[side], W, sizeof W);
 
-        // 1:1 Hand Position in camera view space (no right-bias from the game's weapon animation wrist Wv)
+        // 1:1 Hand Position in camera view space
         float target_v[3] = {
             Wv[0] + (s_hv[side][0] - Wv[0]) * s_arm_w[side],
             Wv[1] + (s_hv[side][1] - Wv[1]) * s_arm_w[side],
@@ -381,29 +389,24 @@ static void vrik_solve_all(void) {
         float d_ba = v3dot(a_bind, f_bind); for (int i = 0; i < 3; i++) a_bind[i] -= d_ba * f_bind[i];
         v3norm(a_bind);
 
-        const float *SH0 = g_vk.have_h[side] ? g_vk.SH[side].m : SF;
-        aff_dir(SH0, f_bind, f_anim[side]); v3norm(f_anim[side]);
-        aff_dir(SH0, a_bind, u_anim[side]);
-        if (side == 0) { for (int i = 0; i < 3; i++) u_anim[0][i] = -u_anim[0][i]; }
-        float d_ua = v3dot(u_anim[side], f_anim[side]); for (int i = 0; i < 3; i++) u_anim[side][i] -= d_ua * f_anim[side][i];
-        v3norm(u_anim[side]);
-
-        // Hand basis after two-bone IK D2
-        aff M_h2 = aff_mul(D2, g_vk.have_h[side] ? g_vk.SH[side] : g_vk.SF[side]);
+        // Hand basis after two-bone IK D2 (using SH[side] when it matches SF[side] at the wrist joint, else SF[side])
+        float wH[3]; aff_pt(g_vk.SH[side].m, cH, wH);
+        float dw_h[3] = { wH[0] - W[0], wH[1] - W[1], wH[2] - W[2] };
+        int use_sh = (g_vk.have_h[side] && v3len(dw_h) < 0.02f);
+        aff M_h2 = aff_mul(D2, use_sh ? g_vk.SH[side] : g_vk.SF[side]);
         float f_h2[3], a_h2[3];
         aff_dir(M_h2.m, f_bind, f_h2); v3norm(f_h2);
         aff_dir(M_h2.m, a_bind, a_h2);
         float d_h2 = v3dot(a_h2, f_h2); for (int i = 0; i < 3; i++) a_h2[i] -= d_h2 * f_h2[i];
         v3norm(a_h2);
 
-        // 1:1 VR hand basis in object space (pitch, yaw, AND full 360-degree palm flip / supination-pronation)
+        // 1:1 VR hand basis in object space with anatomical wrist flexion/extension cone (max ~60 deg from forearm axis)
         float f_vr[3], a_vr[3];
         aff_dir(v2o.m, s_fv[side], f_vr); v3norm(f_vr);
         aff_dir(v2o.m, s_av[side], a_vr);
-        // Prevent anatomical backward wrist snap into the forearm (> 110 deg)
         float df_fore = v3dot(f_vr, u_fore);
-        if (df_fore < -0.35f) {
-            for (int i = 0; i < 3; i++) f_vr[i] += (-0.35f - df_fore) * u_fore[i];
+        if (df_fore < 0.50f) {
+            for (int i = 0; i < 3; i++) f_vr[i] += (0.50f - df_fore) * u_fore[i];
             v3norm(f_vr);
         }
         float f_tgt[3] = {
@@ -422,20 +425,26 @@ static void vrik_solve_all(void) {
         aff_dir(R_aim.m, a_h2, a_h3);
         float dt1 = v3dot(a_h3,  f_tgt); for (int i = 0; i < 3; i++) a_h3[i]  -= dt1 * f_tgt[i];
         float dt2 = v3dot(a_tgt, f_tgt); for (int i = 0; i < 3; i++) a_tgt[i] -= dt2 * f_tgt[i];
-        float roll_ang = 0.0f;
+        float raw_roll = 0.0f;
         if (v3norm(a_h3) && v3norm(a_tgt)) {
             float cx[3]; v3cross(a_h3, a_tgt, cx);
-            roll_ang = atan2f(v3dot(cx, f_tgt), v3dot(a_h3, a_tgt)) * s_arm_w[side];
+            raw_roll = atan2f(v3dot(cx, f_tgt), v3dot(a_h3, a_tgt));
         }
+        raw_roll = fmaxf(-1.35f, fminf(1.35f, raw_roll));
+        if (step_filter) s_roll[side] += (raw_roll - s_roll[side]) * 0.35f;
+        float roll_ang = s_roll[side] * s_arm_w[side];
 
-        // Distribute forearm twist smoothly across Wrist_0 (35%), Wrist_1 (70%), Wrist_2 (85% + half aim), and Hand (100% + full aim)
-        g_vk.D_w0[side] = aff_mul(aff_rot(u_fore, 0.35f * roll_ang, Tc), D2);
-        g_vk.D_w1[side] = aff_mul(aff_rot(u_fore, 0.70f * roll_ang, Tc), D2);
+        // Distribute forearm twist smoothly across Wrist_0 (30%), Wrist_1 (60%), Wrist_2 (85% + half aim), and Hand (100% + full aim)
+        g_vk.D_w0[side] = aff_mul(aff_rot(u_fore, 0.30f * roll_ang, Tc), D2);
+        g_vk.D_w1[side] = aff_mul(aff_rot(u_fore, 0.60f * roll_ang, Tc), D2);
         g_vk.D_w2[side] = aff_mul(aff_rot(f_half, 0.85f * roll_ang, Tc), aff_mul(R_aim_half, D2));
         aff D3          = aff_mul(aff_rot(f_tgt,  roll_ang,         Tc), aff_mul(R_aim,      D2));
 
         memcpy(f_final[side], f_tgt, sizeof f_tgt);
-        for (int i = 0; i < 3; i++) u_final[side][i] = side ? a_tgt[i] : -a_tgt[i];
+        aff_dir(D3.m, g_vk.have_h[side] ? g_vk.SH[side].m : g_vk.SF[side].m, u_final[side]); // placeholder overwritten below
+        float a_fin[3]; aff_dir(aff_rot(f_tgt, roll_ang, Tc).m, a_h3, a_fin);
+        for (int i = 0; i < 3; i++) u_final[side][i] = side ? a_fin[i] : -a_fin[i];
+        v3norm(u_final[side]);
         memcpy(Tc_out[side], Tc, sizeof Tc);
         solved[side] = 1;
         g_vk.D[side ? 4 : 1] = D1; g_vk.D[side ? 5 : 2] = D2; g_vk.D[side ? 6 : 3] = D3;
@@ -444,21 +453,22 @@ static void vrik_solve_all(void) {
                       side ? "right" : "left", g_vk.have_h[side], s_gun_hand, roll_ang * 57.2958f, S[0], S[1], S[2], E2[0], E2[1], E2[2], Tc[0], Tc[1], Tc[2]);
     }
 
-    // Ambidextrous 1:1 Weapon Transform (D_gun):
-    // Maps the weapon from V's unmodified right-hand grip (W_orig[1], f_anim[1], u_anim[1]) to the active holding hand's
-    // 1:1 VR wrist (Tc_out[gh], f_gun, u_final[gh]), with optional two-handed fore-end aiming when the support hand also grips!
+    // 100% Locked Weapon Transform (D_gun) derived directly from g_vk.D[6] (V's Right Hand skinning delta):
+    // - When held in Right Hand (gh == 1): D_gun == g_vk.D[6] (zero floating; identical transform to V's right hand!).
+    // - When held in Left Hand (gh == 0, switched via Joy-Con L button): composed directly on top of g_vk.D[6],
+    //   translating Tc_out[1] -> Tc_out[0] and rotating (f_final[1], u_final[1]) -> (f_gun, u_gun) around Tc_out[0].
     aff D_gun = g_vk.D[6];
     int gh = s_gun_hand, sh = 1 - gh;
-    if (solved[gh] && g_vk.have_af[1]) {
+    if (solved[gh] && solved[1]) {
         float f_gun[3] = { f_final[gh][0], f_final[gh][1], f_final[gh][2] };
         float u_gun[3] = { u_final[gh][0], u_final[gh][1], u_final[gh][2] };
         g_vk.two_hand = 0.0f;
 
-        if (solved[sh] && grip[sh] >= 0.38f) {
+        unsigned sh_grab_mask = (sh == 0) ? (VRIK_BTN_L_GRAB | VRIK_BTN_L_TRIG) : (VRIK_BTN_R_GRAB | VRIK_BTN_R_TRIG);
+        if (solved[sh] && (ctrl_btns & sh_grab_mask)) {
             float dv[3] = { s_hv[sh][0] - s_hv[gh][0], s_hv[sh][1] - s_hv[gh][1], s_hv[sh][2] - s_hv[gh][2] };
             float dist_v = v3len(dv);
             if (dist_v > 0.14f && dist_v < 0.65f && dv[2] > 0.03f) {
-                // Two-handed aiming: steer the barrel smoothly toward the support hand while keeping the rear grip at Tc_out[gh]
                 float dir_2h[3] = { Tc_out[sh][0] - Tc_out[gh][0], Tc_out[sh][1] - Tc_out[gh][1], Tc_out[sh][2] - Tc_out[gh][2] };
                 if (v3norm(dir_2h) && v3dot(dir_2h, f_gun) > 0.35f) {
                     for (int i = 0; i < 3; i++) f_gun[i] = f_gun[i] * 0.35f + dir_2h[i] * 0.65f;
@@ -470,14 +480,19 @@ static void vrik_solve_all(void) {
             }
         }
 
-        if (gh == 1 && g_vk.two_hand < 0.5f) {
-            D_gun = g_vk.D[6];
+        if (gh == 1) {
+            if (g_vk.two_hand < 0.5f) {
+                D_gun = g_vk.D[6];
+            } else {
+                D_gun = aff_mul(aff_arc(f_final[1], f_gun, Tc_out[1]), g_vk.D[6]);
+            }
         } else {
-            // Construct rigid 3D transform taking (W_orig[1], f_anim[1], u_anim[1]) -> (Tc_out[gh], f_gun, u_gun)
-            aff T_step = aff_id();
-            for (int i = 0; i < 3; i++) T_step.m[i*4+3] = Tc_out[gh][i] - W_orig[1][i];
-            aff R_f = aff_arc(f_anim[1], f_gun, Tc_out[gh]);
-            float u1[3]; aff_dir(R_f.m, u_anim[1], u1);
+            // Start from g_vk.D[6] (which places the weapon grip at Tc_out[1] with basis f_final[1], u_final[1]),
+            // translate Tc_out[1] -> Tc_out[0], and align (f_final[1], u_final[1]) -> (f_gun, u_gun) around Tc_out[0]
+            aff T_r2l = aff_id();
+            for (int i = 0; i < 3; i++) T_r2l.m[i*4+3] = Tc_out[0][i] - Tc_out[1][i];
+            aff R_f = aff_arc(f_final[1], f_gun, Tc_out[0]);
+            float u1[3]; aff_dir(R_f.m, u_final[1], u1);
             float d1 = v3dot(u1, f_gun); for (int i = 0; i < 3; i++) u1[i] -= d1 * f_gun[i];
             float d2 = v3dot(u_gun, f_gun); for (int i = 0; i < 3; i++) u_gun[i] -= d2 * f_gun[i];
             float g_roll = 0.0f;
@@ -485,8 +500,8 @@ static void vrik_solve_all(void) {
                 float cx[3]; v3cross(u1, u_gun, cx);
                 g_roll = atan2f(v3dot(cx, f_gun), v3dot(u1, u_gun));
             }
-            aff R_u = aff_rot(f_gun, g_roll, Tc_out[gh]);
-            D_gun = aff_mul(R_u, aff_mul(R_f, T_step));
+            aff R_u = aff_rot(f_gun, g_roll, Tc_out[0]);
+            D_gun = aff_mul(R_u, aff_mul(R_f, aff_mul(T_r2l, g_vk.D[6])));
         }
     }
     g_vk.D_gun = D_gun;
@@ -513,7 +528,7 @@ static void vrik_record_known(const aff *orig, const aff *mod, int seg) {
     }
 }
 
-// Natural hand-tracking finger flexion/extension for BOTH hands (including knuckle volume/muscle bones so fingers never deform)
+// Gentle hand-tracking finger flexion/extension for BOTH hands (including knuckle volume/muscle bones so fingers never deform)
 static void vrik_finger_deltas(int side, const vrik_pal *pal, uint32_t o, aff M_out[128]) {
     for (uint32_t k = 0; k < pal->nb; k++) M_out[k] = aff_id();
     int rigv = g_vk.rigv;
@@ -577,8 +592,8 @@ static void vrik_finger_deltas(int side, const vrik_pal *pal, uint32_t o, aff M_
         v3cross(f_hand, f_p1, cx1);
         float cur_ang1 = atan2f(v3dot(cx1, ax_curl), v3dot(f_hand, f_p1));
         float curl = g_vk.curls[side][1 + f];
-        float tgt_ang1 = curl * 0.95f;
-        float d1 = fmaxf(-0.65f, fminf(0.65f, tgt_ang1 - cur_ang1));
+        float tgt_ang1 = curl * 0.85f;
+        float d1 = fmaxf(-0.35f, fminf(0.35f, (tgt_ang1 - cur_ang1) * 0.55f));
 
         float p1[3]; aff_pt(pal->orig[b1].m, c1, p1);
         aff M1 = aff_rot(ax_curl, d1, p1);
@@ -593,8 +608,8 @@ static void vrik_finger_deltas(int side, const vrik_pal *pal, uint32_t o, aff M_
                 aff_dir(pal->orig[b2].m, fb, f_p2); v3norm(f_p2);
                 v3cross(f_p1, f_p2, cx2);
                 float cur_ang2 = atan2f(v3dot(cx2, ax_curl), v3dot(f_p1, f_p2));
-                float tgt_ang2 = curl * 1.10f;
-                float d2 = fmaxf(-0.65f, fminf(0.65f, tgt_ang2 - cur_ang2));
+                float tgt_ang2 = curl * 0.95f;
+                float d2 = fmaxf(-0.35f, fminf(0.35f, (tgt_ang2 - cur_ang2) * 0.55f));
 
                 float p2[3], p2m[3]; aff_pt(pal->orig[b2].m, c2, p2); aff_pt(M1.m, p2, p2m);
                 aff M2 = aff_mul(aff_rot(ax_curl, d2, p2m), M1);
@@ -604,7 +619,7 @@ static void vrik_finger_deltas(int side, const vrik_pal *pal, uint32_t o, aff M_
                     const float *c3 = vrik_bindpos(rigv, f_jnt[side][f][2]);
                     if (c3) {
                         float p3[3], p3m[3]; aff_pt(pal->orig[b3].m, c3, p3); aff_pt(M2.m, p3, p3m);
-                        M_out[b3] = aff_mul(aff_rot(ax_curl, d2 * 0.65f, p3m), M2);
+                        M_out[b3] = aff_mul(aff_rot(ax_curl, d2 * 0.50f, p3m), M2);
                     } else {
                         M_out[b3] = M2;
                     }
@@ -633,7 +648,7 @@ static void vrik_finger_deltas(int side, const vrik_pal *pal, uint32_t o, aff M_
     if (tb1 >= 0) {
         const float *ct1 = vrik_bindpos(rigv, t_jnt[0]);
         if (ct1) {
-            float dt = fmaxf(-0.35f, fminf(0.35f, (g_vk.curls[side][0] - 0.45f) * 0.60f));
+            float dt = fmaxf(-0.20f, fminf(0.20f, (g_vk.curls[side][0] - 0.45f) * 0.40f));
             float pt1[3]; aff_pt(pal->orig[tb1].m, ct1, pt1);
             aff MT1 = aff_rot(f_hand, side ? -dt : dt, pt1);
             M_out[tb1] = MT1;
@@ -662,7 +677,7 @@ static int vrik_pal_still_modified(const vrik_pal *p) {
 }
 
 static void vrik_apply_pal(vrik_pal *pal) {
-    if ((!g_vk.have_af[0] && !g_vk.have_af[1]) || pal->nb == 0 || pal->nb > pal->max_b) return;
+    if ((!g_vk.have_af[0] && !g_vk.have_af[1]) || pal->nb == 0 || pal->nb > pal->cap_b) return;
     if (pal->L >= 0) {
         uint32_t o = vrik_list_off[pal->L];
         int has_l_fng = 0, has_r_fng = 0;
@@ -678,12 +693,12 @@ static void vrik_apply_pal(vrik_pal *pal) {
         for (uint32_t k = 0; k < pal->nb; k++) {
             int nm = vrik_list[o + k], s = vrik_seg[nm];
             aff *dst = (aff *)(pal->P + (size_t)k * 48);
-            if      (nm == 1503) *dst = aff_mul(g_vk.D_w0[0], pal->orig[k]); // l_Wrist_0_JNT (35% forearm roll)
-            else if (nm == 1504) *dst = aff_mul(g_vk.D_w1[0], pal->orig[k]); // l_Wrist_1_JNT (70% forearm roll)
+            if      (nm == 1503) *dst = aff_mul(g_vk.D_w0[0], pal->orig[k]); // l_Wrist_0_JNT (30% forearm roll)
+            else if (nm == 1504) *dst = aff_mul(g_vk.D_w1[0], pal->orig[k]); // l_Wrist_1_JNT (60% forearm roll)
             else if (nm == 1505 || nm == 1678 || nm == 1680 || nm == 1682)
                                  *dst = aff_mul(g_vk.D_w2[0], pal->orig[k]); // l_Wrist_2_JNT + wrist_A/B/C_mscl
-            else if (nm == 1974) *dst = aff_mul(g_vk.D_w0[1], pal->orig[k]); // r_Wrist_0_JNT (35% forearm roll)
-            else if (nm == 1975) *dst = aff_mul(g_vk.D_w1[1], pal->orig[k]); // r_Wrist_1_JNT (70% forearm roll)
+            else if (nm == 1974) *dst = aff_mul(g_vk.D_w0[1], pal->orig[k]); // r_Wrist_0_JNT (30% forearm roll)
+            else if (nm == 1975) *dst = aff_mul(g_vk.D_w1[1], pal->orig[k]); // r_Wrist_1_JNT (60% forearm roll)
             else if (nm == 1976 || nm == 2148 || nm == 2149 || nm == 2150)
                                  *dst = aff_mul(g_vk.D_w2[1], pal->orig[k]); // r_Wrist_2_JNT + wrist_A/B/C_mscl
             else if (s == 3 && has_l_fng) *dst = aff_mul(g_vk.D[3], aff_mul(M_fng_l[k], pal->orig[k]));
@@ -802,16 +817,16 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger bi, id ib, NSUInteger 
     for (int i = 0; i < g_vk.npals; i++) {
         if (g_vk.pals[i].P == P) { pal = &g_vk.pals[i]; break; }
     }
-    int still_modified = (pal && pal->frame == cur_frame && pal->mod_k1 >= 0 && (size_t)(pal->mod_k1 + 1) * 48 <= pav &&
+    int still_modified = (pal && pal->mod_k1 >= 0 && (size_t)(pal->mod_k1 + 1) * 48 <= pav &&
                           pal->mod_k2 >= 0 && (size_t)(pal->mod_k2 + 1) * 48 <= pav &&
                           vrik_pal_still_modified(pal));
     if (!still_modified && !(pal && pal->frame == cur_frame && !pal->applied)) {
         // P currently holds fresh unmodified matrices from the game CPU:
-        // 1) strict_rot: consecutive unit-scale rigid bones (used for weapon/attachment palettes)
-        // 2) max_b: consecutive valid bones including scaled muscle bones up to the 16-byte inter-palette separator (used for V's body rigs)
+        uint32_t cap_b = (uint32_t)(pav / 48);
+        if (cap_b > 128) cap_b = 128;
         uint32_t strict_rot = 0, max_b = 0;
-        while ((size_t)(strict_rot + 1) * 48 <= pav && strict_rot < 128 && vrik_is_rot((const float *)(P + (size_t)strict_rot * 48))) strict_rot++;
-        while (max_b < 128 && vrik_is_pal_bone(P, max_b, pav)) max_b++;
+        while (strict_rot < cap_b && vrik_is_rot((const float *)(P + (size_t)strict_rot * 48))) strict_rot++;
+        while (max_b < cap_b && vrik_is_pal_bone(P, max_b, pav)) max_b++;
         if (max_b < strict_rot) max_b = strict_rot;
         if (max_b == 0) { pthread_mutex_unlock(&g_vk_l); return; }
         if (!pal) {
@@ -825,25 +840,27 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger bi, id ib, NSUInteger 
             memset(pal, 0, sizeof *pal);
             pal->P = P; pal->L = -2;
         }
+        pal->cap_b = cap_b;
         pal->max_b = max_b;
         pal->strict_rot = strict_rot > 0 ? strict_rot : max_b;
         pal->frame = cur_frame;
         pal->applied = 0;
         pal->mod_k1 = pal->mod_k2 = -1;
-        memcpy(pal->orig, P, (size_t)max_b * 48);
+        memcpy(pal->orig, P, (size_t)cap_b * 48);
     }
     pal->stamp = seq;
     pal->obj = obj;
     pal->count = count;
 
     // Identify using the guaranteed-unmodified pal->orig matrices
-    int rigv = 0, L = vrik_identify((__bridge const void *)ib, io, count, isd[0], (const uint8_t *)pal->orig, pal->max_b, pal->strict_rot, &rigv);
+    int rigv = 0, L = vrik_identify((__bridge const void *)ib, io, count, isd[0], (const uint8_t *)pal->orig, pal->cap_b, pal->max_b, pal->strict_rot, &rigv);
 
     int state_changed = 0;
     if (L >= 0) {
         uint32_t o = vrik_list_off[L], nb = vrik_list_off[L + 1] - o;
         if (nb > 128) nb = 128;
-        if (nb <= pal->max_b) {
+        if (nb <= pal->cap_b) {
+            if (pal->max_b < nb) pal->max_b = nb;
             aff o2v = aff_mul(vcam, obj);
             int near_cam = 0;
             for (uint32_t k = 0; k < nb; k++) {
@@ -909,14 +926,14 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger bi, id ib, NSUInteger 
     if (state_changed) {
         g_vk.nknown = 0;
         vrik_solve_all();
-        // Re-apply to all palettes snapshotted in the current frame (so earlier draws in the same frame stay 100% synchronized)
+        // Re-apply to all palettes active in the current render pass so earlier draws stay 100% synchronized
         for (int i = 0; i < g_vk.npals; i++) {
             vrik_pal *p = &g_vk.pals[i];
-            if (p->L >= 0 && p->frame == cur_frame) vrik_apply_pal(p);
+            if (p->L >= 0 && (p->frame == cur_frame || vrik_pal_still_modified(p))) vrik_apply_pal(p);
         }
         for (int i = 0; i < g_vk.npals; i++) {
             vrik_pal *p = &g_vk.pals[i];
-            if (p->L < 0 && p->frame == cur_frame) vrik_apply_pal(p);
+            if (p->L < 0 && (p->frame == cur_frame || vrik_pal_still_modified(p))) vrik_apply_pal(p);
         }
     } else if (!pal->applied) {
         vrik_apply_pal(pal);

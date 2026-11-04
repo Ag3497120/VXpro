@@ -3020,9 +3020,10 @@ int vx_xros_vr_hand_frames(float out[2][12], int ok[2]) {
 int vx_xros_vr_hand_curls(float out[2][6], float weap_out[8]) {
     static float sm_curls[2][6] = { { 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.0f }, { 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.0f } };
     float S[134], J[2 * HW_JOINTS]; double t, now = CACurrentMediaTime();
+    unsigned btns = vx_xros_vr_controller_buttons(now);
     pthread_mutex_lock(&g_ik_lock);
     memcpy(S, g_ik_skel, sizeof S); memcpy(J, g_ik_joints, sizeof J); t = g_ik_time;
-    if (weap_out) memcpy(weap_out, g_ik_weap, sizeof g_ik_weap);
+    if (weap_out) { memcpy(weap_out, g_ik_weap, sizeof g_ik_weap); weap_out[5] = (float)btns; }
     if (now - t <= 0.25) {
         for (int h = 0; h < 2; h++) {
             const float *sk = S + h * 67;
@@ -3192,7 +3193,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
     {
         static int on = -1, labels; static hand_gestures hg; static double up_at[HG_N]; static int act[HG_N];
         if (on < 0) {
-            const char *e = getenv("VXMAC_GESTURES"); on = !(e && !strcmp(e, "0"));
+            const char *e = getenv("VXMAC_GESTURES"); on = e && !strcmp(e, "1");
             e = getenv("VXMAC_GESTURE_LABELS"); labels = e && !strcmp(e, "1");
             e = getenv("VXMAC_GESTURE_LEFTY"); hg.lefty = e && !strcmp(e, "1");
             // (the game's default bindings: Reload R, QuickMelee Q, CombatGadget the middle button, UseConsumable X;
@@ -3231,7 +3232,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         static int mag = -1, mag_labels; static hand_weapon hw; static int mact[HW_EV_N]; static double mup_at[HW_EV_N];
         static FILE *prec; static double prec_until = -1;
         if (mag < 0) {
-            const char *e = getenv("VXMAC_MAG"); mag = !(e && !strcmp(e, "0"));
+            const char *e = getenv("VXMAC_MAG"); mag = e && !strcmp(e, "1");
             e = getenv("VXMAC_HAND_MODE");
             hw.mode = e && !strcmp(e, "bare") ? HW_MODE_BARE : e && !strcmp(e, "hybrid") ? HW_MODE_HYBRID : HW_MODE_AUTO;
             e = getenv("VXMAC_AUTO_MAG"); hand_weapon_set_auto_mag(&hw, !(e && !strcmp(e, "0")));
@@ -3305,7 +3306,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         //  VXMAC_ARMS_KEYS="hip=1e,back=1f,holster=05,aim=m1,trigger=m0")
         static int arms = -1, trig_on, akey[5], aim_down, trig_down; static double aup_at[3];
         if (arms < 0) {
-            const char *e = getenv("VXMAC_ARMS"); arms = !(e && !strcmp(e, "0"));
+            const char *e = getenv("VXMAC_ARMS"); arms = e && !strcmp(e, "1");
             e = getenv("VXMAC_TRIGGER"); trig_on = e && !strcmp(e, "1");
             akey[0] = 0x1E; akey[1] = 0x1F; akey[2] = 0x05; akey[3] = -2; akey[4] = -1;
             static const char *names[5] = { "hip", "back", "holster", "aim", "trigger" };
@@ -3414,6 +3415,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         g_ik_weap[2] = well_d;
         g_ik_weap[3] = drop_prog;
         g_ik_weap[4] = supp;
+        g_ik_weap[5] = (float)controller;
         pthread_mutex_unlock(&g_ik_lock);
         const char *game_hands = getenv("VXMAC_GAME_HANDS");
         static float sm_lp[3], sm_ypr[3], sm_lo[3], sm_oypr[3];
@@ -3511,7 +3513,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             memset(g_vm_delta, 0, sizeof g_vm_delta); memset(g_vm_rot, 0, sizeof g_vm_rot);
             memset(g_vm_off_delta, 0, sizeof g_vm_off_delta); memset(g_vm_off_rot, 0, sizeof g_vm_off_rot);
         }
-        g_mag_draw.on = vr && ((mag || arms) || g_mag_draw.skel[0] || g_mag_draw.skel[67]);
+        g_mag_draw.on = vr && (mag || arms);
         int reloading = hw.mag_shown || hw.state != HW_LOADED;
         g_mag_draw.ring = reloading && hw.well_ok;
         g_mag_draw.lit = hw.near_well; g_mag_draw.mag = reloading && visual_off->ok && hw.mag_shown; g_mag_draw.holding = hw.mag_shown;
