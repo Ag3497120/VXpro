@@ -15,7 +15,10 @@ PATH = 'Library/Application Support/CD Projekt Red/Cyberpunk 2077/UserSettings.j
 KEEP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'build', 'cyberpunk', 'settings')
 CHEAP = {('/graphics/advanced', 'AmbientOcclusion'): 'Off', ('/graphics/advanced', 'LocalShadowsQuality'): 'Off',
          ('/graphics/advanced', 'ContactShadows'): False, ('/graphics/basic', 'MotionBlur'): 'Off',
-         ('/graphics/advanced', 'FacialTangentUpdates'): False}
+         ('/graphics/advanced', 'FacialTangentUpdates'): False,
+         ('/graphics/presets', 'FrameGeneration'): 'Off',
+         ('/graphics/presets', 'MetalFX_FrameGeneration'): False,
+         ('/graphics/presets', 'FSR3_FrameGeneration'): False}
 PROFILES = {
     'p900': {('/video/display', 'Resolution'): '1600x900', ('/graphics/presets', 'DynamicResolutionScaling'): True},
     'p720': {('/video/display', 'Resolution'): '1280x720', ('/graphics/presets', 'DynamicResolutionScaling'): True},
@@ -68,6 +71,9 @@ PROFILES = {
                   ('/video/display', 'MaximumFPS_OnOff'): False},
     # (h56: nothing but the NAME=VALUE arguments - e.g. `cp_settings.py none FieldOfView=110.0`, the rest as the game has it)
     'none': {},
+    'fix_fg': {('/graphics/presets', 'FrameGeneration'): 'Off',
+               ('/graphics/presets', 'MetalFX_FrameGeneration'): False,
+               ('/graphics/presets', 'FSR3_FrameGeneration'): False},
     'p720fixed': {('/video/display', 'Resolution'): '1280x720', ('/graphics/presets', 'DynamicResolutionScaling'): False,
                   ('/graphics/presets', 'ResolutionScaling'): 'MetalFX', ('/graphics/presets', 'MetalFX'): 'Performance'},
 }

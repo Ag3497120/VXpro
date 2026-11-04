@@ -740,14 +740,37 @@ void vxmac_boot(void) {
             if (e && *e) { double a = 0, b = 0; if (sscanf(e, "%lfx%lf", &a, &b) == 2 && a >= 320 && b >= 240) { sw = a; sh = b; } }
             vxkit_set_screen(sw, sh, 1, 90); }
         // the game's FOV for the presenter's projection: its UserSettings.json FieldOfView, a horizontal angle at the
-        // frame's aspect (Cyberpunk's slider), as VXMAC_FOV_V unless set (-env VXMAC_FOV_V=deg)
-        if (!getenv("VXMAC_FOV_V")) {
+        // frame's aspect (Cyberpunk's slider), as VXMAC_FOV_V unless set (-env VXMAC_FOV_V=deg).
+        // Also auto-sanitize FrameGeneration / MetalFX_FrameGeneration / FSR3_FrameGeneration if the user enabled them
+        // in-game (MetalFX FG replaces the present queue / backbuffer and crashes on visionOS, preventing subsequent boots).
+        {
             NSString *lib = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
-            NSData *js = [NSData dataWithContentsOfFile:[lib stringByAppendingPathComponent:@"CD Projekt Red/Cyberpunk 2077/UserSettings.json"]];
-            NSDictionary *us = js ? [NSJSONSerialization JSONObjectWithData:js options:0 error:nil] : nil;
+            NSString *usPath = [lib stringByAppendingPathComponent:@"CD Projekt Red/Cyberpunk 2077/UserSettings.json"];
+            NSData *js = [NSData dataWithContentsOfFile:usPath];
+            NSMutableDictionary *us = js ? [NSJSONSerialization JSONObjectWithData:js options:NSJSONReadingMutableContainers error:nil] : nil;
             double fov = 0;
-            for (NSDictionary *g in us[@"data"]) for (NSDictionary *o in g[@"options"]) if ([o[@"name"] isEqual:@"FieldOfView"]) fov = [o[@"value"] doubleValue];
-            if (fov > 30 && fov < 150) {
+            BOOL fgFixed = NO;
+            const char *allow_fi = getenv("VXMAC_FX_INTERP");
+            BOOL sanitize_fg = !(allow_fi && !strcmp(allow_fi, "1"));
+            for (NSMutableDictionary *g in us[@"data"]) {
+                for (NSMutableDictionary *o in g[@"options"]) {
+                    NSString *nm = o[@"name"];
+                    if ([nm isEqual:@"FieldOfView"]) fov = [o[@"value"] doubleValue];
+                    if (sanitize_fg) {
+                        if ([nm isEqual:@"FrameGeneration"] && ![o[@"value"] isEqual:@"Off"]) {
+                            o[@"value"] = @"Off"; o[@"index"] = @0; fgFixed = YES;
+                        } else if (([nm isEqual:@"MetalFX_FrameGeneration"] || [nm isEqual:@"FSR3_FrameGeneration"]) && [o[@"value"] boolValue]) {
+                            o[@"value"] = @NO; fgFixed = YES;
+                        }
+                    }
+                }
+            }
+            if (fgFixed) {
+                NSData *outJs = [NSJSONSerialization dataWithJSONObject:us options:NSJSONWritingPrettyPrinted error:nil];
+                if (outJs) [outJs writeToFile:usPath atomically:YES];
+                jlog("settings_sanitized", "\"reset_frame_generation\":1");
+            }
+            if (!getenv("VXMAC_FOV_V") && fov > 30 && fov < 150) {
                 double ty = tan(fov * 0.5 * M_PI / 180) * 9.0 / 16.0;   // (16:9 frames: 1920x1080, 1600x900)
                 char v[32]; snprintf(v, sizeof v, "%.2f", 2 * atan(ty) * 180 / M_PI);
                 setenv("VXMAC_FOV_V", v, 1);
