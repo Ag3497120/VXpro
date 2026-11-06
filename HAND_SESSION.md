@@ -1,13 +1,7 @@
 # Hand/weapon session redesign
 
-Status: experimental render-time hand/weapon adapter with a native equipment/ammunition bridge.
-**The engine animation-stage pose writer is not connected.**
-
-Checkpoint, 2026-11-06: the player confirmed the right hand holds the trigger grip on every weapon
-currently in their inventory. Some shotguns and machine guns still have a supporting-hand intersection.
-This snapshot precedes further left-hand corrections. A universal weapon profile, complete physical
-reload behavior, physical shot-ray integration and a measured FPS improvement remain unproven.
-The implementation history below includes earlier rejected approaches and failed builds.
+Status: foundation and read-only native binding probe. **The engine pose writer is not connected.**
+This is not a claim that the reference videos' handling now works on Vision Pro.
 
 ## Agreed behavior and first proof
 
@@ -263,6 +257,41 @@ Completion gates:
 
 Local checks do not establish visual stability, physical grip accuracy or unchanged frame rate.
 
+## 2026-11-06 supporting hand and forearm chain
+
+**Rejected after headset testing.** The player's 14:00:35 recording shows large stretched
+arm surfaces covering the view, especially around 00:34–00:40 and 01:18–01:24. Endpoint
+agreement alone did not validate weighted mesh deformation or submission ordering. The
+attempt below is not accepted. Renderer/capture/alignment-test sources have been restored
+to the successful right-grip checkpoint `2a30632`. The failed version and device records
+remain in ignored build output for investigation. Left support remains unresolved.
+
+The later recording's right-hand trigger grip was confirmed by the player for all weapons
+currently in their inventory. That source checkpoint is preserved on VXpro `hand-tracking`
+at `2a30632`; the following support correction is separate from that checkpoint.
+
+Three fresh support snapshots show 0.437613, 0.2374 and 0.6468 m between the displayed
+left wrist and the end of its displayed forearm. The receiver-specific contact could be
+resolved after the earlier raw-hand IK. The final body draw then placed the hand at that
+contact while its forearm still used the earlier target. Wrist-only contact tests missed
+this disconnected chain, and separating palm centres does not repair it.
+
+The tracked and constrained paths now share the same two-bone position solver. The final
+support/slide target solves the complete left chain in canonical body coordinates, with
+a leftward/downward elbow pole and a cache keyed by frame, rig, source joints and target.
+Sleeve palettes without a hand joint use the same solution. Wrist twist groups retain the
+same constrained endpoint. A partial chain does not snap its hand independently. The
+right-hand grip binding, native source buffers, private GPU buffer limits, controller
+mapping and reload protocol are unchanged.
+
+`VXMAC_TEST_SUPPORT_REPLAY_DIR` replays the fresh e3/e17/e21 support records through actual
+palette placement, starting from their previously displayed arm corrections. The original
+code fails with a 0.437613 m wrist gap. The correction gives wrist gaps below 0.002 m and
+elbow gaps below 0.002 m on all three records; the printed gaps are near numeric precision.
+It also asserts that the right forearm correction stays unchanged. Synthetic orientations
+exercise both normal reach limiting and exact constrained endpoints. These checks do not
+establish clearance of every finger, every forearm mesh or every weapon in the headset.
+
 ## 2026-11-06 private asset adapter
 
 After reconnecting the player's SSD, `tools/weapon_asset_profile.py` and
@@ -319,3 +348,92 @@ long-gun support surfaces and palm direction are checked in the recorded body/ca
 coordinates. Eight snapshots lack a captured recognized receiver and are explicitly
 excluded, not counted as successes. These are local matrix checks, not a headset playtest,
 an all-weapon compatibility result or a frame-rate measurement.
+
+## 2026-11-06 support consumer isolation (support placement still user-rejected)
+
+The 14:14 recording still shows displaced/crossed support hands after restoring the
+successful right-grip renderer. The earlier 14:00 support-chain attempt remains rejected.
+Its endpoint-only tests missed stretched weighted surfaces: a hand muscle matrix cached
+by bone name could come from a different skin consumer, including partial cyberware whose
+inverse-bind/unused rows differ from the main hand. That matrix was then reused on vertices
+of the main hand. Equal wrist endpoints do not establish intact skinning.
+
+Support shapes now use a bounded 32-entry cache keyed by geometry, draw range, bone list,
+rig and support generation. Each entry retains its own inverse-bind transforms. Invalid
+unused rows are not frozen into the shape. No source GPU buffers are changed. This cache
+does not alter the successful right-hand grip cache or input/reload ownership.
+
+The final support/slide target produces local upper-arm, forearm and wrist corrections for
+each consumer. The native sleeve elbow and a later hand/accessory forearm can have different
+source poses; each forearm maps its own elbow directly to the common solved elbow. This
+does not overwrite the global free-hand/right-arm solve. A small capture field records
+whether the connected support correction was applied to each palette.
+
+`VXMAC_TEST_SUPPORT_DIR` and `VXMAC_TEST_SUPPORT_OUTPUT` enable optional private matrix
+replays. Nine recorded support states check wrist continuity, independent consumers,
+reversed repeat order and unchanged global arm corrections. A synthetic check exercises
+48 target directions with independently displaced native forearms. Existing five recognized
+receiver replays still check the right trigger contact and the former reflection failure.
+
+`tools/skin_replay_check.py` additionally skins the owner's unpacked hand mesh using all
+eight influences and compares surface edge lengths. On the private replay set, the recorded
+outputs fail the 0.10 m edge / 0.05 m edge-growth guard in 22 of 29 draw consumers. The new
+outputs pass all 29, with a maximum edge about 0.051 m and growth about 0.028 m. The four
+Python checks include a surface stretch that joint-origin tests cannot detect. Geometry
+and replay fixtures stay private/ignored; the tool writes numeric summaries only.
+
+These checks establish the recorded transform/surface invariants, not collision-free
+fingers on every weapon, live tracking stability or unchanged FPS. Headset verification
+of the support grip remains required before publishing this candidate over the checkpoint.
+
+## 2026-11-06 support publication source coordinates
+
+The 15:39 recording rejects the support-position result. The user clarifies that the
+left hand/forearm crosses through the right hand, rather than a new board-shaped mesh,
+and that the first white weapon does not have this problem. Fresh captures contain the
+connected-support marker, proving that the preceding candidate was loaded. Weighted-skin
+checks on both actual hand meshes do not detect a large stretched surface in these samples;
+they cannot establish correct relative hand placement.
+
+The white weapon uses the asset/world contact path. Other recorded weapons use a generic
+contact cached before receiver latching. `vrik_publish_support` previously received view
+coordinates from the early solver and item coordinates from the draw publisher without a
+declared source transform. The view is a reflection; rebuilding a proper palm basis there
+and then interpreting its local contact in proper world space reverses the normal component.
+In the recorded long-gun sample the stored normal offset is +0.077 m while the native proper
+side is about -0.078 m. A deterministic source-publication test reproduces a 0.154 m error.
+
+The publisher now requires an explicit `world_from_native` transform. The solver supplies
+the inverse game view and the draw supplies its item object transform. Both convert their
+contacts to proper game-world coordinates before `vrik_set_support_world` freezes them.
+The receiver-latched world path and asset support calculation are unchanged. No handedness
+rule depends on a weapon name, model count or added positional offset.
+
+Tests compare view/item/world publication, preserve the existing world path, and reproduce
+the old reflection as a negative control. The fresh generic-source replays reconstruct the
+former input from its recorded cached contact; they are explicitly derived source cases,
+not newly observed native animation frames. All three support records pass their applicable
+matrix/connection checks and eleven left-hand draw consumers pass the weighted-surface
+guard. The recorded white-weapon local contact is byte-for-byte unchanged. Existing right
+trigger-contact, GPU lifetime, build/signature and full VXRuntime checks pass.
+
+After installing and launching this source-space correction, the user answered
+"完成というレベルにまでなりました" to the request to check the white weapon and ZL support
+on the previously crossing weapons. This is the accepted headset baseline for this support
+placement fix. The embedded renderer's `__text` SHA-256 is
+`38bef640985132aad31671538137090db3f14d28325f57129939d1e65fb9176a`.
+An ignored local checkpoint in `build/hand-session-v2/accepted-nov06-support-space/`
+preserves the matching sources, renderer, verification summary and build/test/device receipts.
+
+User acceptance, local coordinate agreement and centre-line clearances do not establish a
+new FPS result, a formal playable-level result or exhaustive finger clearance on every
+weapon. The published GitHub checkpoint remains separate; no main merge was performed.
+
+## 2026-11-06 一時完成 checkpoint
+
+The player requested publishing the accepted installed state to `hand-tracking` with
+commit subject `一時完成`. The 16:06 recording and accompanying report retain two follow-ups:
+pistol support hands should sit a little closer together, and some sights/scopes can detach
+from the weapon. This checkpoint records these as known issues and makes no new grip-spacing
+or sight-attachment runtime changes. The future live control-mode switch/main integration
+plan remains unchanged.

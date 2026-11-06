@@ -1,6 +1,6 @@
 # VXpro — hand-tracking branch
 
-**Experimental hand-tracking snapshot · 2026-11-06.** This branch develops tracked hands and
+**Temporary completion checkpoint (一時完成) · 2026-11-06.** This branch develops tracked hands and
 Joy-Con-assisted weapon handling. The standard controller version remains on
 [`main`](https://github.com/Ag3497120/VXpro/tree/main).
 
@@ -8,17 +8,18 @@ Joy-Con-assisted weapon handling. The standard controller version remains on
 
 ## Current hand-tracking state
 
-The player confirmed that **every weapon currently in their inventory is held at its trigger grip**
-on the installed build. This is a checkpoint of that working right-hand grip, before the next
-left-hand support correction. It is not an all-weapon compatibility claim.
+The player has accepted the current right-hand grip and left-hand support behavior in headset testing.
+This **一時完成** checkpoint preserves that installed state, including the support coordinate-space
+correction. It is a baseline for further polish, not an all-weapon compatibility claim.
 
 - ARKit wrist tracking moves the hands; Joy-Con buttons provide explicit actions. The weapon stays in the right hand.
 - ZR is the right-hand firing input. On long guns, holding ZL requests left-hand support and ADS; releasing it releases both.
 - X requests magazine ejection. The reload system supports magazine pickup/insertion, manual pistol slide interaction,
   and automatic chambering for non-pistols through the game equipment/ammunition bridge. Compatibility remains weapon-specific.
 - Rendered hand/weapon corrections use independent, bounded GPU buffers and preserve the game's source palettes.
-- **Still unresolved:** the supporting hand crosses the holding hand on some shotguns and machine guns; remaining
-  jitter, complete reload behavior across weapon types, and physical barrel-directed shot integration need further work.
+- **Remaining polish / known issues:** pistol support hands could sit slightly closer together; on some weapons,
+  the sight or scope can separate from the gun. Both are retained as known issues in this checkpoint.
+- Other weapon-specific reload behavior and physical barrel-directed shot integration still need verification/work.
 - Existing NPU weight-edit experiments are included as offline tools. No edited model is enabled and no FPS gain is established.
 
 Implementation, controls and verification boundaries: [HAND_SESSION.md](HAND_SESSION.md),

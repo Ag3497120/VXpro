@@ -22,6 +22,7 @@ static NSDictionary *vrik_capture_snapshot(void) {
         if (!original || !posed) continue;
         [palettes addObject:@{@"indices":@(p->count),@"list":@(p->L),@"rig":@(p->rig),
             @"bones":@(p->nb),@"asset":@(p->asset ? p->asset->asset : 0),@"applied":@(p->applied),
+            @"support_connected":@(p->support_connected),
             @"object":vrik_capture_floats(p->obj.m,12),@"view":vrik_capture_floats(p->view.m,12),
             @"original":original,@"posed":posed}];
     }

@@ -502,16 +502,16 @@ static void test_palm_contacts(void) {
     // A contact stays weapon-local for one button hold, across native ADS/
     // idle changes and frame/camera movement. Releasing allows a new contact.
     g_vk.weap[5] = VRIK_BTN_L_TRIG; g_vk.weap[7] = 2;
-    vrik_set_support(&right,&left,1);
+    vrik_set_support_world(&right,&left,1);
     vrik_grip_pose fixed = g_vk.support_local;
     left.at[0] += .2f; g_vk.capture_frame++;
-    vrik_set_support(&right,&left,1);
+    vrik_set_support_world(&right,&left,1);
     assert_grip(g_vk.support_local,fixed);
     g_vk.weap[5] = 0;
-    vrik_set_support(&right,&left,1);
+    vrik_set_support_world(&right,&left,1);
     assert(!g_vk.support_pose.locked && vrik_distance(g_vk.support_local.at,fixed.at) > .19f);
     g_vk.weap[5] = VRIK_BTN_L_TRIG; g_vk.held.epoch++;
-    vrik_set_support(&right,&left,1);
+    vrik_set_support_world(&right,&left,1);
     assert(g_vk.support_pose.locked && g_vk.support_pose.epoch == g_vk.held.epoch);
 }
 
@@ -722,6 +722,38 @@ static void test_view_handedness(void) {
     puts("left-handed game camera: physical palm basis, gun rotation and support offsets retain chirality: ok");
 }
 
+static void test_support_source_spaces(void) {
+    memset(&g_vk,0,sizeof g_vk);
+    g_vk.vcam=aff_id();g_vk.vcam.m[10]=-1;
+    g_vk.held.owner=1;g_vk.held.epoch=1;g_vk.held.at=1;
+    g_vk.held.room_from_view=aff_inv(g_vk.vcam);
+    g_vk.weap[5]=VRIK_BTN_L_TRIG;g_vk.weap[7]=2;
+    vrik_grip_pose right={{.2f,.3f,.4f},{0,1,0},{0,0,1}};
+    vrik_grip_pose left={{.123f,.55f,.4f},{0,1,0},{0,0,1}};
+    vrik_grip_pose right_view=vrik_grip_in(g_vk.vcam,&right),left_view=vrik_grip_in(g_vk.vcam,&left);
+    vrik_publish_support(1,aff_inv(g_vk.vcam),&right_view,&left_view,&right_view);
+    vrik_grip_pose shown=vrik_support_in_body(aff_inv(g_vk.vcam),&right_view,&g_vk.support_local);
+    if(vrik_distance(shown.at,left.at)>.00001f)
+        fprintf(stderr,"source-space support reflection: gap %.6f m\n",vrik_distance(shown.at,left.at));
+    assert_grip(shown,left);
+    vrik_grip_pose expected_local=g_vk.support_local;
+    // The draw-time publisher starts with an item-space source, not view.
+    aff item_world=aff_rot((float[3]){0,0,1},.6f,(float[3]){0,0,0});item_world.m[3]=.4f;
+    vrik_grip_pose right_item=vrik_grip_in(aff_inv(item_world),&right);
+    vrik_grip_pose left_item=vrik_grip_in(aff_inv(item_world),&left);
+    g_vk.support_pose.locked=0;g_vk.held.epoch++;
+    vrik_publish_support(1,item_world,&right_item,&left_item,&right_view);
+    assert_grip(g_vk.support_local,expected_local);
+    // Preserve the existing proper-world path used after receiver latching.
+    g_vk.support_pose.locked=0;g_vk.held.epoch++;
+    vrik_set_support_world(&right,&left,1);assert_grip(g_vk.support_local,expected_local);
+    // Negative control for the former view/world mixture.
+    vrik_grip_pose reflected=vrik_grip_in(aff_inv(vrik_grip_basis(&right_view)),&left_view);
+    vrik_grip_pose bad=vrik_support_in_body(aff_inv(g_vk.vcam),&right_view,&reflected);
+    assert(vrik_distance(bad.at,left.at)>.1539f);
+    puts("support source spaces: view, item and world publications agree; former 154 mm reflection reproduced: ok");
+}
+
 static aff test_json_aff(NSArray *values,unsigned offset) {
     assert(values.count>=offset+12);aff result;
     for(int k=0;k<12;k++)result.m[k]=[values[offset+k] floatValue];
@@ -825,6 +857,190 @@ static void test_device_replays(void) {
     assert(checked>=3);printf("device replays: %u matched receivers checked; %u samples lack a captured recognized receiver\n",checked,unmatched);
 }
 
+static NSArray *test_aff_values(const aff *matrices, unsigned count) {
+    NSMutableArray *values=[NSMutableArray array];
+    for(unsigned k=0;k<count;k++)for(int j=0;j<12;j++)[values addObject:@(matrices[k].m[j])];
+    return values;
+}
+
+static void test_independent_support_sources(void) {
+    float shoulder[3]={0,0,0},upper_end[3]={0,.28f,0},pole[3]={-.6f,-1,-.35f},fallback[3]={0,0,-1};
+    for(int sample=0;sample<48;sample++) {
+        float angle=sample*.131f;
+        float target[3]={.4f*cosf(angle),.15f,.4f*sinf(angle)};
+        vrik_arm_solution first;
+        for(int source=0;source<2;source++) {
+            float elbow[3]={source*.19f,.28f-source*.11f,source*.07f};
+            float wrist[3]={elbow[0]+.27f,elbow[1],elbow[2]};
+            vrik_arm_solution solved;
+            assert(vrik_two_bone(shoulder,upper_end,elbow,wrist,target,pole,fallback,1,&solved));
+            float end[3];aff_pt(solved.upper.m,upper_end,end);
+            assert(vrik_distance(end,solved.elbow)<.00001f);
+            aff_pt(solved.forearm.m,elbow,end);assert(vrik_distance(end,solved.elbow)<.00001f);
+            aff_pt(solved.forearm.m,wrist,end);assert(vrik_distance(end,target)<.00001f);
+            assert(test_determinant(solved.forearm)>.99f);
+            if(source) {
+                assert(vrik_distance(first.elbow,solved.elbow)<.00001f);
+                assert(vrik_distance(first.wrist,solved.wrist)<.00001f);
+            } else first=solved;
+        }
+    }
+    puts("support chain: 48 targets, independent native sleeve/forearm sources retain the same elbow and wrist: ok");
+}
+
+// Optional private device records. Export only matrices for the separate
+// weighted-mesh check; neither fixtures nor original geometry enter the repo.
+static void test_support_consumers(void) {
+    const char *directory=getenv("VXMAC_TEST_SUPPORT_DIR");if(!directory)return;
+    const char *output=getenv("VXMAC_TEST_SUPPORT_OUTPUT");assert(output);
+    [[NSFileManager defaultManager] createDirectoryAtPath:@(output) withIntermediateDirectories:YES attributes:nil error:nil];
+    unsigned checked=0;
+    for(NSString *file in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@(directory) error:nil]) {
+        if(![file.pathExtension isEqualToString:@"json"])continue;
+        NSDictionary *record=[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:
+            [@(directory) stringByAppendingPathComponent:file]] options:0 error:nil];
+        if(![record[@"support"] boolValue] || ![record[@"support_locked"] boolValue])continue;
+        NSDictionary *body=nil;
+        for(NSDictionary *p in record[@"palettes"]) {
+            int list=[p[@"list"] intValue];if(list<0)continue;
+            unsigned offset=vrik_list_off[list];int a=0,f=0;
+            for(unsigned k=0;k<[p[@"bones"] unsignedIntValue];k++) {
+                a|=vrik_list[offset+k]==VRIK_LEFTARM;f|=vrik_list[offset+k]==VRIK_LEFTFOREARM;
+            }
+            if(a && f) {body=p;break;}
+        }
+        assert(body);
+        memset(&g_vk,0,sizeof g_vk);
+        unsigned frame=[record[@"frame"] unsignedIntValue];
+        g_vk.rigv=g_vk.held.rig=[body[@"rig"] intValue];
+        g_vk.capture_frame=g_vk.solve_frame=frame;g_vk.capture_body=1;
+        g_vk.obj=test_json_aff(body[@"object"],0);g_vk.vcam=test_json_aff(body[@"view"],0);
+        g_vk.held.owner=1;g_vk.held.epoch=1;g_vk.held.wrists=3;g_vk.held.at=1;
+        g_vk.held.room_from_view=aff_inv(g_vk.vcam);
+        g_vk.held.right_grip_view=test_json_aff(record[@"tracked_grip"],0);
+        g_vk.held.right_grip_frame=frame;g_vk.held.right_grip_valid=1;
+        g_vk.weap[5]=VRIK_BTN_L_TRIG;g_vk.weap[6]=2;g_vk.weap[7]=2;
+        g_vk.support_local_owner=1;g_vk.support_local_at=1;
+        float stored_support[9];for(int k=0;k<9;k++)stored_support[k]=[record[@"support_local"][k] floatValue];
+        memcpy(&g_vk.support_local,stored_support,sizeof stored_support);
+        g_vk.support_pose.locked=1;g_vk.support_pose.epoch=1;g_vk.support_pose.generation=1;
+        int reconstructed=getenv("VXMAC_TEST_SUPPORT_SOURCE_REPLAY") && ![record[@"frame_uses_asset"] boolValue];
+        if(reconstructed) {
+            // Reconstruct the former view-space input from its recorded
+            // cached contact. This tests source conversion, not a claim that
+            // an uncaptured animation frame was observed on the device.
+            float values[9];for(int k=0;k<9;k++)values[k]=[record[@"native_grip"][k] floatValue];
+            vrik_grip_pose native;memcpy(&native,values,sizeof values);
+            vrik_grip_pose old_source=vrik_grip_in(vrik_grip_basis(&native),&g_vk.support_local),target;
+            assert(vrik_draw_grip(1,0,&target));g_vk.support_pose.locked=0;
+            vrik_publish_support(1,aff_inv(g_vk.vcam),&native,&old_source,&target);
+            stored_support[2]*=-1;stored_support[5]*=-1;stored_support[8]*=-1;
+            vrik_grip_pose proper;memcpy(&proper,stored_support,sizeof proper);assert_grip(g_vk.support_local,proper);
+        }
+        for(int k=0;k<7;k++)g_vk.D[k]=aff_id();
+        for(int side=0;side<2;side++)g_vk.D_w0[side]=g_vk.D_w1[side]=g_vk.D_w2[side]=aff_id();
+        unsigned bo=vrik_list_off[[body[@"list"] intValue]];
+        for(unsigned k=0;k<[body[@"bones"] unsignedIntValue];k++) {
+            int name=vrik_list[bo+k];aff source=test_json_aff(body[@"original"],k*12);
+            if(name==VRIK_LEFTARM)g_vk.SA[0]=source;
+            if(name==VRIK_LEFTFOREARM) {g_vk.SF[0]=source;g_vk.have_af[0]=1;}
+        }
+        // Match the same anatomical seams used by capture; unrelated tail
+        // rows in a partial cyberware palette do not choose the arm source.
+        const float *h=vrik_bindpos(g_vk.rigv,VRIK_LEFTHAND),*f=vrik_bindpos(g_vk.rigv,VRIK_LEFTFOREARM);
+        for(NSDictionary *p in record[@"palettes"]) {
+            int list=[p[@"list"] intValue];if(list<0 || g_vk.have_h[0])continue;
+            unsigned offset=vrik_list_off[list];int w=-1,fore=-1;
+            for(unsigned k=0;k<[p[@"bones"] unsignedIntValue];k++) {
+                if(vrik_list[offset+k]==VRIK_LEFTHAND)w=k;
+                if(vrik_list[offset+k]==VRIK_LEFTFOREARM)fore=k;
+            }
+            if(w<0 || fore<0)continue;
+            aff into_body=aff_mul(aff_inv(g_vk.obj),test_json_aff(p[@"object"],0));
+            aff hand=aff_mul(into_body,test_json_aff(p[@"original"],w*12));
+            aff arm=aff_mul(into_body,test_json_aff(p[@"original"],fore*12));
+            float ea[3],ef[3],wf[3],wh[3];
+            aff_pt(g_vk.SA[0].m,f,ea);aff_pt(arm.m,f,ef);aff_pt(arm.m,h,wf);aff_pt(hand.m,h,wh);
+            if(vrik_distance(ea,ef)<.02f && vrik_distance(wf,wh)<.02f) {
+                g_vk.SF[0]=arm;g_vk.SH[0]=hand;g_vk.have_h[0]=1;
+            }
+        }
+        aff untouched[7];memcpy(untouched,g_vk.D,sizeof untouched);
+        unsigned connections=0;
+        NSMutableArray *palettes=[NSMutableArray array];
+        for(NSDictionary *p in record[@"palettes"]) {
+            int list=[p[@"list"] intValue];if(list<0)continue;
+            vrik_pal pal={.L=list,.rig=[p[@"rig"] intValue],.frame=frame,.cap_b=128,
+                .nb=[p[@"bones"] unsignedIntValue],.count=[p[@"indices"] unsignedLongValue]};
+            pal.obj=test_json_aff(p[@"object"],0);pal.view=test_json_aff(p[@"view"],0);
+            pal.indices=(const void *)(uintptr_t)(list+1);pal.P=(uint8_t *)pal.posed;
+            for(unsigned k=0;k<pal.nb;k++)pal.posed[k]=pal.orig[k]=test_json_aff(p[@"original"],k*12);
+            vrik_apply_pal_pose(&pal);assert(pal.applied);
+            int wrist=-1,fore=-1;
+            for(unsigned k=0;k<pal.nb;k++) {
+                int name=vrik_list[vrik_list_off[list]+k];
+                if(name==VRIK_LEFTHAND)wrist=k;
+                if(name==VRIK_LEFTFOREARM)fore=k;
+            }
+            if(fore>=0 && wrist<0) {
+                vrik_grip_pose grip;assert(vrik_draw_grip(1,0,&grip));
+                vrik_grip_pose expected=vrik_support_in_body(aff_inv(aff_mul(pal.view,pal.obj)),&grip,&g_vk.support_local);
+                float endpoint[3];aff_pt(pal.posed[fore].m,h,endpoint);
+                if(vrik_distance(endpoint,expected.at)>=.001f)
+                    fprintf(stderr,"support sleeve %s list=%d indices=%lu gap=%.6f\n",file.UTF8String,list,
+                            (unsigned long)pal.count,vrik_distance(endpoint,expected.at));
+                assert(vrik_distance(endpoint,expected.at)<.001f);
+            }
+            float native_hand[3],native_fore[3];int connected=0;
+            if(wrist>=0 && fore>=0) {
+                aff_pt(pal.orig[wrist].m,h,native_hand);aff_pt(pal.orig[fore].m,h,native_fore);
+                connected=vrik_distance(native_hand,native_fore)<.02f;
+            }
+            if(connected) {
+                const float *bind=vrik_bindpos(pal.rig,VRIK_LEFTHAND);
+                float hand_end[3],fore_end[3];
+                aff_pt(pal.posed[wrist].m,bind,hand_end);aff_pt(pal.posed[fore].m,bind,fore_end);
+                if(vrik_distance(hand_end,fore_end)>=.001f) {
+                    float shoulder[3],elbow[3];
+                    aff_pt(g_vk.SA[0].m,vrik_bindpos(pal.rig,VRIK_LEFTARM),shoulder);
+                    aff_pt(pal.orig[fore].m,f,elbow);
+                    fprintf(stderr,"support seam %s list=%d indices=%lu gap=%.6f upper=%.6f fore=%.6f source_rot=%d/%d/%d\n",file.UTF8String,list,
+                            (unsigned long)pal.count,vrik_distance(hand_end,fore_end),vrik_distance(shoulder,elbow),
+                            vrik_distance(elbow,native_fore),vrik_is_rot(g_vk.SA[0].m),vrik_is_rot(pal.orig[fore].m),vrik_is_rot(pal.orig[wrist].m));
+                }
+                assert(vrik_distance(hand_end,fore_end)<.001f);connections++;
+            }
+            NSMutableDictionary *result=[p mutableCopy];result[@"posed"]=test_aff_values(pal.posed,pal.nb);
+            result[@"support_connected"]=@(pal.support_connected);
+            [palettes addObject:result];
+        }
+        assert(connections);
+        // A later, incompatible skin consumer must not replace any of the
+        // earlier consumer's frozen matrices, even when names overlap.
+        for(NSDictionary *p in [palettes reverseObjectEnumerator]) {
+            int list=[p[@"list"] intValue];
+            vrik_pal pal={.L=list,.rig=[p[@"rig"] intValue],.frame=frame,.cap_b=128,
+                .nb=[p[@"bones"] unsignedIntValue],.count=[p[@"indices"] unsignedLongValue]};
+            pal.obj=test_json_aff(p[@"object"],0);pal.view=test_json_aff(p[@"view"],0);
+            pal.indices=(const void *)(uintptr_t)(list+1);pal.P=(uint8_t *)pal.posed;
+            for(unsigned k=0;k<pal.nb;k++)pal.posed[k]=pal.orig[k]=test_json_aff(p[@"original"],k*12);
+            vrik_apply_pal_pose(&pal);
+            for(unsigned k=0;k<pal.nb;k++)for(int j=0;j<12;j++)
+                assert(fabsf(pal.posed[k].m[j]-[p[@"posed"][k*12+j] floatValue])<.00002f);
+        }
+        assert(!memcmp(untouched,g_vk.D,sizeof untouched));
+        NSMutableDictionary *result=[record mutableCopy];result[@"palettes"]=palettes;
+        NSMutableArray *support_values=[NSMutableArray array];
+        float support_out[9];memcpy(support_out,&g_vk.support_local,sizeof support_out);
+        for(int k=0;k<9;k++)[support_values addObject:@(support_out[k])];
+        result[@"support_local"]=support_values;result[@"support_source_reconstructed"]=@(reconstructed);
+        NSData *data=[NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
+        assert([data writeToFile:[@(output) stringByAppendingPathComponent:file] atomically:YES]);
+        checked++;
+    }
+    assert(checked>=3);printf("support consumer replays: %u records; skin-consumer isolation, repeat order, immutable global arm solve: ok\n",checked);
+}
+
 int main(void) { @autoreleasepool {
     setenv("VXMAC_JOY_HOLD", "1", 1);
     test_saved_shader_profiles();
@@ -837,6 +1053,9 @@ int main(void) { @autoreleasepool {
     test_geometry_cache();
     test_view_handedness();
     test_device_replays();
+    test_support_source_spaces();
+    test_independent_support_sources();
+    test_support_consumers();
     memset(&g_vk, 0, sizeof g_vk);
     g_vk.capture_body = g_vk.weapon_origin_valid = 1;
     g_vk.capture_frame = g_vk.solve_frame = 7;

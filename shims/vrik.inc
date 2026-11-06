@@ -314,13 +314,24 @@ typedef struct {
     uint32_t cap_b, max_b, strict_rot, nb;
     const void *indices;
     NSUInteger index_offset, count;
-    int L, rig, applied, mod_k1, mod_k2, magazine, receiver;
+    int L, rig, applied, mod_k1, mod_k2, magazine, receiver, support_connected;
     const vrik_asset_profile *asset;
     unsigned stamp, frame;
     aff obj, view, mod1, mod2;
     aff orig[128];
     aff posed[128];
 } vrik_pal;
+
+// Skin matrices include the mesh's own inverse bind transform. A bone name
+// alone cannot share a frozen matrix between the hand and its cyberware.
+typedef struct {
+    const void *indices;
+    NSUInteger offset, count;
+    int list, rig;
+    unsigned touch, generation, bones;
+    aff in_hand[128];
+    uint8_t valid[128];
+} vrik_support_shape;
 
 extern int vxmtl_retain_for_encoder(id encoder, id resource);
 extern id vxmtl_command_buffer_for_encoder(id encoder);
@@ -517,8 +528,8 @@ static struct {
     struct {
         int locked;
         unsigned epoch;
-        aff bones[VRIK_NNAMES];
-        uint8_t valid[VRIK_NNAMES];
+        unsigned generation, clock;
+        vrik_support_shape shapes[32];
     } support_pose;
     float well_room[3], rack_room[6];
     int reload_owner, reload_mesh, rack_valid, rack_auto;
@@ -901,7 +912,7 @@ static int vrik_support_requested(void) {
            ((unsigned)g_vk.weap[5] & VRIK_BTN_L_TRIG) && !g_vk.slide_active;
 }
 
-static void vrik_set_support(const vrik_grip_pose *grip, const vrik_grip_pose *support, int owner) {
+static void vrik_set_support_world(const vrik_grip_pose *grip, const vrik_grip_pose *support, int owner) {
     int active = vrik_support_requested();
     if (!active || g_vk.support_pose.epoch != g_vk.held.epoch) g_vk.support_pose.locked = 0;
     if (!support || (active && g_vk.support_pose.locked)) return;
@@ -911,7 +922,7 @@ static void vrik_set_support(const vrik_grip_pose *grip, const vrik_grip_pose *s
     if (active) {
         g_vk.support_pose.locked = 1;
         g_vk.support_pose.epoch = g_vk.held.epoch;
-        memset(g_vk.support_pose.valid, 0, sizeof g_vk.support_pose.valid);
+        g_vk.support_pose.generation++;
     }
 }
 
@@ -945,7 +956,7 @@ static int vrik_latch_weapon_frame(void) {
     frame->epoch = g_vk.held.epoch;
     frame->valid = 1;
     if (frame->support_valid && !g_vk.asset_grip.valid) {
-        vrik_set_support(&frame->native_world, &frame->support_world, 1);
+        vrik_set_support_world(&frame->native_world, &frame->support_world, 1);
     }
     return 1;
 }
@@ -965,12 +976,17 @@ static void vrik_publish_right_grip(void) {
 
 static int vrik_draw_grip(int owner, int solved, vrik_grip_pose *grip);
 
-static void vrik_publish_support(int owner, const vrik_grip_pose *native_grip,
+// Source contacts must be converted explicitly: the early solver supplies
+// camera-view coordinates (a reflection), while a draw supplies item space.
+// Only proper game-world coordinates may define the cached local contact.
+static void vrik_publish_support(int owner, aff world_from_native, const vrik_grip_pose *native_grip,
                                  const vrik_grip_pose *native_support, const vrik_grip_pose *target) {
     int latched = owner == 1 && g_vk.weapon_frame.valid && g_vk.weapon_frame.frame == g_vk.capture_frame &&
                   g_vk.weapon_frame.epoch == g_vk.held.epoch;
     if (native_support && !latched && !g_vk.asset_grip.valid) {
-        vrik_set_support(native_grip, native_support, owner);
+        vrik_grip_pose world_grip=vrik_grip_in(world_from_native,native_grip);
+        vrik_grip_pose world_support=vrik_grip_in(world_from_native,native_support);
+        vrik_set_support_world(&world_grip,&world_support,owner);
     }
     if (g_vk.support_local_at <= 0 || g_vk.support_local_owner != owner) return;
     aff room_from_grip = aff_mul(g_vk.held.room_from_view, vrik_view_palm_basis(target));
@@ -1167,7 +1183,7 @@ static void vrik_solve_all(void) {
     if (paired_right && (g_vk.held.wrists & 2u) && vrik_draw_grip(1, 0, &target_grip)) {
         // Native support can be captured from the arm meshes even when the
         // receiver has a different origin or has not been drawn yet.
-        vrik_publish_support(1, &g_vk.native_item_grip,
+        vrik_publish_support(1, aff_inv(g_vk.vcam), &g_vk.native_item_grip,
                              g_vk.item_support_valid ? &g_vk.native_item_support : NULL, &target_grip);
     }
     if (!joy_weapon) {
@@ -1908,7 +1924,7 @@ static void vrik_asset_support(const vrik_asset_profile *asset, aff root, const 
         g_vk.support_local = vrik_grip_in(aff_inv(vrik_grip_basis(source)),&wrist);
         g_vk.support_local_owner = 1; g_vk.support_local_at = g_vk.held.at;
         if (active) {
-            memset(g_vk.support_pose.valid,0,sizeof g_vk.support_pose.valid);
+            g_vk.support_pose.generation++;
             g_vk.support_pose.locked = 1; g_vk.support_pose.epoch = g_vk.held.epoch;
         }
     }
@@ -2015,7 +2031,7 @@ static void vrik_note_drawn_grip(const vrik_pal *pal, vrik_item_grip *item, aff 
         item->bore_sign = native_view.m[9] > 0 ? 1 : -1;
     aff item_view = aff_mul(aff_inv(g_vk.held.room_from_view), room_from_item);
     vrik_grip_pose owner_grip = vrik_grip_in(item_view, source);
-    vrik_publish_support(owner, source, support, &owner_grip);
+    vrik_publish_support(owner, pal->obj, source, support, &owner_grip);
     if (item && item->bore_sign) {
         aff bore=pal->asset ? aff_mul(room_from_item,pal->orig[pal->asset->root]) : room_from_item;
         aff_dir(bore.m, (float[3]){0, item->bore_sign, 0}, g_vk.bore_room);
@@ -2304,8 +2320,126 @@ static int vrik_held_bone(int side, int name, int segment) {
            name == 2148 || name == 2149 || name == 2150;
 }
 
+typedef struct {
+    aff upper, forearm;
+    float elbow[3], wrist[3], axis[3];
+} vrik_arm_solution;
+
+// The final receiver contact moves the whole arm, using this consumer's
+// immutable source. It never overwrites the earlier free-hand/right-arm solve.
+static int vrik_two_bone(const float S[3],const float upper_end[3],const float E[3],const float W[3],const float T[3],
+                         const float pole[3],const float fallback[3],int exact,vrik_arm_solution *out) {
+    float a0[3],b0[3],u[3],n[3];
+    for(int i=0;i<3;i++) {a0[i]=upper_end[i]-S[i];b0[i]=W[i]-E[i];u[i]=T[i]-S[i];n[i]=pole[i];}
+    float a=v3len(a0),b=v3len(b0),d=v3len(u);
+    if(a<.001f || b<.001f || d<.001f)return 0;
+    v3norm(u);
+    float dc=fmaxf(fabsf(a-b)+.01f,fminf(a+b-.002f,d));
+    float k=v3dot(n,u);for(int i=0;i<3;i++)n[i]-=k*u[i];
+    if(!v3norm(n)) {
+        memcpy(n,fallback,sizeof n);k=v3dot(n,u);for(int i=0;i<3;i++)n[i]-=k*u[i];
+        if(!v3norm(n))return 0;
+    }
+    float ca=(a*a+dc*dc-b*b)/(2*a*dc);ca=fmaxf(-1,fminf(1,ca));float sa=sqrtf(1-ca*ca);
+    for(int i=0;i<3;i++) {out->elbow[i]=S[i]+a*(ca*u[i]+sa*n[i]);out->wrist[i]=S[i]+dc*u[i];}
+    float e1[3],f1[3];
+    for(int i=0;i<3;i++)e1[i]=out->elbow[i]-S[i];
+    out->upper=aff_arc(a0,e1,S);
+    for(int i=0;i<3;i++)f1[i]=out->wrist[i]-out->elbow[i];
+    // The native hand/accessory and sleeve can have different elbow poses.
+    // Map each source forearm directly to the solved elbow, rather than
+    // rotating it about another consumer's source elbow.
+    out->forearm=aff_arc(b0,f1,E);
+    for(int i=0;i<3;i++)out->forearm.m[i*4+3]+=out->elbow[i]-E[i];
+    memcpy(out->axis,f1,sizeof f1);v3norm(out->axis);
+    if(exact && fabsf(dc-d)>.0001f) {
+        float direction[3];for(int i=0;i<3;i++)direction[i]=T[i]-out->elbow[i];
+        float length=v3len(direction);
+        if(!v3norm(direction))return 0;
+        aff stretch=aff_id();float scale=length/b-1.f;
+        for(int row=0;row<3;row++) {
+            for(int col=0;col<3;col++)stretch.m[row*4+col]+=scale*direction[row]*direction[col];
+            stretch.m[row*4+3]=-scale*direction[row]*v3dot(direction,out->elbow);
+        }
+        out->forearm=aff_mul(stretch,aff_mul(aff_arc(out->axis,direction,out->elbow),out->forearm));
+        memcpy(out->wrist,T,sizeof out->wrist);memcpy(out->axis,direction,sizeof out->axis);
+    }
+    return 1;
+}
+
+static int vrik_support_arm(const vrik_pal *pal, const aff *hand,
+                            const vrik_grip_pose *target, aff delta[5]) {
+    if (pal->rig != g_vk.rigv || !hand) return 0;
+    const float *a=vrik_bindpos(pal->rig,VRIK_LEFTARM), *f=vrik_bindpos(pal->rig,VRIK_LEFTFOREARM),
+                *h=vrik_bindpos(pal->rig,VRIK_LEFTHAND);
+    if (!a || !f || !h) return 0;
+    const aff *upper=g_vk.have_af[0] ? &g_vk.SA[0] : NULL;
+    const aff *fore=g_vk.have_af[0] ? &g_vk.SF[0] : NULL;
+    int own_upper=0;
+    unsigned offset=vrik_list_off[pal->L];
+    for (unsigned k=0;k<pal->nb;k++) {
+        if (vrik_list[offset+k]==VRIK_LEFTARM) {upper=&pal->orig[k];own_upper=2;}
+        else if (vrik_list[offset+k]==VRIK_L_SHL_0_JNT && own_upper<2) {upper=&pal->orig[k];own_upper=1;}
+        if (vrik_list[offset+k]==VRIK_LEFTFOREARM) fore=&pal->orig[k];
+    }
+    if (!upper || !fore || !vrik_is_rot(upper->m) || !vrik_is_rot(fore->m) || !vrik_is_rot(hand->m)) return 0;
+    float S[3],E[3],W[3],end[3],wrist[3];
+    aff_pt(upper->m,a,S);aff_pt(upper->m,f,end);
+    aff_pt(fore->m,f,E);aff_pt(fore->m,h,W);aff_pt(hand->m,h,wrist);
+    // A hand-only consumer can use a later native forearm pose than the
+    // sleeve. Its own wrist/forearm pair is authoritative; the earlier upper
+    // arm supplies only the shoulder position when it has no upper-arm bone.
+    if ((own_upper && vrik_distance(end,E)>.025f) ||
+        vrik_distance(W,wrist)>.025f ||
+        vrik_distance(S,target->at)>.9f) return 0;
+    aff from_view=aff_inv(aff_mul(pal->view,pal->obj));
+    float pole[3],fallback[3];
+    aff_dir(from_view.m,(float[3]){-.60f,-1.f,-.35f},pole);
+    aff_dir(from_view.m,(float[3]){0,0,-1},fallback);
+    vrik_arm_solution solved;
+    if (!vrik_two_bone(S,end,E,W,target->at,pole,fallback,1,&solved)) return 0;
+    vrik_grip_pose native;
+    if (!vrik_wrist_frame_from(0,*hand,native.at,native.fwd,native.up)) return 0;
+    float f2[3],up2[3],up[3],cross[3];
+    aff_dir(solved.forearm.m,native.fwd,f2);v3norm(f2);
+    aff_dir(solved.forearm.m,native.up,up2);memcpy(up,target->up,sizeof up);
+    float d1=v3dot(up2,solved.axis),d2=v3dot(up,solved.axis);
+    for (int i=0;i<3;i++) {up2[i]-=d1*solved.axis[i];up[i]-=d2*solved.axis[i];}
+    float roll=0;
+    if (v3norm(up2) && v3norm(up)) {v3cross(up2,up,cross);roll=atan2f(v3dot(cross,solved.axis),v3dot(up2,up));}
+    float half[3];for (int i=0;i<3;i++) half[i]=f2[i]+target->fwd[i];
+    if (!v3norm(half)) memcpy(half,target->fwd,sizeof half);
+    delta[0]=solved.upper;delta[1]=solved.forearm;
+    delta[2]=aff_mul(aff_rot(solved.axis,.30f*roll,solved.wrist),solved.forearm);
+    delta[3]=aff_mul(aff_rot(solved.axis,.60f*roll,solved.wrist),solved.forearm);
+    delta[4]=aff_mul(aff_rot(half,.85f*roll,solved.wrist),
+                     aff_mul(aff_arc(f2,half,solved.wrist),solved.forearm));
+    return 1;
+}
+
+static vrik_support_shape *vrik_support_shape_for(const vrik_pal *pal) {
+    vrik_support_shape *oldest=&g_vk.support_pose.shapes[0];
+    unsigned clock=++g_vk.support_pose.clock;
+    for (unsigned i=0;i<32;i++) {
+        vrik_support_shape *shape=&g_vk.support_pose.shapes[i];
+        if (shape->bones && shape->generation==g_vk.support_pose.generation &&
+            shape->indices==pal->indices && shape->offset==pal->index_offset &&
+            shape->count==pal->count && shape->list==pal->L && shape->rig==pal->rig && shape->bones==pal->nb) {
+            shape->touch=clock;return shape;
+        }
+        if (!shape->bones || shape->generation!=g_vk.support_pose.generation) oldest=shape;
+        else if (oldest->bones && oldest->generation==g_vk.support_pose.generation && shape->touch<oldest->touch) oldest=shape;
+    }
+    oldest->indices=pal->indices;oldest->offset=pal->index_offset;oldest->count=pal->count;
+    oldest->list=pal->L;oldest->rig=pal->rig;oldest->bones=0;
+    oldest->generation=g_vk.support_pose.generation;oldest->touch=clock;
+    memset(oldest->valid,0,sizeof oldest->valid);
+    return oldest;
+}
+
 static void vrik_apply_pal_pose(vrik_pal *pal) {
     if (pal->nb == 0 || pal->nb > pal->cap_b) return;
+    pal->support_connected=0;
     if (pal->L >= 0 && g_vk.capture_body && pal->rig == g_vk.rigv &&
         memcmp(&pal->obj, &g_vk.obj, sizeof(aff))) {
         aff body_from_pal = aff_mul(aff_inv(g_vk.obj), pal->obj);
@@ -2321,6 +2455,7 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
             pal->mod_k1 = body.mod_k1; pal->mod_k2 = body.mod_k2;
             pal->mod1 = ((aff *)pal->P)[pal->mod_k1]; pal->mod2 = ((aff *)pal->P)[pal->mod_k2];
             pal->applied = 1;
+            pal->support_connected=body.support_connected;
         }
         return;
     }
@@ -2365,32 +2500,39 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
                                             hand_target.at, hand_target.fwd, hand_target.up);
             placed_hand = aff_mul(grip_delta, *source_hand);
         }
-        aff support_delta;
+        aff support_delta, support_chain[5];
+        vrik_grip_pose support_target;
+        const aff *support_source=left_wrist>=0 ? &pal->orig[left_wrist] :
+                                  g_vk.have_h[0] ? &g_vk.SH[0] : NULL;
         int place_support = 0;
-        if (target_valid && held_owner == 1 && left_wrist >= 0 && g_vk.slide_active) {
+        if (target_valid && held_owner == 1 && support_source && g_vk.slide_active) {
             vrik_grip_pose native;
-            if (vrik_wrist_frame_from(0, pal->orig[left_wrist], native.at, native.fwd, native.up)) {
+            if (vrik_wrist_frame_from(0, *support_source, native.at, native.fwd, native.up)) {
                 aff arm_from_view = aff_mul(arm_from_room, g_vk.held.room_from_view);
                 vrik_grip_pose snapped = vrik_grip_in(arm_from_view, &g_vk.slide_hand);
+                support_target=snapped;
                 support_delta = vrik_retarget_grip(native.at, native.fwd, native.up,
                                                    snapped.at, snapped.fwd, snapped.up);
                 place_support = 1;
             }
-        } else if (target_valid && held_owner == 1 && left_wrist >= 0 && g_vk.support_pose.locked && g_vk.weap[7] > .5f &&
+        } else if (target_valid && held_owner == 1 && support_source && g_vk.support_pose.locked && g_vk.weap[7] > .5f &&
             ((unsigned)g_vk.weap[5] & VRIK_BTN_L_TRIG) && g_vk.support_local_owner == 1 &&
             g_vk.support_local_at > 0) {
             vrik_grip_pose native;
-            if (vrik_wrist_frame_from(0, pal->orig[left_wrist], native.at, native.fwd, native.up)) {
+            if (vrik_wrist_frame_from(0, *support_source, native.at, native.fwd, native.up)) {
                 aff body_from_view=aff_mul(arm_from_room,g_vk.held.room_from_view);
                 vrik_grip_pose supported = vrik_support_in_body(body_from_view,&target,&g_vk.support_local);
+                support_target=supported;
                 support_delta = vrik_retarget_grip(native.at, native.fwd, native.up,
                                                    supported.at, supported.fwd, supported.up);
                 place_support = 1;
                 g_vk.support_at = g_vk.held.at;
             }
         }
+        int connected_support=place_support && vrik_support_arm(pal,support_source,&support_target,support_chain);
+        pal->support_connected=connected_support;
         aff support_from_hand = aff_id(), supported_hand = aff_id();
-        int keep_support_pose = place_support && g_vk.support_pose.locked && !g_vk.slide_active;
+        int keep_support_pose = place_support && left_wrist>=0 && g_vk.support_pose.locked && !g_vk.slide_active;
         if (keep_support_pose) {
             vrik_grip_pose wrist;
             keep_support_pose = vrik_wrist_frame_from(0, pal->orig[left_wrist], wrist.at, wrist.fwd, wrist.up);
@@ -2421,21 +2563,40 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
             if (has_l_fng) vrik_capture_hand_shape(0,pal,o,M_fng_l);
             if (has_r_fng) vrik_capture_hand_shape(1,pal,o,M_fng_r);
         }
+        vrik_support_shape *support_shape=NULL;
+        if (keep_support_pose) {
+            support_shape=vrik_support_shape_for(pal);
+            if (!support_shape->bones) {
+                for (unsigned k=0;k<pal->nb;k++) {
+                    aff original=has_l_fng ? aff_mul(M_fng_l[k],pal->orig[k]) : pal->orig[k];
+                    if(vrik_is_bone(original.m)) {
+                        support_shape->in_hand[k]=aff_mul(support_from_hand,original);
+                        support_shape->valid[k]=1;
+                    }
+                }
+                support_shape->bones=pal->nb;
+            }
+        }
         int k1 = -1, k2 = -1;
         for (uint32_t k = 0; k < pal->nb; k++) {
             int nm = vrik_list[o + k], s = vrik_seg[nm];
             aff *dst = (aff *)(pal->P + (size_t)k * 48);
             int hold_bone = hold_arm && vrik_held_bone(held_owner, nm, s);
-            if (!live_arm && !hold_bone && !(place_support && s == 3)) continue;
-            if (place_support && s == 3) {
+            int support_bone=place_support && vrik_held_bone(0,nm,s);
+            if (!live_arm && !hold_bone && !support_bone) continue;
+            if (connected_support && nm==1503) *dst=aff_mul(support_chain[2],pal->orig[k]);
+            else if (connected_support && nm==1504) *dst=aff_mul(support_chain[3],pal->orig[k]);
+            else if (connected_support && (nm==1505 || nm==1678 || nm==1680 || nm==1682))
+                *dst=aff_mul(support_chain[4],pal->orig[k]);
+            else if (connected_support && (s==1 || s==2)) *dst=aff_mul(support_chain[s-1],pal->orig[k]);
+            else if (place_support && s == 3) {
                 aff original = has_l_fng ? aff_mul(M_fng_l[k], pal->orig[k]) : pal->orig[k];
-                if (keep_support_pose) {
-                    if (!g_vk.support_pose.valid[nm]) {
-                        g_vk.support_pose.bones[nm] = aff_mul(support_from_hand, original);
-                        g_vk.support_pose.valid[nm] = 1;
-                    }
-                    *dst = aff_mul(supported_hand, g_vk.support_pose.bones[nm]);
-                } else *dst = aff_mul(support_delta, original);
+                if(support_shape && !support_shape->valid[k] && vrik_is_bone(original.m)) {
+                    support_shape->in_hand[k]=aff_mul(support_from_hand,original);
+                    support_shape->valid[k]=1;
+                }
+                *dst=support_shape && support_shape->valid[k] ?
+                     aff_mul(supported_hand,support_shape->in_hand[k]) : aff_mul(support_delta,original);
             }
             else if (!live_arm) *dst = pal->orig[k];
             else if (nm == 1503) *dst = aff_mul(g_vk.D_w0[0], pal->orig[k]); // l_Wrist_0_JNT (30% forearm roll)
