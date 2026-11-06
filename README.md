@@ -24,6 +24,17 @@ left-hand support correction. It is not an all-weapon compatibility claim.
 Implementation, controls and verification boundaries: [HAND_SESSION.md](HAND_SESSION.md),
 [design notes](docs/DESIGN.md), [NPU experiments](NPU_WEIGHT_EDIT.md).
 
+## Integration plan
+
+Stabilize this branch before integrating it into `main`. Integration must include an in-game,
+immediate switch between standard controller play and tracked-hand play, without restarting the
+app or reloading a save. Both modes keep VR head tracking.
+
+Only one mode owns gameplay input at a time. Switching must release the previous mode's trigger,
+ADS and grip inputs, preserve the equipped weapon and real ammunition/reload state, and change
+hand/weapon rendering with the same mode update. Verify switches during firing, support, reload,
+tracking loss, menus and weapon changes before integration. This switch is planned, not implemented.
+
 ## Use this branch
 
 ```sh

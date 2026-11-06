@@ -20,6 +20,20 @@ Prove a complete eject → acquire magazine → insert → manual rack → fire 
 actual ammunition, before expanding the pose writer to other weapons. Later, long guns keep manual
 magazine insertion, automatic chambering and ZL-held support/ADS as requested.
 
+## Planned integration gate
+
+The user plans to integrate `hand-tracking` into `main` only after stabilization. That integration
+must add immediate in-game switching between standard controller input and tracked-hand input,
+without restarting the app, reloading the save or disabling VR head tracking. No merge or runtime
+mode switch is implemented by this checkpoint.
+
+The switch must use one authoritative mode/epoch for input and pose publication, release held
+attack/ADS/grip actions from the old mode, and prevent duplicate input. Preserve weapon identity,
+actual ammunition and reload progress; changing modes must neither grant ammunition nor leave a
+stale manual-reload lock. Return to native controller hand/weapon presentation when that mode owns
+input, and restore tracked poses when hand mode owns it. Confirm firing, empty/loaded magazines,
+support, manual reload, tracking loss/recovery, menus and equipment changes in both directions.
+
 ## Ownership and clocks
 
 1. ARKit publishes head + both raw wrist poses + Joy-Con buttons as one immutable, numbered room-space
