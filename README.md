@@ -1,4 +1,48 @@
-# VXpro
+# VXpro — hand-tracking branch
+
+**Experimental hand-tracking snapshot · 2026-11-06.** This branch develops tracked hands and
+Joy-Con-assisted weapon handling. The standard controller version remains on
+[`main`](https://github.com/Ag3497120/VXpro/tree/main).
+
+[English](README.md) · [日本語](README_ja.md)
+
+## Current hand-tracking state
+
+The player confirmed that **every weapon currently in their inventory is held at its trigger grip**
+on the installed build. This is a checkpoint of that working right-hand grip, before the next
+left-hand support correction. It is not an all-weapon compatibility claim.
+
+- ARKit wrist tracking moves the hands; Joy-Con buttons provide explicit actions. The weapon stays in the right hand.
+- ZR is the right-hand firing input. On long guns, holding ZL requests left-hand support and ADS; releasing it releases both.
+- X requests magazine ejection. The reload system supports magazine pickup/insertion, manual pistol slide interaction,
+  and automatic chambering for non-pistols through the game equipment/ammunition bridge. Compatibility remains weapon-specific.
+- Rendered hand/weapon corrections use independent, bounded GPU buffers and preserve the game's source palettes.
+- **Still unresolved:** the supporting hand crosses the holding hand on some shotguns and machine guns; remaining
+  jitter, complete reload behavior across weapon types, and physical barrel-directed shot integration need further work.
+- Existing NPU weight-edit experiments are included as offline tools. No edited model is enabled and no FPS gain is established.
+
+Implementation, controls and verification boundaries: [HAND_SESSION.md](HAND_SESSION.md),
+[design notes](docs/DESIGN.md), [NPU experiments](NPU_WEIGHT_EDIT.md).
+
+## Use this branch
+
+```sh
+git clone --branch hand-tracking https://github.com/Ag3497120/VXpro.git
+cd VXpro
+```
+
+The base setup below prepares your own purchased game. Hand interaction is experimental and opt-in;
+see the tracked-hand weapon section of the [design notes](docs/DESIGN.md) for the environment options
+and matching manual-reload overlay. Regenerate the Xcode project after updating sources.
+
+Weapon-specific bindings on the tested installation use a **locally generated numeric catalog**.
+Game meshes, extracted metadata, compiled overlays, model weights, recordings and built apps are not included.
+`tools/weapon_asset_catalog.py` can generate `build/hand-session-v2/weapon_asset_catalog.h` from your own
+fully unpacked CR2W mesh resources; the external-buffer extraction utility is not bundled.
+Without that private catalog the source builds with the existing generic fallback, which does not reproduce
+all of the tested installation's weapon-specific contacts. Run `sh tools/check_hand_session.sh` for local checks.
+
+## Base runtime and setup
 
 Run Mac App Store games (Cyberpunk 2077) in VR on Apple Vision Pro — head look, depth reprojection, Neural Engine
 foveated upscaling. Free, MIT.

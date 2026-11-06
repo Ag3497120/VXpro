@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include "../app/Sources/weapon_bridge.h"
 // The immersive presenter (see xros_vr.h; VISIONOS_PORT.md, "VR presentation"). visionOS only.
 //
 // Knobs (read once):
@@ -66,6 +67,11 @@ void vx_log(const char *fmt, ...);
 void vx_xros_pace_tick(void);
 extern void (*vx_host_jlog)(const char *event, const char *fields);   // (src/input.m: the app's host_log, or NULL)
 void vx_input_chords_poll(void);                  // (src/input.m: a controller's chords for the presenter)                     // (src/xros_ui.m: a compositor frame for sync-interval presents)
+
+int vx_xros_vr_bare_enabled(void) {
+    const char *value = getenv("VXMAC_FULL_HAND");
+    return value && !strcmp(value, "1");
+}
 
 static int g_on;
 void vx_xros_vr_enable(int on) {
@@ -448,6 +454,44 @@ static double g_gain_sxy[2], g_gain_sxx[2]; static unsigned g_gain_n[2];   // (h
 // (h64: warp mode 7 - free look and controller aim; below with vr_mouse)
 static int aim_on(void);
 static float g_hand_aim_y, g_hand_aim_p;
+static struct {
+    double at, camera_at;
+    float aim[2], camera[2], sent[2];
+    int seen, track, steering;
+} g_muzzle;
+static pthread_mutex_t g_weapon_view_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    double at;
+    float yaw_offset, yaw_sign;
+} g_weapon_view;
+
+static int muzzle_aim_enabled(void) {
+    static int on;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *joy = getenv("VXMAC_JOY_HOLD"), *opt = getenv("VXMAC_MUZZLE_AIM");
+        on = joy && !strcmp(joy, "1") && opt && !strcmp(opt, "1");
+    });
+    return on;
+}
+
+// Match the warp's camera orientation on the same draw that skins the weapon.
+int vx_xros_vr_weapon_view(const float view[12], float head[16]) {
+    pthread_mutex_lock(&g_weapon_view_lock);
+    double at = g_weapon_view.at;
+    float offset = g_weapon_view.yaw_offset, sign = g_weapon_view.yaw_sign;
+    pthread_mutex_unlock(&g_weapon_view_lock);
+    if (!at || CACurrentMediaTime() - at > .25) return 0;
+    float yaw = offset + sign * atan2f(view[9], view[8]) * (180.f / (float)M_PI);
+    float pitch = asinf(fmaxf(-1.f, fminf(1.f, view[10]))) * (180.f / (float)M_PI);
+    camera_pose(yaw, pitch, head, head);
+    return 1;
+}
+
+static int muzzle_fresh(double now) { // g_lock held
+    return g_muzzle.track && now - g_muzzle.at <= .16 && now - g_muzzle.camera_at <= .18;
+}
+
 static int g_hand_draw_zone;
 int vx_xros_vr_draw_zone(void) { pthread_mutex_lock(&g_lock); int z = g_hand_draw_zone; pthread_mutex_unlock(&g_lock); return z; }
 static float g_aim_push_p; static int g_rebase_due; static double g_aim_cam_t;                                // (pitch the cone's edge asks of the game, sent at the next vr_mouse)
@@ -508,6 +552,10 @@ static void vr_mouse(const float *m, double now, int send) {        // (with g_l
     if (!g_vr_ref || g_recenter) {
         { const char *e = getenv("VXMAC_PITCH_LIMIT"); if (e && *e) { g_pitch_hi = (float)atof(e); g_pitch_lo = -g_pitch_hi; } else if (!pitch_learn_old()) { g_pitch_hi = 80; g_pitch_lo = -80; } }
         g_aim_push_p = 0;
+        g_muzzle.camera_at = 0;
+        pthread_mutex_lock(&g_weapon_view_lock);
+        g_weapon_view.at = 0;
+        pthread_mutex_unlock(&g_weapon_view_lock);
         g_pitch_off = 0;
         g_recenter = 0; g_vr_ref = 1; g_yaw_ref = yaw; g_ref_gen++; g_cam_off_ok = 0; g_pitch_ref = 0; g_sent_yaw = 0; g_sent_pitch = 0; g_sent_n = 0; g_cam_off_yaw = g_cam_off_pitch = 0;
         vx_log("VR: vr mode's zero: yaw %.1f (the game's camera is taken as level there)", yaw);
@@ -540,6 +588,14 @@ static void vr_mouse(const float *m, double now, int send) {        // (with g_l
     }
     g_yaw_ref = wrap180(g_yaw_ref - g_hand_aim_y); g_pitch_ref -= g_hand_aim_p;
     g_hand_aim_y = g_hand_aim_p = 0;
+    if (g_muzzle.steering && muzzle_fresh(now) && g_look_hold && !g_vehicle &&
+        now >= g_ignore_until && now >= g_nocontrol_until) {
+        // Subtract input still in the queue so repeated event polls cannot overshoot a slow render.
+        float dy = wrap180(g_muzzle.aim[0] - g_muzzle.camera[0]) - wrap180(g_sent_yaw - g_muzzle.sent[0]);
+        float dp = g_muzzle.aim[1] - g_muzzle.camera[1] - (g_sent_pitch - g_muzzle.sent[1]);
+        want_y = wrap180(g_sent_yaw + fmaxf(-7.f, fminf(7.f, dy * .65f)));
+        want_p = g_sent_pitch + fmaxf(-7.f, fminf(7.f, dp * .65f));
+    }
     // (h43: the game's pitch limits - VXMAC_PITCH_LIMIT, else 80, narrowed when the picture stops pitching while the
     //  sent pitch goes on (vx_xros_vr_seen_turn2): never sent beyond them, so the game's pitch and the head's stay one)
     if (want_p > g_pitch_hi) want_p = g_pitch_hi; if (want_p < g_pitch_lo) want_p = g_pitch_lo;
@@ -965,7 +1021,11 @@ static pthread_mutex_t g_floor_lock = PTHREAD_MUTEX_INITIALIZER;
 static id<MTLBuffer> g_floor_buf[2];
 static unsigned g_floor_busy;
 static void floor_fit(id<MTLCommandBuffer> cb, vr_slot *S, uint64_t pseq) {
-    if (g_floor_on < 0) { const char *e = getenv("VXMAC_FLOOR"); g_floor_on = !(e && !strcmp(e, "0")); }
+    if (g_floor_on < 0) {
+        const char *e = getenv("VXMAC_FLOOR"), *joy = getenv("VXMAC_JOY_HOLD");
+        // Near-eye weapons and arms can be mistaken for a floor and repeatedly tilt the view.
+        g_floor_on = e ? strcmp(e, "0") != 0 : !(joy && !strcmp(joy, "1"));
+    }
     if (!g_floor_on || !vr_now() || !S->has_depth || !S->depth || pseq % 6) return;
     if (!g_floor_pso) {
         NSError *err = nil;
@@ -1133,6 +1193,7 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
             uint64_t q = got ? vxmtl_game_camera(gm) : 0;
             int fresh = 0;
             if (q && q != last_q) { last_q = q; last_t = now; fresh = 1; }
+            float camera_input_pitch = pch;
             static float resid; static int corr_on = -1;
             if (corr_on < 0) { const char *e = getenv("VXMAC_PITCH_CORR"); corr_on = !(e && !strcmp(e, "0")); }
             if (q && now - last_t < 0.25) {
@@ -1236,7 +1297,7 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                 //  sent on top of the head's moves (the sent pitch's account moved by it, vr_mouse sends the difference),
                 //  so the game's camera converges to the head's and the warp turns the frame by little. Not while the pitch
                 //  axis is frozen, the game ignores the head (cinematic) or its mouse look is off. VXMAC_PITCH_CORR=0: off)
-                if (fresh && g_head_valid) {
+                if (fresh && g_head_valid && !g_muzzle.steering) {
                     float hy, hp; head_angles(g_head, &hy, &hp);
                     float err = (hp - g_cam_off_pitch) - gp; resid = err;
                     if (aim_on()) {   // (h64: mode 7 - only past the cone's edge: half the excess a game frame, at most 4 deg)
@@ -1316,6 +1377,18 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                     }
                     float yt = wrap180(gy - K);
                     cons_y = y; y = wrap180(yt - g_cam_off_yaw);
+                    if (fresh && muzzle_aim_enabled()) {
+                        g_muzzle.camera[0] = wrap180(g_yaw_ref + yt);
+                        g_muzzle.camera[1] = gp;
+                        g_muzzle.sent[0] = cons_y;
+                        g_muzzle.sent[1] = camera_input_pitch;
+                        g_muzzle.camera_at = now;
+                        pthread_mutex_lock(&g_weapon_view_lock);
+                        g_weapon_view.at = now;
+                        g_weapon_view.yaw_sign = ysign;
+                        g_weapon_view.yaw_offset = wrap180(g_yaw_ref - K);
+                        pthread_mutex_unlock(&g_weapon_view_lock);
+                    }
                     if (fresh && g_head_valid) { float hy, hp; head_angles(g_head, &hy, &hp); yresid = wrap180((hy - g_yaw_ref) - y); }
                 }
                 if (now - ylog_t > 5 && vx_host_jlog && yaw_on) { ylog_t = now; char f[360];
@@ -1546,6 +1619,27 @@ static vxw_core *g_core;
 static int g_frame_slot = -1;
 static id<MTLTexture> g_zero_mv, g_far_depth;
 static double g_report;
+static float g_frame_eye_offsets[2][3];
+static int g_frame_eye_valid;
+
+int vx_xros_vr_system_stereo(void) {
+    static int enabled;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *mode = getenv("VXMAC_STEREO_EYES"), *ipd = getenv("VXMAC_IPD");
+        enabled = mode && !strcmp(mode, "system") && !(ipd && *ipd);
+    });
+    return enabled;
+}
+
+void vx_xros_vr_set_eye_views(const float left[16], const float right[16]) {
+    float offsets[2][3];
+    int valid = vxw_stereo_eye_offsets(left, right, offsets);
+    pthread_mutex_lock(&g_lock);
+    g_frame_eye_valid = valid;
+    if (valid) memcpy(g_frame_eye_offsets, offsets, sizeof offsets);
+    pthread_mutex_unlock(&g_lock);
+}
 
 
 int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
@@ -1586,6 +1680,7 @@ int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
     vx_xros_pace_tick();
     pthread_mutex_lock(&g_lock);
     memcpy(g_head, m, sizeof g_head);
+    g_frame_eye_valid = 0;
     g_head_valid = 1;
     if (g_poll_in < 0) { const char *e = getenv("VXMAC_POLL_INPUT"); g_poll_in = e && !strcmp(e, "1"); }   // (h40: off by default - the compositor-paced path was the known-good one; =1 on)
     {   // (h38: the compositor's send only when the poll path is off - or silent for 100 ms: a game blocked waiting for
@@ -1699,6 +1794,7 @@ static int draw_screen(id<MTLCommandBuffer> cb, vr_slot *S, const float *view_fr
 }
 
 // ---- a short label in front of the eyes (the mode, the sensitivity), 2.5 s, head-locked ----
+static int g_bare_menu, g_bare_hover = -1;
 static id<MTLTexture> g_label_tex; static double g_label_until; static char g_label_text[160]; static int g_label_dirty;
 static id<MTLRenderPipelineState> g_label_pso; static MTLPixelFormat g_label_cf;
 static void show_label(const char *text) {
@@ -1707,8 +1803,8 @@ static void show_label(const char *text) {
     g_label_dirty = 1; g_label_until = CACurrentMediaTime() + 2.5; g_label_big = 0;
     pthread_mutex_unlock(&g_lock);
 }
-static id<MTLTexture> label_texture(id<MTLDevice> dev, const char *text) {
-    const size_t W = 1024, H = 128;
+static id<MTLTexture> label_texture(id<MTLDevice> dev, const char *text, size_t W) {
+    const size_t H = 128;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef c = CGBitmapContextCreate(NULL, W, H, 8, W * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
     CGColorSpaceRelease(cs);
@@ -1745,19 +1841,25 @@ static NSString *const kLabelSrc = @
     "vertex VO vs(uint i [[vertex_id]], constant float4 &r [[buffer(0)]]) {\n"
     "    float2 c = float2(i & 1, (i >> 1) & 1); VO o;\n"
     "    o.pos = float4(mix(r.x, r.z, c.x), mix(r.w, r.y, c.y), 0, 1); o.uv = float2(c.x, 1 - c.y); return o; }\n"
-    "fragment float4 fs(VO in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
-    "    constexpr sampler s(filter::linear, address::clamp_to_edge); return t.sample(s, in.uv); }\n";
-static void draw_label(id<MTLCommandBuffer> cb, void *outp) {
+    "fragment float4 fs(VO in [[stage_in]], texture2d<float> t [[texture(0)]], constant float &selected [[buffer(0)]]) {\n"
+    "    constexpr sampler s(filter::linear, address::clamp_to_edge); float4 c=t.sample(s,in.uv);"
+    "    return float4(min(c.rgb + c.a * selected * float3(.04,.28,.31), float3(c.a)),c.a); }\n";
+static void draw_label(id<MTLCommandBuffer> cb, void *outp, const float tan[4]) {
     id<MTLTexture> out = (__bridge id<MTLTexture>)outp;
     double now = CACurrentMediaTime();
-    char text[160]; int dirty;
+    char text[160]; int dirty = 0;
     pthread_mutex_lock(&g_lock);
-    if (now > g_label_until) { pthread_mutex_unlock(&g_lock); return; }
-    dirty = g_label_dirty; g_label_dirty = 0; memcpy(text, g_label_text, sizeof text);
+    int menu = g_bare_menu, hover = g_bare_hover;
+    if (!menu && now > g_label_until) { pthread_mutex_unlock(&g_lock); return; }
+    if (!menu) {
+        dirty = g_label_dirty;
+        g_label_dirty = 0;
+        memcpy(text, g_label_text, sizeof text);
+    }
     pthread_mutex_unlock(&g_lock);
     id<MTLDevice> dev = cb.device;
-    if (dirty || !g_label_tex) g_label_tex = label_texture(dev, text);
-    if (!g_label_tex) return;
+    if (!menu && (dirty || !g_label_tex)) g_label_tex = label_texture(dev, text, 1024);
+    if (!menu && !g_label_tex) return;
     if (!g_label_pso || g_label_cf != out.pixelFormat) {
         NSError *err = nil;
         id<MTLLibrary> lib = [dev newLibraryWithSource:kLabelSrc options:nil error:&err];
@@ -1783,9 +1885,47 @@ static void draw_label(id<MTLCommandBuffer> cb, void *outp) {
     float hw = g_label_big ? 0.5f : 0.32f, hh = hw * aspect * 128.0f / 1024.0f;   // (h47: the mode's label larger)
     float r[4] = { -hw, 0.42f + hh, hw, 0.42f - hh };   // (left, top, right, bottom in NDC, a little above the centre)
     [e setRenderPipelineState:g_label_pso];
-    [e setVertexBytes:r length:sizeof r atIndex:0];
-    [e setFragmentTexture:g_label_tex atIndex:0];
-    [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    if (menu) {
+        static id<MTLTexture> tiles[BH_ACTIONS], title;
+        static const char *labels[2][BH_ACTIONS] = {
+            {"Phone", "Radio", "Call vehicle", "Inventory", "Interact", "Heal", "Next weapon", "Holster",
+             "Jump", "Crouch", "Scan", "Back", "Previous", "Next", "Confirm", "Close"},
+            {"電話", "ラジオ", "車を呼ぶ", "持ち物", "調べる", "回復", "次の武器", "収納",
+             "ジャンプ", "しゃがむ", "スキャン", "戻る", "上へ", "下へ", "決定", "閉じる"}
+        };
+        int ja = ui_lang() == 1;
+        if (!title) title = label_texture(dev, ja ? "指を離し、項目に手を向けてピンチ" : "Release, point at an action, then pinch", 1024);
+        const float dx = 2 * BH_MENU_X / BH_COLUMNS, dy = 2 * BH_MENU_Y / BH_ROWS;
+        for (int i = 0; i <= BH_ACTIONS; i++) {
+            if (i < BH_ACTIONS && !tiles[i]) tiles[i] = label_texture(dev, labels[ja][i], 256);
+            id<MTLTexture> tex = i < BH_ACTIONS ? tiles[i] : title;
+            if (!tex) continue;
+            float x = -BH_MENU_X + (i % BH_COLUMNS) * dx;
+            float y = BH_MENU_CENTER_Y + BH_MENU_Y - (i / BH_COLUMNS) * dy;
+            float bounds[4] = { x + .009f, y - .014f, x + dx - .009f, y - dy + .014f };
+            if (i == BH_ACTIONS) {
+                float top = BH_MENU_CENTER_Y + BH_MENU_Y;
+                bounds[0] = -.49f; bounds[1] = top + .15f;
+                bounds[2] = .49f; bounds[3] = top + .035f;
+            }
+            for (int k = 0; k < 4; k++) {
+                float offset = k % 2 ? tan[3] : tan[0];
+                float span = k % 2 ? tan[2] + tan[3] : tan[0] + tan[1];
+                bounds[k] = (bounds[k] + offset) * 2 / span - 1;
+            }
+            float selected = i == hover;
+            [e setVertexBytes:bounds length:sizeof bounds atIndex:0];
+            [e setFragmentBytes:&selected length:sizeof selected atIndex:0];
+            [e setFragmentTexture:tex atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        }
+    } else {
+        float selected = 0;
+        [e setVertexBytes:r length:sizeof r atIndex:0];
+        [e setFragmentBytes:&selected length:sizeof selected atIndex:0];
+        [e setFragmentTexture:g_label_tex atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
     [e endEncoding];
 }
 
@@ -2455,7 +2595,10 @@ static void draw_mag(id<MTLCommandBuffer> cb, void *outp, const float vfo[16], c
     if (g_eff != 2 || (!D.on && !(v_hands && (D.skel[0] > .5f || D.skel[67] > .5f))) || (!game_hands && !v_hands && !D.ring && !D.mag)) return;
     id<MTLTexture> out = (__bridge id<MTLTexture>)outp;
     if (game_hands && warp_M) draw_game_viewmodel(cb, out, S, &D, warp_M, tan, eye);
-    static int mag_box = -1; if (mag_box < 0) { const char *e = getenv("VXMAC_MAG_BOX"); mag_box = e && !strcmp(e, "1"); }
+    static int mag_box = -1; if (mag_box < 0) {
+        const char *e = getenv("VXMAC_MAG_BOX"), *manual = getenv("VXMAC_MANUAL_MAG_ACTIVE");
+        mag_box = e && !strcmp(e, "1") && !(manual && !strcmp(manual, "1"));
+    }
     if (!v_hands && (!mag_box || (!D.mag && !D.ring))) return;
     if (!g_mag_pso || g_mag_cf != out.pixelFormat) {
         NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -2566,7 +2709,7 @@ int vx_xros_vr_draw_eye(void *cbp, int eye, const float view_from_origin[16], co
             if (vx_host_jlog) vx_host_jlog("vr_eye_density", f);
         }
     }
-    if (ok) { wc_update((__bridge id<MTLCommandBuffer>)cbp); draw_vignette((__bridge id<MTLCommandBuffer>)cbp, outp, tan, view_from_origin); draw_hud((__bridge id<MTLCommandBuffer>)cbp, outp, eye, tan); draw_mag((__bridge id<MTLCommandBuffer>)cbp, outp, view_from_origin, tan, eye, warp_valid ? warp_M : NULL); draw_fade((__bridge id<MTLCommandBuffer>)cbp, outp); draw_label((__bridge id<MTLCommandBuffer>)cbp, outp); }
+    if (ok) { wc_update((__bridge id<MTLCommandBuffer>)cbp); draw_vignette((__bridge id<MTLCommandBuffer>)cbp, outp, tan, view_from_origin); draw_hud((__bridge id<MTLCommandBuffer>)cbp, outp, eye, tan); draw_mag((__bridge id<MTLCommandBuffer>)cbp, outp, view_from_origin, tan, eye, warp_valid ? warp_M : NULL); draw_fade((__bridge id<MTLCommandBuffer>)cbp, outp); draw_label((__bridge id<MTLCommandBuffer>)cbp, outp, tan); }
     return ok;
 }
 static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], const float tan[4], float near_m, void *outp, void *odp, float *warp_M, int *warp_valid) {
@@ -2574,6 +2717,9 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
     pthread_mutex_lock(&g_lock);
     int s = g_frame_slot;
     double pt = g_present_time;
+    float eye_offset[3];
+    int eye_valid = eye >= 0 && eye < 2 && g_frame_eye_valid;
+    if (eye_valid) memcpy(eye_offset, g_frame_eye_offsets[eye], sizeof eye_offset);
     if (eye >= 0 && eye < 2) memcpy(&g_tan_seen[0], tan, 4 * sizeof *tan);
     pthread_mutex_unlock(&g_lock);
     if (s < 0) return 0;
@@ -2639,7 +2785,22 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
                                   //  depth-dependent term from motion) and each eye's fixed half-IPD baseline from the depth
                                   //  - stereo that never changes with head motion: 3D without swimming. VXMAC_IPD (m, 0.064))
             static float ipd = -1; if (ipd < 0) { const char *e = getenv("VXMAC_IPD"); ipd = e && *e ? (float)atof(e) : 0.064f; }
-            M[12] = (eye == 0 ? 0.5f : -0.5f) * ipd; M[13] = 0; M[14] = 0;   // (the centre camera seen from this eye)
+            int system_eyes = vx_xros_vr_system_stereo();
+            if (system_eyes && eye_valid) {
+                memcpy(M + 12, eye_offset, sizeof eye_offset);
+            } else {
+                M[12] = (eye == 0 ? 0.5f : -0.5f) * ipd; M[13] = 0; M[14] = 0;
+            }
+            static int last_eye_source = -1;
+            int eye_source = system_eyes ? (eye_valid ? 1 : 2) : 0;
+            if (eye == 0 && last_eye_source != eye_source) {
+                last_eye_source = eye_source;
+                char fields[160];
+                snprintf(fields, sizeof fields, "\"source\":\"%s\",\"offset_m\":[%.5f,%.5f,%.5f]",
+                         eye_source == 1 ? "system" : eye_source == 2 ? "fallback" : "fixed",
+                         M[12], M[13], M[14]);
+                if (vx_host_jlog) vx_host_jlog("stereo_eyes", fields);
+            }
             // (h60: the game camera's own motion since its frame - running, a vehicle - carried on to this eye's time:
             //  velocity x the frame's age, in the frame camera's axes, as a translation of the depth warp (at most
             //  VXMAC_MOVE_MAX m, default 0.3; VXMAC_MOVE=0 off): new frames no longer step forward every 50-150 ms)
@@ -2686,7 +2847,10 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
     }
     if (eye >= 0 && eye < 2) {   // (h64: mode 7 - the frame's centre (the gun's aim) in this eye's tangents, for the crosshair)
         float ex = p.rot[2], ey = p.rot[5], ez = p.rot[8];
-        g_xh_ok[eye] = aim_on() && ez > 0.2f;
+        pthread_mutex_lock(&g_lock);
+        int muzzle_reticle = g_muzzle.steering && muzzle_fresh(pt);
+        pthread_mutex_unlock(&g_lock);
+        g_xh_ok[eye] = (aim_on() || muzzle_reticle) && ez > 0.2f;
         if (g_xh_ok[eye]) { g_xh[eye][0] = ex / ez; g_xh[eye][1] = ey / ez; }
     }
     {   // (how much of this eye's view lies outside the game's frame: a 16 x 16 grid of its directions, for the log)
@@ -2898,6 +3062,47 @@ void vx_xros_hand_pointer(double x, double y);           // (src/xros_ui.m: the 
 void vx_xros_hand_button(int which, int down);           // (0 left, 1 right: as a mouse's)
 void vx_xros_hand_wheel(int delta);                      // (raw wheel input and WM_MOUSEWHEEL)
 void vx_xros_hand_key(int hid_usage, int down);
+enum { BARE_FIRE = 16, BARE_AIM = 32 };
+static unsigned g_bare_held;
+static int g_bare_key;
+static double g_bare_last, g_bare_key_up;
+
+static void bare_held_locked(unsigned held) {
+    static const int keys[] = { 0x1a, 0x16, 0x04, 0x07 }; // W, S, A, D
+    unsigned changed = g_bare_held ^ held;
+    for (int i = 0; i < 4; i++)
+        if (changed & (1u << i)) vx_xros_hand_key(keys[i], !!(held & (1u << i)));
+    if (changed & BARE_FIRE) vx_xros_hand_button(0, !!(held & BARE_FIRE));
+    if (changed & BARE_AIM) vx_xros_hand_button(1, !!(held & BARE_AIM));
+    g_bare_held = held;
+}
+
+static void bare_key_pulse(int key, double duration) {
+    pthread_mutex_lock(&g_lock);
+    if (g_bare_key) vx_xros_hand_key(g_bare_key, 0);
+    vx_xros_hand_key(key, 1);
+    g_bare_key = key;
+    g_bare_key_up = CACurrentMediaTime() + duration;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void bare_action(int action) {
+    // Cyberpunk 2077 default keyboard mappings. Radio opens on a hold.
+    static const int keys[BH_ACTIONS] = {
+        0x17, 0x1d, 0x19, 0x0c, 0x09, 0x1b, 0, 0x05,
+        0x2c, 0x06, 0x2b, 0x29, 0x52, 0x51, 0x28, 0
+    };
+    static unsigned slot;
+    if (action < 0 || action >= BH_ACTIONS) return;
+    int key = action == BH_WEAPON ? 0x1e + (slot++ % 3) : keys[action];
+    if (!key) return;
+    double duration = action == BH_SCAN ? 1.5 : (action == BH_RADIO || action == BH_PHONE) ? .60 : .10;
+    pthread_mutex_lock(&g_lock);
+    bare_held_locked(0);
+    pthread_mutex_unlock(&g_lock);
+    bare_key_pulse(key, duration);
+}
+
 extern int vx_xros_display_w, vx_xros_display_h;
 static char g_hand_stats[400] = "\"hands\":\"none yet\"";
 static int g_hand_stats_reset;
@@ -2931,16 +3136,73 @@ static int screen_hit(const float *o, const float *d, float *u, float *v) {
 }
 // (h70: the hands' joints for the magazine by hand, from the same frame as the vx_xros_vr_hands call that follows)
 static float g_joints[2 * HW_JOINTS], g_arms[14], g_skel[134];
+static float g_wrists[20], g_raw_wrists[20], g_middle_dist[2] = { 1, 1 };
+void vx_xros_vr_middle_pinches(const float distances[2]) { memcpy(g_middle_dist, distances, sizeof g_middle_dist); }
 void vx_xros_vr_hand_skeleton(const float skel[134]) { memcpy(g_skel, skel, sizeof g_skel); }
+static int shared_wrist_filter(void) {
+    static int enabled;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *joy = getenv("VXMAC_JOY_HOLD");
+        enabled = joy && !strcmp(joy, "1") && !vx_xros_vr_bare_enabled();
+    });
+    return enabled;
+}
+void vx_xros_vr_wrist_poses(const float wrists[20]) {
+    memcpy(g_raw_wrists, wrists, sizeof g_raw_wrists);
+    if (!shared_wrist_filter()) { memcpy(g_wrists, wrists, sizeof g_wrists); return; }
+    static float filtered[2][10];
+    static double last[2];
+    double now = CACurrentMediaTime();
+    for (int h = 0; h < 2; h++) {
+        const float *raw = wrists + 10*h;
+        float *out = g_wrists + 10*h;
+        if (raw[0] < .5f) { out[0] = 0; continue; }
+        float dt = (float)(now - last[h]);
+        last[h] = now;
+        if (dt <= 0.f || dt > .24f) memcpy(filtered[h], raw, sizeof filtered[h]);
+        else {
+            float distance = dist3(raw + 1, filtered[h] + 1);
+            // The free hand needs steady small movements at the slide while
+            // keeping up when it moves between the holster and the weapon.
+            float position_rate = h ? (distance > .06f ? 46.f : 29.f) :
+                                  20.f + 32.f * fminf(1.f, distance / .08f);
+            float position = 1.f - expf(-dt * position_rate);
+            float rotation = 1.f - expf(-dt * (h ? 21.f : 18.f));
+            for (int i = 1; i < 10; i++) filtered[h][i] += (raw[i] - filtered[h][i]) * (i < 4 ? position : rotation);
+        }
+        hand_pose pose;
+        hand_pose_from_wrist(filtered[h], &pose);
+        if (!pose.ok) { memcpy(filtered[h], raw, sizeof filtered[h]); hand_pose_from_wrist(filtered[h], &pose); }
+        memcpy(out, filtered[h], sizeof filtered[h]);
+        if (pose.ok) {
+            memcpy(out + 4, pose.fwd, sizeof pose.fwd);
+            memcpy(out + 7, pose.across, sizeof pose.across);
+        } else out[0] = 0;
+    }
+}
 static unsigned g_controller_buttons;
 static double g_controller_time;
+static unsigned g_joy_fire_mask;
+static double g_joy_fire_ready_at;
 static unsigned g_weapon_cycles;
 void vx_xros_vr_cycle_weapon_type(void) {
     pthread_mutex_lock(&g_lock); g_weapon_cycles++; pthread_mutex_unlock(&g_lock);
 }
 void vx_xros_vr_hand_arms(const float arms[14]) { memcpy(g_arms, arms, sizeof g_arms); }
 void vx_xros_vr_controller_state(unsigned btns, double now) {
-    pthread_mutex_lock(&g_lock); g_controller_buttons = btns; g_controller_time = now; pthread_mutex_unlock(&g_lock);
+    static unsigned firing_trigger, release_required;
+    pthread_mutex_lock(&g_lock);
+    g_controller_buttons = btns;
+    g_controller_time = now;
+    // Both edges come from the controller poll, including release if hand frames stop arriving.
+    unsigned allowed = vr_now() && now - g_joy_fire_ready_at <= .25 ? g_joy_fire_mask : 0;
+    release_required &= btns;
+    release_required |= firing_trigger & btns & ~allowed;
+    unsigned trigger = btns & allowed & ~release_required;
+    if (!!trigger != !!firing_trigger) vx_xros_hand_button(0, trigger != 0);
+    firing_trigger = trigger;
+    pthread_mutex_unlock(&g_lock);
 }
 unsigned vx_xros_vr_controller_buttons(double now) {
     pthread_mutex_lock(&g_lock); unsigned b = now - g_controller_time <= .25 ? g_controller_buttons : 0; pthread_mutex_unlock(&g_lock); return b;
@@ -2952,21 +3214,63 @@ void vx_xros_vr_hand_joints(const float joints[50]) { memcpy(g_joints, joints, s
 //  across (little -> index knuckle), normal (forward x across); head: x right, y up, -z forward. Copied with the head of
 //  the same frame, read by vxpipe.m on the game's render threads)
 static float g_ik_head[16], g_ik_joints[2 * HW_JOINTS], g_ik_skel[134], g_ik_slide_pull, g_ik_weap[8];
+static float g_ik_wrists[20];
 static double g_ik_time; static pthread_mutex_t g_ik_lock = PTHREAD_MUTEX_INITIALIZER;
 static float g_ik_sm[2][12]; static double g_ik_seen[2];
 
-int vx_xros_vr_hand_frames(float out[2][12], int ok[2]) {
-    float H[16], J[2 * HW_JOINTS]; double t, now = CACurrentMediaTime();
-    pthread_mutex_lock(&g_ik_lock); memcpy(H, g_ik_head, sizeof H); memcpy(J, g_ik_joints, sizeof J); t = g_ik_time;
-    int any = 0;
+static int g_ik_mag_state = -1;
+static double g_ik_mag_started;
+static unsigned g_ik_mag_ejection;
+static unsigned g_ik_weapon_epoch;
+static int g_ik_weapon_owner;
+static float g_ik_slide_contact[6];
+static int g_ik_slide_active;
+
+int vx_xros_vr_slide_contact(float contact[6]) {
+    pthread_mutex_lock(&g_ik_lock);
+    int active = g_ik_slide_active && CACurrentMediaTime() - g_ik_time <= .18;
+    if (active) memcpy(contact, g_ik_slide_contact, sizeof g_ik_slide_contact);
+    pthread_mutex_unlock(&g_ik_lock);
+    return active;
+}
+
+int vx_xros_vr_manual_mag_frame(double *started, unsigned *ejection) {
+    pthread_mutex_lock(&g_ik_lock);
+    double now = CACurrentMediaTime();
+    int state = now - g_ik_time <= .25 ? g_ik_mag_state : -1;
+    if (state >= 0) {
+        *started = g_ik_mag_started;
+        *ejection = g_ik_mag_ejection;
+    }
+    pthread_mutex_unlock(&g_ik_lock);
+    return state;
+}
+
+int vx_xros_vr_render_hands(float out[2][12], int ok[2], float head[16], unsigned *epoch, unsigned *wrists) {
+    pthread_mutex_lock(&g_ik_lock);
+    const float *H = g_ik_head;
+    double t = g_ik_time, now = CACurrentMediaTime();
+    double age = now - t;
+    int owner = age <= .25 ? g_ik_weapon_owner : 0;
+    memcpy(head, H, sizeof g_ik_head);
+    *epoch = g_ik_weapon_epoch;
+    *wrists = 0;
     for (int h = 0; h < 2; h++) {
-        const float *j = J + h * HW_JOINTS; ok[h] = 0;
-        int valid = (now - t <= 0.25 && j[0] >= 0.5f);
+        const float *j = g_ik_joints + h * HW_JOINTS; ok[h] = 0;
+        // Multiple skinned draws can request the same ARKit sample.
+        const float *wrist = g_ik_wrists + h * 10;
+        int anchored = wrist[0] >= .5f;
+        int valid = t > g_ik_seen[h] && now - t <= 0.25 &&
+                    (anchored || (!shared_wrist_filter() && j[0] >= 0.5f));
         float raw[12];
         if (valid) {
             const float *w = j + 1, *ik = j + 4, *mk = j + 7, *lk = j + 10;
             float wp[3], f[3], a[3], n[3];
-            for (int i = 0; i < 3; i++) { float d = w[i] - H[12 + i]; wp[i] = d; f[i] = mk[i] - w[i]; a[i] = (h ? ik[i] - lk[i] : lk[i] - ik[i]); }
+            for (int i = 0; i < 3; i++) {
+                wp[i] = anchored ? wrist[1 + i] : w[i];
+                f[i] = anchored ? wrist[4 + i] : mk[i] - w[i];
+                a[i] = anchored ? wrist[7 + i] : (h ? ik[i] - lk[i] : lk[i] - ik[i]);
+            }
             float fl = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
             float al_raw = sqrtf(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
             if (fl >= 0.015f && al_raw >= 0.015f) {
@@ -2977,15 +3281,16 @@ int vx_xros_vr_hand_frames(float out[2][12], int ok[2]) {
                     for (int i = 0; i < 3; i++) a[i] /= al;
                     n[0] = f[1]*a[2] - f[2]*a[1]; n[1] = f[2]*a[0] - f[0]*a[2]; n[2] = f[0]*a[1] - f[1]*a[0];
                     const float *vs[4] = { wp, f, a, n };
-                    for (int k = 0; k < 4; k++) for (int c = 0; c < 3; c++) raw[k * 3 + c] = vs[k][0] * H[c * 4 + 0] + vs[k][1] * H[c * 4 + 1] + vs[k][2] * H[c * 4 + 2];
+                    for (int k = 0; k < 4; k++) memcpy(raw + k * 3, vs[k], 3 * sizeof(float));
                 } else valid = 0;
             } else valid = 0;
         }
         if (valid) {
-            if (now - g_ik_seen[h] > 0.30) {
+            // Anchored wrists already share the room-space filter with input.
+            if ((anchored && shared_wrist_filter()) || now - g_ik_seen[h] > 0.30) {
                 memcpy(g_ik_sm[h], raw, sizeof raw);
             } else {
-                // Velocity-adaptive (1-Euro style) filter in head space: kills millimeter knuckle jitter while keeping fast motion lag-free
+                // Filter in room space so head turns do not drag a steady or briefly occluded wrist.
                 float dp = dist3(raw, g_ik_sm[h]);
                 float df = dist3(raw + 3, g_ik_sm[h] + 3);
                 float da = dist3(raw + 6, g_ik_sm[h] + 6);
@@ -3006,15 +3311,21 @@ int vx_xros_vr_hand_frames(float out[2][12], int ok[2]) {
                 if (al > 1e-4f) { sa[0] /= al; sa[1] /= al; sa[2] /= al; }
                 sn[0] = sf[1]*sa[2] - sf[2]*sa[1]; sn[1] = sf[2]*sa[0] - sf[0]*sa[2]; sn[2] = sf[0]*sa[1] - sf[1]*sa[0];
             }
-            g_ik_seen[h] = now;
+            g_ik_seen[h] = t;
         }
         if (now - g_ik_seen[h] <= 0.25) {
-            memcpy(out[h], g_ik_sm[h], sizeof(float) * 12);
-            ok[h] = 1; any = 1;
+            float relative[3];
+            for (int i = 0; i < 3; i++) relative[i] = g_ik_sm[h][i] - H[12 + i];
+            for (int c = 0; c < 3; c++) {
+                out[h][c] = vdot(relative, H + c * 4);
+                for (int k = 1; k < 4; k++) out[h][k * 3 + c] = vdot(g_ik_sm[h] + k * 3, H + c * 4);
+            }
+            ok[h] = 1;
+            if (anchored && age <= .10 && g_ik_seen[h] == t) *wrists |= 1u << h;
         }
     }
     pthread_mutex_unlock(&g_ik_lock);
-    return any;
+    return owner;
 }
 
 int vx_xros_vr_hand_curls(float out[2][6], float weap_out[8]) {
@@ -3023,7 +3334,11 @@ int vx_xros_vr_hand_curls(float out[2][6], float weap_out[8]) {
     unsigned btns = vx_xros_vr_controller_buttons(now);
     pthread_mutex_lock(&g_ik_lock);
     memcpy(S, g_ik_skel, sizeof S); memcpy(J, g_ik_joints, sizeof J); t = g_ik_time;
-    if (weap_out) { memcpy(weap_out, g_ik_weap, sizeof g_ik_weap); weap_out[5] = (float)btns; }
+    int bare = vx_xros_vr_bare_enabled();
+    if (weap_out) {
+        memcpy(weap_out, g_ik_weap, sizeof g_ik_weap);
+        if (!bare) weap_out[5] = (float)btns;
+    }
     if (now - t <= 0.25) {
         for (int h = 0; h < 2; h++) {
             const float *sk = S + h * 67;
@@ -3079,21 +3394,44 @@ int vx_xros_vr_hand_curls(float out[2][6], float weap_out[8]) {
         }
     }
     memcpy(out, sm_curls, sizeof sm_curls);
+    // A Joy-Con hides the fingers from hand tracking. Show the holding fingers closed and animate the firing finger
+    // from the owner's trigger, even when ARKit supplies incomplete or straight synthetic finger joints.
+    static int joy_hold_curls = -1; static float joy_grip[2], joy_index[2];
+    if (joy_hold_curls < 0) { const char *e = getenv("VXMAC_JOY_HOLD"); joy_hold_curls = e && !strcmp(e, "1"); }
+    if (!bare && joy_hold_curls && g_ik_weap[6] >= 1.f && g_ik_weap[6] <= 2.f) {
+        int owner = g_ik_weap[6] > 1.5f ? 1 : 0;
+        for (int h = 0; h < 2; h++) {
+            int holding = h == owner || g_ik_weap[7] > .5f;
+            int trigger = !!(btns & (h ? HW_BTN_R_TRIG : HW_BTN_L_TRIG));
+            joy_grip[h] += ((holding ? .85f : 0.f) - joy_grip[h]) * .35f;
+            joy_index[h] += ((holding && trigger ? .9f : .15f) - joy_index[h]) * .35f;
+            if (holding) { out[h][0] = joy_grip[h]; out[h][1] = joy_index[h];
+                for (int i = 2; i <= 4; i++) out[h][i] = joy_grip[h]; }
+            else if (g_ik_weap[4] > .5f && trigger)
+                for (int i = 0; i <= 4; i++) out[h][i] = .75f;
+        }
+    }
     pthread_mutex_unlock(&g_ik_lock);
     return 1;
 }
 
 void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
+    if (vx_weapon_bridge_commands_enabled())
+        vx_weapon_bridge_publish_hands(head, g_raw_wrists, vx_xros_vr_controller_buttons(now), now);
     config();
-    pthread_mutex_lock(&g_ik_lock); memcpy(g_ik_head, head, sizeof g_ik_head); memcpy(g_ik_joints, g_joints, sizeof g_ik_joints); memcpy(g_ik_skel, g_skel, sizeof g_ik_skel); g_ik_time = CACurrentMediaTime(); pthread_mutex_unlock(&g_ik_lock);
+    pthread_mutex_lock(&g_ik_lock); memcpy(g_ik_head, head, sizeof g_ik_head); memcpy(g_ik_joints, g_joints, sizeof g_ik_joints); memcpy(g_ik_skel, g_skel, sizeof g_ik_skel); memcpy(g_ik_wrists, g_wrists, sizeof g_ik_wrists); g_ik_time = CACurrentMediaTime(); pthread_mutex_unlock(&g_ik_lock);
     if (!C.hand) { pthread_mutex_lock(&g_lock); g_vm_active = 0; memset(g_vm_delta, 0, sizeof g_vm_delta); memset(g_vm_rot, 0, sizeof g_vm_rot); pthread_mutex_unlock(&g_lock); return; }
     if (g_hand_stats_reset) { g_hand_stats_reset = 0; g_clicks = g_rclicks = g_drags = g_scroll_notches = g_escs = 0; g_tracked_frames[0] = g_tracked_frames[1] = 0; g_hand_frames = 0; }
     g_hand_frames++;
     for (int b = 0; b < 2; b++) if (g_up_at[b] > 0 && now >= g_up_at[b]) { g_up_at[b] = 0; vx_xros_hand_button(b, 0); }
     int tr[2] = { hands[0] > 0.5f, hands[10] > 0.5f };
-    for (int h = 0; h < 2; h++) if (tr[h]) g_tracked_frames[h]++;
     int prim = tr[1] ? 1 : tr[0] ? 0 : -1, sec = prim < 0 ? -1 : 1 - prim;
-    int scr = screen_now(), vr = vr_now();
+    int bare = vx_xros_vr_bare_enabled();
+    static int joy_hold = -1;
+    if (joy_hold < 0) { const char *e = getenv("VXMAC_JOY_HOLD"); joy_hold = bare || (e && !strcmp(e, "1")); }
+    int wrist_primary = joy_hold && !bare;
+    for (int h = 0; h < 2; h++) if (wrist_primary ? g_wrists[10 * h] > .5f : tr[h]) g_tracked_frames[h]++;
+    int vr = vr_now(), scr = !vr && screen_now();
     // the pointer: the ray through the primary hand's anchor
     int hit = 0; float u = 0, v = 0;
     if (prim >= 0 && scr) {
@@ -3124,11 +3462,12 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             }
             // (h39: in vr mode a pinch no longer holds a mouse button (the game is played on the controller; a long pinch
             //  fired the gun) - VXMAC_VR_PINCH_BUTTONS=1 restores it; held 1 s it cycles the warp mode instead)
-            static int vr_btn = -1; if (vr_btn < 0) { const char *e = getenv("VXMAC_VR_PINCH_BUTTONS"); vr_btn = e && !strcmp(e, "1"); }
+            static int vr_btn = -1; if (vr_btn < 0) { const char *e = getenv("VXMAC_VR_PINCH_BUTTONS");
+                vr_btn = !joy_hold && e && !strcmp(e, "1"); }
             if (vr_btn && is_prim && vr) { vx_xros_hand_button(0, 1); g->phase = 2; }
             if (vr_btn && is_sec && vr) { vx_xros_hand_button(1, 1); g->phase = 2; }
         } else if (g->pinched) {
-            if (vr && g->phase == 1 && now - g->t0 >= 1.0 && !g_hg[1 - h].pinched && now - g_ctrl_t > 2.0) {   // (h39: a pinch held 1 s in vr mode: the next warp mode; not with both hands)
+            if (vr && !joy_hold && g->phase == 1 && now - g->t0 >= 1.0 && !g_hg[1 - h].pinched && now - g_ctrl_t > 2.0) {   // (h39: a pinch held 1 s in vr mode: the next warp mode; not with both hands)
                 g->phase = 4; void vx_xros_vr_cycle_warp_mode(void);
                 vx_xros_vr_cycle_warp_mode();   // (the hands' state is not under g_lock here)
             }
@@ -3147,7 +3486,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
                 if (vr) vx_xros_hand_button(is_sec ? 1 : 0, 0);
                 else if (is_sec) vx_xros_hand_key(0x29, 0);
                 else vx_xros_hand_button(0, 0);
-            } else if (g->phase == 1 && scr) {
+            } else if (g->phase == 1 && scr && (!wrist_primary || tr[h])) {
                 if (is_prim) { vx_xros_hand_button(0, 1); g_up_at[0] = now + 0.06; g_clicks++; }
                 else if (is_sec) { vx_xros_hand_button(1, 1); g_up_at[1] = now + 0.06; g_rclicks++; }
             }
@@ -3159,7 +3498,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         }
     }
     // both hands' pinch held still for 1 s: the manual vr / screen toggle (the pinches then do nothing more)
-    {
+    if (!bare) {
         static double both_since, quit_ask_until; static float both_y[2]; static int both_done, both_armed;
         if (g_hg[0].pinched && g_hg[1].pinched) {
             if (!both_since) { both_since = now; both_y[0] = hands[8]; both_y[1] = hands[18]; both_done = 0; }
@@ -3234,8 +3573,10 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         if (mag < 0) {
             const char *e = getenv("VXMAC_MAG"); mag = e && !strcmp(e, "1");
             e = getenv("VXMAC_HAND_MODE");
-            hw.mode = e && !strcmp(e, "bare") ? HW_MODE_BARE : e && !strcmp(e, "hybrid") ? HW_MODE_HYBRID : HW_MODE_AUTO;
+            hw.mode = (bare || (e && !strcmp(e, "bare"))) ? HW_MODE_BARE :
+                      e && !strcmp(e, "hybrid") ? HW_MODE_HYBRID : HW_MODE_AUTO;
             e = getenv("VXMAC_AUTO_MAG"); hand_weapon_set_auto_mag(&hw, !(e && !strcmp(e, "0")));
+            e = getenv("VXMAC_MANUAL_MAG_ACTIVE"); hw.manual_mag = mag && e && !strcmp(e, "1");
             e = getenv("VXMAC_MAG_RACK"); hw.rack = !(e && !strcmp(e, "0"));
             e = getenv("VXMAC_GESTURE_LEFTY"); hw.lefty = e && !strcmp(e, "1");
             e = getenv("VXMAC_GESTURE_LABELS"); mag_labels = !(e && !strcmp(e, "0"));
@@ -3251,12 +3592,17 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
                     v += strlen(k);
                     mact[i] = v[0] == 'm' ? -1 - (int)strtol(v + 1, NULL, 10) : (int)strtol(v, NULL, 16);
                 }
+            if (hw.manual_mag) {
+                memset(mact, 0, sizeof mact);
+                mact[0] = 0x43; mact[2] = 0x44; mact[4] = 0x45; // Private F10/F11/F12 actions.
+            }
             if (mag && (e = getenv("VXMAC_MAG_TUNE"))) hand_weapon_tune(e);
             if (mag) { char pr[512]; hand_weapon_params(pr, sizeof pr); vx_log("VR: magazine by hand on (gun hand %s, rack %d, done key 0x%x): %s", hw.lefty ? "left" : "right", hw.rack, mact[4], pr); }
         }
         for (int i = 0; i < HW_EV_N; i++) if (mup_at[i] > 0 && now >= mup_at[i]) {
             mup_at[i] = 0;
             if (mact[i] < 0) vx_xros_hand_button(-1 - mact[i], 0); else vx_xros_hand_key(mact[i], 0);
+            if (i == 0 && hw.manual_mag && !bare) vx_xros_hand_key(0x15, 0);
         }
         if (mag && prec_until < 0) {            // (the joints' record: Documents/hand_pose_record.csv, tests/hand_weapon_replay.c)
             const char *e = getenv("VXMAC_HAND_RECORD"); double mins = e && *e ? atof(e) : 5;
@@ -3269,24 +3615,155 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         unsigned controller, cycles; double controller_time;
         pthread_mutex_lock(&g_lock); controller = g_controller_buttons; controller_time = g_controller_time; cycles = g_weapon_cycles; g_weapon_cycles = 0; pthread_mutex_unlock(&g_lock);
         if (now - controller_time > .25) controller = 0;
+        static hand_weapon_controller joy_weapon;
+        static bare_hands full_hands;
+        bare_hand_input hand_input = { .action = -1, .hover = -1 };
+        int gameplay = vr && vx_game_mouse_look();
+        if (bare) {
+            hand_input = bare_hands_update(&full_hands, head, hands, g_wrists, g_middle_dist,
+                                           now, vr, gameplay, 1, hw.manual_mag && hand_weapon_has_magazine(&hw),
+                                           joy_weapon.support);
+            controller = (hand_input.pinches & 1 ? HW_BTN_L_TRIG : 0) |
+                         (hand_input.pinches & 2 ? HW_BTN_R_TRIG : 0) |
+                         (hand_input.eject ? HW_BTN_ACT_X : 0);
+            controller_time = now;
+            if (hand_input.action == BH_WEAPON) cycles++;
+            bare_action(hand_input.action);
+        }
         hw.weapon_type = (hw.weapon_type + cycles % HW_WPN_N) % HW_WPN_N;
+        if (hw.manual_mag && cycles) {
+            hw.state = HW_LOADED;
+            hw.manual_slide_ready = hw.slide_hold = 0;
+        }
+        vx_weapon_snapshot equipment = vx_weapon_bridge_snapshot();
+        static uint64_t equipment_generation, reload_report;
+        static int previous_reload_phase;
+        int changed_weapon = equipment.known && equipment.generation != equipment_generation;
+        if (changed_weapon) {
+            equipment_generation = equipment.generation;
+            reload_report = 0;
+            previous_reload_phase = 0;
+            hw.state = HW_LOADED;
+            hw.state_at = now;
+            hw.manual_slide_ready = hw.slide_hold = 0;
+        }
+        int actual_reload = equipment.known && equipment.entity && equipment.reload_known;
+        int direct_commands = hw.manual_mag && vx_weapon_bridge_commands_enabled();
+        static uint64_t command_notice;
+        if (direct_commands && equipment.command_serial != command_notice &&
+            equipment.command_status >= VX_COMMAND_REJECTED) {
+            command_notice = equipment.command_serial;
+            show_label(equipment.command_status == VX_COMMAND_TIMEOUT ? "ゲームから操作の応答がありません" :
+                       "ゲームが操作を受け付けませんでした");
+            // Restore the gesture state to the last game-confirmed state.
+            hw.state = equipment.reload_phase == 0 ? HW_LOADED :
+                       equipment.reload_phase == 5 ? HW_IN_NO_ROUND : HW_EMPTY;
+            hw.slide_hold = hw.manual_slide_ready = 0;
+        }
+        hw.game_reload_known = actual_reload;
+        if (actual_reload) {
+            hw.game_reload_phase = equipment.reload_phase;
+            hw.game_ammo = equipment.ammo;
+            if (reload_report != equipment.reload_report) {
+                reload_report = equipment.reload_report;
+                if (previous_reload_phase >= 2 && previous_reload_phase != 5 &&
+                    (equipment.reload_phase == 0 || equipment.reload_phase == 5) && equipment.ammo > 0) {
+                    show_label(equipment.reload_phase == 5 ? "弾倉装着・ZLでスライドを引く" : "装填完了");
+                } else if ((previous_reload_phase == 7 || previous_reload_phase == 8) && equipment.reload_phase == 1) {
+                    show_label("装填できません・所持弾を確認");
+                }
+                previous_reload_phase = equipment.reload_phase;
+                if (equipment.reload_phase == 0 || equipment.reload_phase == 5) {
+                    hw.state = equipment.reload_phase == 0 ? HW_LOADED : HW_IN_NO_ROUND;
+                    hw.state_at = now;
+                } else if (equipment.reload_phase == 1 && hw.state != HW_HOLD_NEW) {
+                    hw.state = HW_EMPTY;
+                    hw.state_at = now;
+                    if (direct_commands && equipment.ammo == 0) show_label("左腰で ZL 長押し");
+                }
+            }
+        }
         hand_weapon_set_controller(&hw, controller, controller_time);
         hand_weapon_set_arms(&hw, g_arms);
+        hw.wrist_primary = wrist_primary;
+        if (joy_hold) hw.lefty = 0;
+        if (hw.manual_mag || wrist_primary) hand_weapon_set_wrist_frames(&hw, g_wrists);
         int mb = 0;
-        if (mag && vr) {
+        int game_input = vr && (!hw.manual_mag || gameplay) && (!bare || !hand_input.blocked);
+        float bore[10];
+        static double (*drawn_direction)(float[10]);
+        if (wrist_primary && !drawn_direction) drawn_direction = dlsym(RTLD_DEFAULT, "vxpipe_drawn_weapon_direction");
+        double bore_at = gameplay && wrist_primary && drawn_direction ? drawn_direction(bore) : 0;
+        int have_bore = bore_at > 0 && now - bore_at <= .16;
+        int typed_weapon = equipment.known && equipment.entity && equipment.type_known;
+        int long_gun = typed_weapon ? equipment.ranged && !equipment.handgun && !equipment.revolver :
+                       hw.auto_chamber || hw.weapon_type != HW_WPN_PISTOL || (have_bore && bore[9] >= .16f);
+        int button_support = !bare && long_gun;
+        hw.shake_enabled = have_bore && !cycles;
+        if (hw.manual_mag && !game_input) {
+            hw.manual_prev = controller;
+            hw.manual_slide_ready = hw.slide_hold = 0;
+        }
+        if (mag && game_input) {
+            hw.manual_support = joy_hold && joy_weapon.support;
+            if (hw.manual_mag) {
+                static int (*reload_targets)(int, float[3], float[6], int *, int *);
+                if (!reload_targets) reload_targets = dlsym(RTLD_DEFAULT, "vxpipe_weapon_reload_targets");
+                float rack[6];
+                int has_rack = 0;
+                hw.auto_chamber = 0;
+                hw.well_contact_model = reload_targets && !cycles
+                    ? reload_targets(hw.lefty ? 0 : 1, hw.well_contact, rack, &has_rack, &hw.auto_chamber) : 0;
+                hw.rack_contact_valid = has_rack;
+                if (has_rack) {
+                    memcpy(hw.rack_contact, rack, sizeof hw.rack_contact);
+                    memcpy(hw.rack_axis, rack + 3, sizeof hw.rack_axis);
+                } else if (have_bore && !cycles) {
+                    // Models without an authored handle use a point on the
+                    // receiver in gun space, even while the weapon is rolled.
+                    hw.rack_contact_valid = -1;
+                    float along = bore[9] >= .16f ? .14f : .055f;
+                    for (int i = 0; i < 3; i++) {
+                        hw.rack_contact[i] = bore[6 + i] + along * bore[i] + .055f * bore[3 + i];
+                        hw.rack_axis[i] = bore[i];
+                    }
+                }
+                if (typed_weapon) hw.auto_chamber = !equipment.handgun;
+            }
             mb = hand_weapon_update(&hw, head, g_joints, now);
             for (int i = 0; i < HW_EV_N; i++) if (mb & (1 << i)) {
-                vx_log("VR: magazine %s (%s)", hand_weapon_event_name(1 << i), hand_weapon_state_name(hw.state));
-                if (mact[i] && !mup_at[i]) {
+                vx_log("VR: magazine %s%s (%s)", hand_weapon_event_name(1 << i),
+                       hw.manual_mag ? " requested" : "", hand_weapon_state_name(hw.state));
+                if (direct_commands) {
+                    int kind = i == 0 ? VX_WEAPON_EJECT : i == 2 ? VX_WEAPON_INSERT :
+                               i == 4 ? VX_WEAPON_CHAMBER : 0;
+                    if (kind) {
+                        uint64_t serial = vx_weapon_bridge_command(kind);
+                        if (!serial) {
+                            show_label("武器操作の接続を待っています");
+                            hw.state = equipment.reload_phase == 0 ? HW_LOADED :
+                                       equipment.reload_phase == 5 ? HW_IN_NO_ROUND : HW_EMPTY;
+                            hw.slide_hold = hw.manual_slide_ready = 0;
+                            mb &= ~((1 << i) | (i == 4 ? HW_EV_RACK : 0));
+                        }
+                        vx_log("VR: game weapon command kind=%d serial=%llu", kind, (unsigned long long)serial);
+                    }
+                } else if (bare && mact[i] > 0) bare_key_pulse(mact[i], .08);
+                else if (mact[i] && !mup_at[i]) {
                     if (mact[i] < 0) vx_xros_hand_button(-1 - mact[i], 1); else vx_xros_hand_key(mact[i], 1);
+                    // The stock Reload action is also handled by the idempotent
+                    // script command when the game uses a different input context.
+                    if (i == 0 && hw.manual_mag && !bare) vx_xros_hand_key(0x15, 1);
                     mup_at[i] = now + 0.08;
                 }
             }
             int shown = mb & ~HW_EV_DONE; if (hw.rack && (mb & HW_EV_RACK)) shown = HW_EV_RACK;
+            // A requested ejection has not yet been acknowledged by the game.
+            if (direct_commands) shown &= ~HW_EV_OUT;
             if (mag_labels && shown) {          // (a short label for the step: out, a new one, in, racked, cancelled)
                 static const char *ms[8][HW_EV_N] = {
                     { "Magazine out", "New magazine", "Magazine in", "Chambered", "", "Reload cancelled" },
-                    { "マガジンを抜いた", "新しいマガジン", "マガジンを差した", "装填", "", "リロード中止" },
+                    { "マガジンを抜いた", "新しいマガジン", "弾倉挿入・装填を確認中", "コッキング操作", "", "リロード中止" },
                     { "弹匣已取出", "新弹匣", "弹匣已插入", "已上膛", "", "取消装弹" },
                     { "彈匣已取出", "新彈匣", "彈匣已插入", "已上膛", "", "取消裝彈" },
                     { "탄창 분리", "새 탄창", "탄창 장착", "장전 완료", "", "재장전 취소" },
@@ -3296,8 +3773,16 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
                 int i = 0; while (i < HW_EV_N - 1 && !(shown & (1 << i))) i++;
                 if (shown & HW_EV_RACK) i = 3;
                 if (ms[ui_lang()][i][0]) {
-                    show_label(ms[ui_lang()][i]);
-                    pthread_mutex_lock(&g_lock); g_label_until = now + 0.7; g_label_big = 0; pthread_mutex_unlock(&g_lock);
+                    int pouch_hint = hw.manual_mag && i == 0;
+                    const char *label = ms[ui_lang()][i];
+                    if (pouch_hint) {
+                        if (bare && ui_lang() == 1) label = hw.lefty ? "右腰でピンチしたまま持ち上げる" : "左腰でピンチしたまま持ち上げる";
+                        else if (bare) label = hw.lefty ? "Pinch at right hip and lift" : "Pinch at left hip and lift";
+                        else if (ui_lang() == 1) label = hw.lefty ? "右腰で ZR 長押し" : "左腰で ZL 長押し";
+                        else label = hw.lefty ? "Hold ZR at right hip" : "Hold ZL at left hip";
+                    }
+                    show_label(label);
+                    pthread_mutex_lock(&g_lock); g_label_until = now + (pouch_hint ? 2.5 : .7); g_label_big = 0; pthread_mutex_unlock(&g_lock);
                 }
             }
         }
@@ -3322,9 +3807,49 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         #define AKEY(k, d) do { if ((k) < 0) vx_xros_hand_button(-1 - (k), d); else if (k) vx_xros_hand_key(k, d); } while (0)
         for (int i = 0; i < 3; i++) if (aup_at[i] > 0 && now >= aup_at[i]) { aup_at[i] = 0; AKEY(akey[i], 0); }
         int grab = 0;
-        if ((arms || mag) && vr) {
-            if (!mag) hand_weapon_update(&hw, head, g_joints, now);   // (the arms use the magazine's state and the grip's line)
-            int ab = hand_weapon_arms(&hw, head, g_joints, now, trig_on);
+        if ((arms || mag || joy_hold) && vr) {
+            if (!mag) {
+                if (joy_hold) hand_weapon_sample_poses(&hw, head, g_joints, now);
+                else hand_weapon_update(&hw, head, g_joints, now);
+            }
+            hand_pose contact[2];
+            for (int h = 0; h < 2; h++) {
+                hand_pose_from_wrist(g_wrists + h * 10, &contact[h]);
+                if (bare && hands[h * 10] < .5f) contact[h].ok = 0;
+            }
+            static int (*weapon_contacts)(int, const float[3], float[2]);
+            if (joy_hold && !weapon_contacts) weapon_contacts = dlsym(RTLD_DEFAULT, "vxpipe_drawn_weapon_contacts");
+            float distances[2] = { INFINITY, INFINITY };
+            if (weapon_contacts && contact[0].ok) weapon_contacts(1, contact[0].palm, distances);
+            hand_weapon_contact rendered = { distances[0], distances[1], button_support };
+            if (joy_hold && (!gameplay || (bare && hand_input.blocked))) {
+                joy_weapon.support = 0;
+                joy_weapon.support_held = 0;
+                joy_weapon.previous = controller;
+            }
+            hand_weapon_controller_update(&joy_weapon, contact, controller, now,
+                                          joy_hold && gameplay && (!bare || !hand_input.blocked), &rendered);
+            unsigned owner_trigger = HW_BTN_R_TRIG;
+            if (hw.manual_mag && (mb & (HW_EV_IN | HW_EV_DONE)) && (controller & owner_trigger)) {
+                joy_weapon.consume = 1;
+                joy_weapon.fire = 0;
+            }
+            if (hw.manual_mag && (!hand_weapon_has_magazine(&hw) ||
+                                  hw.slide_hold || (mb & (HW_EV_IN | HW_EV_DONE)) ||
+                                  (actual_reload && equipment.reload_phase != 0 && equipment.reload_phase != 5))) {
+                joy_weapon.support = joy_weapon.support_held = 0;
+            }
+            if (joy_hold) {
+                static unsigned last_joy; static int last_support = -1;
+                if (controller != last_joy || joy_weapon.support != last_support) {
+                    float gap = (contact[0].ok && contact[1].ok) ? dist3(contact[0].palm, contact[1].palm) : -1.f;
+                    vx_log("VR: %s weapon buttons=0x%x owner=right support=%d fire=%d tracked=%d/%d gap=%.2f grip=%.2f foregrip=%.2f state=%d",
+                           bare ? "full hand" : "Joy-Con", controller, joy_weapon.support, joy_weapon.fire,
+                           contact[0].ok, contact[1].ok, gap, rendered.grip, rendered.support, hw.state);
+                    last_joy = controller; last_support = joy_weapon.support;
+                }
+            }
+            int ab = joy_hold ? 0 : hand_weapon_arms(&hw, head, g_joints, now, trig_on);
             grab = ab & HW_ARM_INTERACT;
             for (int i = 0; i < 3; i++) if (arms && (ab & (1 << i)) && !aup_at[i]) {
                 AKEY(akey[i], 1); aup_at[i] = now + 0.08;
@@ -3332,21 +3857,65 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
                 vx_log("VR: gun %s", an[i]);
             }
         }
+        if (!vr) hand_weapon_controller_update(&joy_weapon, hw.pose, 0, now, 0, NULL);
         static int auto_draw_done;
         if (!vr) auto_draw_done = 0;
         hand_pose *draw_gun = &hw.pose[hw.lefty ? 0 : 1];
-        if (arms && vr && !auto_draw_done && !hw.weapon_drawn && draw_gun->ok &&
+        if (!joy_hold && arms && vr && !auto_draw_done && !hw.weapon_drawn && draw_gun->ok &&
             draw_gun->palm[1] - head[13] > -.38f && !aup_at[0] && !aup_at[1] && !aup_at[2] && akey[0]) {
             AKEY(akey[0], 1); aup_at[0] = now + .08; hw.weapon_drawn = 1; auto_draw_done = 1;
             vx_log("VR: gun draw (raised hand)");
         }
         static int hand_ads = -1;
         if (hand_ads < 0) { const char *e = getenv("VXMAC_HAND_ADS"); hand_ads = e && !strcmp(e, "1"); }
-        int want_aim = arms && hand_ads && vr && hw.ads && !hand_weapon_is_hybrid(&hw, now);
-        int want_trig = arms && trig_on && vr && hw.trigger && !hand_weapon_is_hybrid(&hw, now);
-        if (want_aim != aim_down) { aim_down = want_aim; AKEY(akey[3], aim_down); }
+        // Joy-Con mode has one fire source. Finger tracking can look like a curled index finger while holding a pad.
+        int joy_actions = hand_weapon_controller_actions(&joy_weapon, joy_hold && vr, 1);
+        static int (*supported_grip)(void);
+        if ((joy_actions & HW_JOY_AIM) && !supported_grip)
+            supported_grip = dlsym(RTLD_DEFAULT, "vxpipe_supported_grip");
+        int want_aim = joy_hold ? ((joy_actions & HW_JOY_AIM) && (button_support || (supported_grip && supported_grip()))) :
+                                  (arms && hand_ads && vr && hw.ads && !hand_weapon_is_hybrid(&hw, now));
+        int want_trig = !joy_hold && arms && trig_on && vr && hw.trigger && !hand_weapon_is_hybrid(&hw, now);
+        if (!bare && want_aim != aim_down) { aim_down = want_aim; AKEY(akey[3], aim_down); }
         if (want_trig != trig_down) { trig_down = want_trig; AKEY(akey[4], trig_down); }
+        pthread_mutex_lock(&g_lock);
+        g_joy_fire_ready_at = CACurrentMediaTime();
+        g_joy_fire_mask = 0;
+        if (!gameplay || cycles || bare || g_warp_mode == 5 || !muzzle_aim_enabled() ||
+            (!have_bore && !(controller & HW_BTN_R_TRIG) && now - bore_at > .70)) g_muzzle.seen = 0;
+        else if (have_bore) g_muzzle.seen = 1;
+        g_muzzle.track = g_muzzle.seen && have_bore && g_wrists[10] > .5f &&
+                         hand_weapon_aim_angles(bore, head, g_muzzle.aim);
+        g_muzzle.at = bore_at;
+        g_muzzle.steering = g_muzzle.track && !!(controller & HW_BTN_R_TRIG);
+        if (bare) {
+            g_bare_last = CACurrentMediaTime();
+            g_bare_menu = hand_input.menu;
+            g_bare_hover = hand_input.hover;
+            unsigned held = hand_input.movement;
+            if (gameplay && full_hands.armed && !hand_input.blocked) {
+                if (joy_weapon.fire && (!hw.manual_mag || hand_weapon_has_magazine(&hw))) held |= BARE_FIRE;
+                if (want_aim) held |= BARE_AIM;
+            }
+            bare_held_locked(held);
+        }
+        // An inserted magazine can already be usable on a long gun whose mesh
+        // is unknown to the renderer. The game checks its real chamber state.
+        if (!bare && joy_hold && gameplay && joy_weapon.initialized &&
+            !joy_weapon.consume && (!hw.manual_mag || hand_weapon_has_magazine(&hw)) &&
+            (!direct_commands || equipment.command_status != VX_COMMAND_PENDING) &&
+            (!actual_reload || equipment.reload_phase == 0)) {
+            g_joy_fire_mask = HW_BTN_R_TRIG;
+        }
+        pthread_mutex_unlock(&g_lock);
         #undef AKEY
+        // This path is opt-in until the grip positions have been calibrated on the headset.
+        static int hand_hold_enabled = -1; static hand_weapon_hold visual_hold;
+        if (hand_hold_enabled < 0) { const char *e = getenv("VXMAC_HAND_HOLD"); hand_hold_enabled = e && !strcmp(e, "1"); }
+        if (vr && !mag && !arms && !joy_hold && (on || hand_hold_enabled)) hand_weapon_update(&hw, head, g_joints, now);
+        int hold_active = !joy_hold && hand_hold_enabled && vr && !hand_weapon_is_hybrid(&hw, now);
+        hand_weapon_hold_update(&visual_hold, hw.pose, hw.lefty ? 0 : 1, hold_active);
+        if (hw.state != HW_LOADED || hw.slide_hold || hw.pull_ready) visual_hold.support = 0;
         pthread_mutex_lock(&g_lock);
         int off_hand = hw.lefty ? 1 : 0;
         hand_pose *visual_off = &hw.pose[off_hand];
@@ -3385,11 +3954,12 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         memcpy(g_mag_draw.palm, gun->palm, sizeof gun->palm); memcpy(g_mag_draw.fwd, gun->fwd, sizeof gun->fwd);
         g_mag_draw.two_hand = hw.ads && hw.off_fist;
         g_mag_draw.weapon_type = hw.weapon_type; g_mag_draw.state = hw.state; g_mag_draw.slide_hold = hw.slide_hold;
-        static double s_slide_t, s_suppress_until;
+        static double s_slide_t;
         double dt_s = s_slide_t > 0 ? fmin(0.1, fmax(0.0, now - s_slide_t)) : 0.016;
         s_slide_t = now;
-        if (mb & HW_EV_DONE) s_suppress_until = now + 2.1;
-        if (hw.slide_hold && visual_off->ok) {
+        if (hw.manual_mag && hw.slide_hold) {
+            g_mag_draw.pull = fminf(.095f, hw.manual_pull);
+        } else if (hw.slide_hold && visual_off->ok) {
             float raw_p = 0;
             for (int i = 0; i < 3; i++) raw_p += (hw.grab_at[i] - visual_off->palm[i]) * gun->fwd[i];
             g_mag_draw.pull = fminf(.068f, fmaxf(0.0f, raw_p));
@@ -3407,15 +3977,27 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             mag_mode = 2.0f;
             drop_prog = fminf(1.0f, fmaxf(0.0f, (float)(now - hw.state_at) * 3.0f));
         }
-        float supp = (now < s_suppress_until || mag_mode > 0.5f || g_mag_draw.pull > 0.002f) ? 1.0f : 0.0f;
         pthread_mutex_lock(&g_ik_lock);
         g_ik_slide_pull = g_mag_draw.pull;
+        g_ik_slide_active = hw.manual_mag && game_input && hw.slide_hold && !hw.rack_suspended &&
+                            !!(controller & HW_BTN_L_TRIG);
+        memcpy(g_ik_slide_contact, hw.slide_contact, sizeof hw.slide_contact);
+        memcpy(g_ik_slide_contact + 3, hw.slide_axis, sizeof hw.slide_axis);
+        g_ik_mag_state = hw.manual_mag && game_input ? hw.state : -1;
+        g_ik_mag_started = hw.state == HW_EMPTY ? hw.manual_ejected_at : hw.state_at;
+        g_ik_mag_ejection = hw.manual_ejections;
         g_ik_weap[0] = g_mag_draw.pull;
         g_ik_weap[1] = mag_mode;
         g_ik_weap[2] = well_d;
         g_ik_weap[3] = drop_prog;
-        g_ik_weap[4] = supp;
+        g_ik_weap[4] = hw.manual_mag && game_input && (hw.state == HW_HOLD_NEW || hw.slide_hold);
         g_ik_weap[5] = (float)controller;
+        g_ik_weap[6] = joy_hold && vr ? 2.f : hold_active ? (float)(visual_hold.owner + 1) : 0;
+        g_ik_weap[7] = joy_hold && vr ? (joy_weapon.support ? (button_support ? 2.f : 1.f) : 0.f) :
+                                      hold_active && visual_hold.support ? 1.f : 0.f;
+        int visual_owner = joy_hold && gameplay && (!bare || full_hands.armed) ? 2 : 0;
+        if (cycles || changed_weapon || visual_owner != g_ik_weapon_owner) g_ik_weapon_epoch++;
+        g_ik_weapon_owner = visual_owner;
         pthread_mutex_unlock(&g_ik_lock);
         const char *game_hands = getenv("VXMAC_GAME_HANDS");
         static float sm_lp[3], sm_ypr[3], sm_lo[3], sm_oypr[3];
@@ -3515,7 +4097,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         }
         g_mag_draw.on = vr && (mag || arms);
         int reloading = hw.mag_shown || hw.state != HW_LOADED;
-        g_mag_draw.ring = reloading && hw.well_ok;
+        g_mag_draw.ring = !hw.manual_mag && reloading && hw.well_ok;
         g_mag_draw.lit = hw.near_well; g_mag_draw.mag = reloading && visual_off->ok && hw.mag_shown; g_mag_draw.holding = hw.mag_shown;
         memcpy(g_mag_draw.well, hw.well, sizeof hw.well); memcpy(g_mag_draw.grip_dir, hw.grip_dir, sizeof hw.grip_dir);
         if (visual_off->ok) for (int i = 0; i < 3; i++) {
@@ -3549,7 +4131,6 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             } else { fclose(prec); prec = NULL; vx_log("VR: hand pose record done"); }
         }
         int b = 0;
-        if (on && vr && !mag && !arms) hand_weapon_update(&hw, head, g_joints, now);
         float gesture_hands[20]; memcpy(gesture_hands, hands, sizeof gesture_hands);
         for (int h = 0; h < 2; h++) if (hw.pose[h].ok && hw.pose[h].from_arm) {
             hand_gestures_arm_pose(gesture_hands, h, hw.pose[h].palm, hw.pose[h].across);
@@ -3753,9 +4334,21 @@ void vx_xros_vr_cycle_warp_mode(void) {
 // (VX Mac, h38: the game is about to drain its events (libvxkit's poll hook, the game's thread): the head's delta since
 //  the last one, from the newest head pose (the compositor's, for its display time), as one mouse event first in line)
 void vx_xros_vr_input_poll(void) {
-    if (g_poll_in != 1) return;
+    int bare = vx_xros_vr_bare_enabled();
+    if (!bare && g_poll_in != 1) return;
     pthread_mutex_lock(&g_lock);
-    if (vr_now() && g_head_valid) { double t = CACurrentMediaTime(); vr_mouse(g_head, t, 1); g_last_poll = t; }
+    double t = CACurrentMediaTime();
+    if (bare) {
+        if (t - g_bare_last > .20) {
+            bare_held_locked(0);
+            g_bare_menu = 0;
+        }
+        if (g_bare_key && t >= g_bare_key_up) {
+            vx_xros_hand_key(g_bare_key, 0);
+            g_bare_key = 0;
+        }
+    }
+    if (g_poll_in == 1 && vr_now() && g_head_valid) { vr_mouse(g_head, t, 1); g_last_poll = t; }
     pthread_mutex_unlock(&g_lock);
 }
 

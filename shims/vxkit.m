@@ -910,7 +910,11 @@ void vxkit_post_hid_key(uint32_t u, int down) {
     int shift = (g_mod_flags & kFlagShift) != 0;
     if (u >= 0x04 && u <= 0x1D) { kc = letters[u - 4]; c[0] = (char)((shift ? 'A' : 'a') + (u - 4)); }
     else if (u >= 0x1E && u <= 0x27) { kc = digits[u - 0x1E]; c[0] = shift ? ")!@#$%^&*("[(u - 0x1D) % 10] : (char)('0' + (u - 0x1D) % 10); }
-    else if (u >= 0x3A && u <= 0x45) kc = fkeys[u - 0x3A];
+    else if (u >= 0x3A && u <= 0x45) {
+        kc = fkeys[u - 0x3A];
+        // AppKit represents F1–F12 as U+F704–U+F70F in key events.
+        c[0] = (char)0xEF; c[1] = (char)0x9C; c[2] = (char)(0x84 + u - 0x3A);
+    }
     else switch (u) {
         case 0x28: kc = 0x24; c[0] = '\r'; break;   case 0x29: kc = 0x35; c[0] = 0x1b; break;
         case 0x2A: kc = 0x33; c[0] = 0x7f; break;   case 0x2B: kc = 0x30; c[0] = '\t'; break;

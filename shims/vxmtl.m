@@ -209,7 +209,9 @@ static void pace(void) {
     }
     if (now > t0 + 0.0005) { g_pace_waits++; g_pace_us += (unsigned long)((now - t0) * 1e6); }
 }
+static void pose_seal(id command);
 static void h_commit(id self, SEL s) {
+    pose_seal(self);
     if (![((id<MTLCommandBuffer>)self).commandQueue.label hasPrefix:@"VX Mac"]) {
         [(id<MTLCommandBuffer>)self addCompletedHandler:^(id<MTLCommandBuffer> c) { gpu_account(c); }];
         if (g_fg) pace();
@@ -241,6 +243,34 @@ void vxmtl_set_target_hook(vxmtl_target_hook h) { g_target_hook = h; }
 static const void *kPassTargets = &kPassTargets;
 static void targets_end(id enc);
 static const void *kPassCB = &kPassCB, *kPassDepth = &kPassDepth, *kPassStore = &kPassStore;
+static const void *kPoseResources = &kPoseResources;
+static void pose_seal(id command) {
+    if (!objc_getAssociatedObject(command, kPoseResources)) return;
+    void vxpipe_pose_seal_command_buffer(id);
+    vxpipe_pose_seal_command_buffer(command);
+}
+id vxmtl_command_buffer_for_encoder(id encoder) {
+    return objc_getAssociatedObject(encoder, kPassCB);
+}
+
+// Indirect argument buffers may be used by a command buffer created with
+// unretained references. Own our copies until its GPU work has completed.
+int vxmtl_retain_for_encoder(id encoder, id resource) {
+    id<MTLCommandBuffer> cb = objc_getAssociatedObject(encoder, kPassCB);
+    if (!cb || !resource) return 0;
+    @synchronized (cb) {
+        NSMutableSet *resources = objc_getAssociatedObject(cb, kPoseResources);
+        if (!resources) {
+            resources = [NSMutableSet set];
+            objc_setAssociatedObject(cb, kPoseResources, resources, OBJC_ASSOCIATION_RETAIN);
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                objc_setAssociatedObject(completed, kPoseResources, nil, OBJC_ASSOCIATION_RETAIN);
+            }];
+        }
+        [resources addObject:resource];
+    }
+    return 1;
+}
 typedef id (*rce_imp)(id, SEL, MTLRenderPassDescriptor *);
 typedef void (*end_imp)(id, SEL);
 static rce_imp o_rce, o_prce; static end_imp o_end, o_pend;
@@ -653,6 +683,7 @@ static id h_rce(id self, SEL s, MTLRenderPassDescriptor *pd) {
     if (g_hud_layer != 0) pd = hud_redirect(pd);
     void *ppx = NULL; if (vxprof_live) pd = vxprof_render_pd(self, pd, &ppx, 0);   // (a sampled frame: a copy with the counters)
     id e = o_rce(self, s, pd);
+    if (e) objc_setAssociatedObject(e, kPassCB, self, OBJC_ASSOCIATION_ASSIGN);
     if (ppx) vxprof_render_enc(e, ppx);
     if (e && g_pass_hook) { color_note(pd); drawable_pass_note(pd); cam_watch(e, pd); ui_note(e, pd); if (objc_getAssociatedObject(e, kUI)) { objc_setAssociatedObject(e, kUIcb, self, OBJC_ASSOCIATION_ASSIGN); ui_hook_end(e); } }
     if (e) targets_note(e, self, pd);

@@ -35,7 +35,7 @@ $(OUT)/libvxgk.dylib: vxgk.m | $(OUT)
 	$(CC) $(CFLAGS) $(DY) vxgk.m -o $@ -Wl,-reexport_framework,GameKit -framework Foundation
 $(OUT)/libvxcurl.dylib: vxcurl.c $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxcurl.c -o $@ $(OUT)/libvxkit.dylib
-$(OUT)/libvxmtl.dylib: vxmtl.m vxpipe.m vrik.inc vrik_table.h vxprof.m vxprof.h $(OUT)/libvxkit.dylib
+$(OUT)/libvxmtl.dylib: vxmtl.m vxpipe.m vrik.inc vrik_assets.inc vrik_capture.inc vrik_table.h $(wildcard ../build/hand-session-v2/weapon_asset_catalog.h) vxprof.m vxprof.h $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxmtl.m vxpipe.m vxprof.m -o $@ -Wl,-reexport_framework,Metal -framework Foundation -framework QuartzCore $(OUT)/libvxkit.dylib
 $(OUT)/libvxmtlfx.dylib: vxmtlfx.m $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxmtlfx.m -o $@ $(FXLINK) -framework Foundation -framework Metal -framework QuartzCore $(OUT)/libvxkit.dylib
@@ -48,7 +48,7 @@ $(MOUT):
 	mkdir -p $@
 $(MOUT)/libvxlog.dylib: vxlog_mac.c | $(MOUT)
 	$(MCC) $(MCFLAGS) $(DY) vxlog_mac.c -o $@
-$(MOUT)/libvxmtl.dylib: vxmtl.m vxpipe.m vxprof.m vxprof.h $(MOUT)/libvxlog.dylib
+$(MOUT)/libvxmtl.dylib: vxmtl.m vxpipe.m vrik.inc vrik_assets.inc vrik_capture.inc vrik_table.h $(wildcard ../build/hand-session-v2/weapon_asset_catalog.h) vxprof.m vxprof.h $(MOUT)/libvxlog.dylib
 	$(MCC) $(MCFLAGS) $(DY) vxmtl.m vxpipe.m vxprof.m -o $@ -framework Foundation -framework Metal -framework QuartzCore $(MOUT)/libvxlog.dylib -Wl,-rpath,@loader_path
 $(MOUT)/libvxmtlfx.dylib: vxmtlfx.m $(MOUT)/libvxlog.dylib
 	$(MCC) $(MCFLAGS) $(DY) vxmtlfx.m -o $@ -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore $(MOUT)/libvxlog.dylib -Wl,-rpath,@loader_path

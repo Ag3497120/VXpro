@@ -24,12 +24,14 @@
 #include <mach-o/dyld.h>
 #include <os/proc.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "xros_vr.h"
 #include "vxmac.h"
 #include "interp_frame.h"
+#include "weapon_bridge.h"
 
 extern void (*vx_host_jlog)(const char *event, const char *fields);   // (../../vr/vxmac_vr_glue.m)
 extern int vx_xros_display_w, vx_xros_display_h;
@@ -41,6 +43,7 @@ static double t0;
 static int g_vr = 1, g_gcmouse = 1, g_space_open, g_keep_window;
 int vxmac_keep_window(void) { return g_keep_window; }
 static char g_image[128];
+static _Atomic(const struct mach_header *) g_input_game_image;
 static double g_snap_s = 10, g_snap_last;   // (-snap: below)
 static double now_s(void) { return CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970; }
 static uint64_t footprint_mb(void) {
@@ -425,7 +428,7 @@ static void watch_mouse(GCMouse *m) {
 // -[GCControllerAxisInput value] for the right sticks' y axes, and the handlers set on right sticks get y = 0.
 // VXMAC_STICK_PITCH=1: the stick's pitch kept.
 int vx_xros_vr_driving(void);
-static NSHashTable *g_right_y, *g_right_pads, *g_vr_btns, *g_vr_axes, *g_vr_pads;
+static NSHashTable *g_right_y, *g_right_pads, *g_vr_btns, *g_vr_axes, *g_vr_pads, *g_joy_triggers;
 static _Atomic unsigned long g_stick_y_zeroed;   // (reads of the right stick's y answered 0, for the stats)
 static int stick_pitch_blocked(void) {
     static int keep = -1; if (keep < 0) { const char *e = getenv("VXMAC_STICK_PITCH"); keep = e && !strcmp(e, "1"); }
@@ -436,6 +439,8 @@ static void note_controller(GCController *c) {
     GCMicroGamepad *m = c.microGamepad;
     @synchronized (g_right_pads) {
         if (g) {
+            if (g.leftTrigger) [g_joy_triggers addObject:g.leftTrigger];
+            if (g.rightTrigger) [g_joy_triggers addObject:g.rightTrigger];
             [g_right_pads addObject:g.rightThumbstick]; [g_right_y addObject:g.rightThumbstick.yAxis];
             [g_vr_pads addObject:g.leftThumbstick]; [g_vr_pads addObject:g.rightThumbstick]; [g_vr_pads addObject:g.dpad];
             for (GCControllerDirectionPad *pad in @[g.leftThumbstick, g.rightThumbstick, g.dpad]) {
@@ -454,6 +459,7 @@ typedef void (*btn_handler_imp)(id, SEL, id);
 static btn_pressed_imp o_btn_pressed;
 static btn_value_imp o_btn_value;
 static btn_handler_imp o_set_btn_pressed_handler, o_set_btn_value_handler;
+#include "vxrawinput.h"
 static int vr_buttons_blocked(void) {
     static int block = -1; if (block < 0) { const char *e = getenv("VXMAC_BLOCK_PAD_BTNS"); block = e && !strcmp(e, "1"); }
     return block && vx_xros_vr_driving();
@@ -463,21 +469,44 @@ static int vr_axes_blocked(void) {
     return block && vx_xros_vr_driving();
 }
 static BOOL blocked_btn(id b) {
-    if (!vr_buttons_blocked()) return NO;
-    BOOL blocked; @synchronized (g_right_pads) { blocked = [g_vr_btns containsObject:b]; } return blocked;
+    if (vx_raw_button_depth) return NO;
+    static int joy_hold = -1;
+    if (joy_hold < 0) { const char *e = getenv("VXMAC_JOY_HOLD"); joy_hold = e && !strcmp(e, "1"); }
+    BOOL blocked; @synchronized (g_right_pads) {
+        blocked = (vr_buttons_blocked() && [g_vr_btns containsObject:b]) ||
+                  ((joy_hold || vx_xros_vr_bare_enabled()) && vx_xros_vr_driving() && [g_joy_triggers containsObject:b]);
+    }
+    return blocked;
 }
-static BOOL raw_btn_pressed(GCControllerButtonInput *b) { return b && (o_btn_pressed ? o_btn_pressed(b, @selector(isPressed)) : b.pressed); }
-static float raw_btn_value(GCControllerButtonInput *b) { return b ? (o_btn_value ? o_btn_value(b, @selector(value)) : b.value) : 0; }
-static BOOL h_btn_pressed(id self, SEL s) { return blocked_btn(self) ? NO : o_btn_pressed(self, s); }
-static float h_btn_value(id self, SEL s) { return blocked_btn(self) ? 0 : o_btn_value(self, s); }
+static BOOL raw_btn_pressed(GCControllerButtonInput *b) {
+    return vx_raw_button_pressed(b);
+}
+static float raw_btn_value(GCControllerButtonInput *b) {
+    return vx_raw_button_value(b);
+}
+static BOOL game_input_caller(void *address) {
+    const struct mach_header *image = atomic_load(&g_input_game_image);
+    Dl_info caller;
+    return image && dladdr(address, &caller) && caller.dli_fbase == image;
+}
+// GameController also reads these properties while processing hardware input.
+// Returning zero to those callers can swallow the release of a masked button.
+#define INPUT_CALLER __builtin_extract_return_addr(__builtin_return_address(0))
+static BOOL h_btn_pressed(id self, SEL s) {
+    return blocked_btn(self) && game_input_caller(INPUT_CALLER) ? NO : o_btn_pressed(self, s);
+}
+static float h_btn_value(id self, SEL s) {
+    return blocked_btn(self) && game_input_caller(INPUT_CALLER) ? 0 : o_btn_value(self, s);
+}
 static void h_set_btn_pressed_handler(id self, SEL s, GCControllerButtonValueChangedHandler h) {
-    if (!h) { o_set_btn_pressed_handler(self, s, nil); return; }
+    if (!h || !game_input_caller(INPUT_CALLER)) { o_set_btn_pressed_handler(self, s, h); return; }
     o_set_btn_pressed_handler(self, s, ^(GCControllerButtonInput *b, float v, BOOL p) { BOOL z = blocked_btn(b); h(b, z ? 0 : v, z ? NO : p); });
 }
 static void h_set_btn_value_handler(id self, SEL s, GCControllerButtonValueChangedHandler h) {
-    if (!h) { o_set_btn_value_handler(self, s, nil); return; }
+    if (!h || !game_input_caller(INPUT_CALLER)) { o_set_btn_value_handler(self, s, h); return; }
     o_set_btn_value_handler(self, s, ^(GCControllerButtonInput *b, float v, BOOL p) { BOOL z = blocked_btn(b); h(b, z ? 0 : v, z ? NO : p); });
 }
+#undef INPUT_CALLER
 typedef float (*axis_imp)(id, SEL);
 static axis_imp o_axis_value;
 static float h_axis_value(id self, SEL s) {
@@ -517,7 +546,7 @@ static void h_set_axis_handler(id self, SEL s, GCControllerAxisValueChangedHandl
 static void stick_pitch_setup(void) {
     o_set_axis_handler = (sethandler_imp)method_setImplementation(class_getInstanceMethod([GCControllerAxisInput class], @selector(setValueChangedHandler:)), (IMP)h_set_axis_handler);
     g_vr_axes = [NSHashTable weakObjectsHashTable]; g_vr_pads = [NSHashTable weakObjectsHashTable];
-    g_right_y = [NSHashTable weakObjectsHashTable]; g_right_pads = [NSHashTable weakObjectsHashTable]; g_vr_btns = [NSHashTable weakObjectsHashTable];
+    g_right_y = [NSHashTable weakObjectsHashTable]; g_right_pads = [NSHashTable weakObjectsHashTable]; g_vr_btns = [NSHashTable weakObjectsHashTable]; g_joy_triggers = [NSHashTable weakObjectsHashTable];
     o_btn_pressed = (btn_pressed_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(isPressed)), (IMP)h_btn_pressed);
     o_btn_value = (btn_value_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(value)), (IMP)h_btn_value);
     o_set_btn_pressed_handler = (btn_handler_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(setPressedChangedHandler:)), (IMP)h_set_btn_pressed_handler);
@@ -536,15 +565,29 @@ static void warp_mode_poll_start(void) {
     dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0), 11 * NSEC_PER_MSEC, 1 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(t, ^{
         static double since; static int fired;
+        static unsigned previous_triggers;
+        static int input_diag = -1; static double input_diag_at; static unsigned input_diag_count;
+        if (input_diag < 0) { const char *e = getenv("VXMAC_JOY_INPUT_DIAG"); input_diag = e && !strcmp(e, "1"); }
+        double poll_at = CACurrentMediaTime();
+        int report = input_diag && input_diag_count < 40 && poll_at - input_diag_at >= 3.0;
+        if (report) { input_diag_at = poll_at; input_diag_count++; }
         int both = 0; unsigned hbtns = 0; int active = 0;
         for (GCController *c in GCController.controllers) {
             GCExtendedGamepad *g = c.extendedGamepad;
             if (g && g.buttonHome && g.buttonHome.pressed) both = 1;
             if (g) {
+                if (report) jlog("joy_raw", "\"pad_class\":\"%s\",\"left_class\":\"%s\",\"right_class\":\"%s\",\"zl\":[%d,%.3f],\"zr\":[%d,%.3f],\"x\":[%d,%.3f]",
+                                  object_getClassName(g), g.leftTrigger ? object_getClassName(g.leftTrigger) : "none",
+                                  g.rightTrigger ? object_getClassName(g.rightTrigger) : "none",
+                                  raw_btn_pressed(g.leftTrigger), raw_btn_value(g.leftTrigger),
+                                  raw_btn_pressed(g.rightTrigger), raw_btn_value(g.rightTrigger),
+                                  raw_btn_pressed(g.buttonX), raw_btn_value(g.buttonX));
                 if (raw_btn_pressed(g.leftShoulder) || raw_btn_pressed(g.leftThumbstickButton)) hbtns |= HW_BTN_L_GRAB;
-                if (raw_btn_pressed(g.leftTrigger)) hbtns |= HW_BTN_L_TRIG;
+                if (raw_btn_pressed(g.leftTrigger) || raw_btn_value(g.leftTrigger) >=
+                    ((previous_triggers & HW_BTN_L_TRIG) ? .14f : .25f)) hbtns |= HW_BTN_L_TRIG;
                 if (raw_btn_pressed(g.rightShoulder) || raw_btn_pressed(g.rightThumbstickButton)) hbtns |= HW_BTN_R_GRAB;
-                if (raw_btn_pressed(g.rightTrigger)) hbtns |= HW_BTN_R_TRIG;
+                if (raw_btn_pressed(g.rightTrigger) || raw_btn_value(g.rightTrigger) >=
+                    ((previous_triggers & HW_BTN_R_TRIG) ? .14f : .25f)) hbtns |= HW_BTN_R_TRIG;
                 if (raw_btn_pressed(g.buttonA)) hbtns |= HW_BTN_ACT_A;
                 if (raw_btn_pressed(g.buttonB)) hbtns |= HW_BTN_ACT_B;
                 if (raw_btn_pressed(g.buttonX)) hbtns |= HW_BTN_ACT_X;
@@ -566,6 +609,7 @@ static void warp_mode_poll_start(void) {
                       g.dpad.left.pressed || g.dpad.right.pressed)) { void vx_xros_vr_controller_touch(void); vx_xros_vr_controller_touch(); }
         }
         double now = CACurrentMediaTime();
+        previous_triggers = hbtns & (HW_BTN_L_TRIG | HW_BTN_R_TRIG);
         static double ctrl_last_active;
         if (active || hbtns) ctrl_last_active = now;
         if (ctrl_last_active > 0 && now - ctrl_last_active < 5) hbtns |= HW_BTN_ACTIVE;
@@ -581,8 +625,34 @@ static void warp_mode_poll_start(void) {
     dispatch_resume(t);
 }
 static void input_setup(void) {
-    stick_pitch_setup();
-    warp_mode_poll_start();
+    if (vx_xros_vr_bare_enabled()) {
+        setenv("VXMAC_EJECT_MAG", "1", 1);
+        setenv("VXMAC_NO_AUTO_RELOAD", "1", 1);
+        setenv("VXMAC_ARMS", "0", 1);
+        setenv("VXMAC_GESTURES", "0", 1);
+        jlog("input_source", "\"source\":\"full_hand\"");
+    }
+    const char *manual = getenv("VXMAC_MANUAL_MAG"), *mag = getenv("VXMAC_MAG"), *overlay = getenv("VXMAC_NO_AUTO_RELOAD");
+    const char *eject = getenv("VXMAC_EJECT_MAG");
+    int requested = (eject && !strcmp(eject, "1")) ||
+                    (manual && !strcmp(manual, "1") && mag && !strcmp(mag, "1"));
+    int ready = requested && overlay && !strcmp(overlay, "1");
+    const char *files[] = { "final.redscripts", "inputUserMappings.xml", "inputContexts.xml" };
+    for (size_t i = 0; ready && i < sizeof files / sizeof files[0]; i++) {
+        char path[sizeof g_docs + 64];
+        snprintf(path, sizeof path, "%s/vxhands_manual/%s", g_docs, files[i]);
+        ready = access(path, R_OK) == 0;
+    }
+    setenv("VXMAC_MANUAL_MAG_ACTIVE", ready ? "1" : "0", 1);
+    if (ready) setenv("VXMAC_MAG", "1", 1);
+    if (requested && !ready) {
+        setenv("VXMAC_MAG", "0", 1);
+        jlog("manual_reload_unavailable", "\"reason\":\"the three game overlays must be installed together\"");
+    }
+    if (!vx_xros_vr_bare_enabled()) {
+        stick_pitch_setup();
+        warp_mode_poll_start();
+    }
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
     [nc addObserverForName:GCKeyboardDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { watch_keyboard(n.object); }];
     [nc addObserverForName:GCMouseDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { watch_mouse(n.object); }];
@@ -592,6 +662,12 @@ static void input_setup(void) {
 
 // ---- the program -------------------------------------------------------------------------------------------------
 typedef int (*entry_fn)(int, char **, char **, char **);
+static void program_poll(void) {
+    vx_weapon_bridge_poll();
+    void vx_xros_vr_input_poll(void);
+    vx_xros_vr_input_poll();
+}
+
 static void *program_main(void *arg) {
     (void)arg;
     pthread_setname_np("program main");
@@ -615,6 +691,8 @@ static void *program_main(void *arg) {
         if (n && (!strcmp(n, path.UTF8String) || strstr(n, [NSString stringWithFormat:@"/%s.dylib", g_image].UTF8String))) mh = _dyld_get_image_header(i);
     }
     if (!mh) { jlog("program_error", "\"what\":\"loaded image not found\""); return NULL; }
+    atomic_store(&g_input_game_image, mh);
+    vx_weapon_bridge_prepare(mh);
     vxaudio_hook_image(mh);   // (h66: its HAL imports through libvxkit's counters - done at load already; idempotent)
     entry_fn entry = (entry_fn)((const char *)mh + [img[@"entry_offset"] unsignedLongLongValue]);
     // (h61b: which prepared image this bundle carries - ddgame61 was built from 2.3.2's prepared/ (entry 206152) against
@@ -778,16 +856,22 @@ static void now_json(const char *vr, const char *mt, long thermal) {
       if (!once++) { mp = (void (*)(char *, unsigned))dlsym(RTLD_DEFAULT, "vxpipe_mem_stats"); mtr = (void (*)(char *, unsigned))dlsym(RTLD_DEFAULT, "vxsys_mtrace_stats"); }
       if (mp) mp(pm, sizeof pm);
       const char *e = getenv("VXMAC_MALLOC_TRACE"); if (mtr && e && atoi(e) > 0) mtr(tr, sizeof tr); }
-    char o[2800];
+    char weapon_status[768];
+    vx_weapon_bridge_status_json(weapon_status, sizeof weapon_status);
+    char pose_copy[320] = "\"pose_copy\":null";
+    { static void (*stats)(char *, unsigned); static int once;
+      if (!once++) stats = (void (*)(char *, unsigned))dlsym(RTLD_DEFAULT, "vxpipe_pose_copy_stats");
+      if (stats) stats(pose_copy, sizeof pose_copy); }
+    char o[3900];
     int n = snprintf(o, sizeof o, "{\"t\":%.0f,\"since_start\":%.0f,\"game_fps\":%.1f,\"compositor_hz\":%.1f,\"mode\":\"%s\",\"footprint_mb\":%llu,\"available_mb\":%llu,"
                      "\"peak_mb\":%llu,\"malloc_mb\":%llu,\"malloc_blocks\":%u,\"thermal\":%ld,\"gpu_cap\":%.2f,\"gpu_cap_half\":%d,\"game_gpu_busy_pct\":%.0f,"
                      "\"pace_ms\":%.0f,\"warp_gpu_ms\":%.2f,\"interp\":\"%s\",\"render_pipes_made\":%.0f,\"render_pipes\":%.0f,\"rp_repeat\":%.0f,\"rp_ms_max\":%.1f,"
-                     "\"enc_probes_live\":%.0f,%s%s%s}\n",
+                     "\"enc_probes_live\":%.0f,%s%s%s,%s,%s}\n",
                      t, t - t0, json_num(vr, "game_fps"), json_num(vr, "compositor_hz"), g_vr ? (strstr(vr, "\"mode\":\"vr\"") ? "vr" : "screen") : "flat",
                      (unsigned long long)footprint_mb(), (unsigned long long)(os_proc_available_memory() >> 20), ok ? (unsigned long long)(i.ledger_phys_footprint_peak >> 20) : 0ULL,
                      (unsigned long long)(ms.size_in_use >> 20), ms.blocks_in_use, thermal, cap, half, json_num(mt, "game_gpu_busy_pct"), json_num(mt, "pace_ms"),
                      json_num(vr, "warp_gpu_ms"), interp, json_num(pm, "render_pipes_made"), json_num(pm, "render_pipes"), json_num(pm, "rp_repeat"), json_num(pm, "rp_ms_max"),
-                     json_num(pm, "enc_probes_live"), au, *tr ? "," : "", tr);
+                     json_num(pm, "enc_probes_live"), au, *tr ? "," : "", tr, weapon_status, pose_copy);
     if (n <= 0 || n >= (int)sizeof o) return;
     char path[1100], tmp[1100];
     snprintf(path, sizeof path, "%s/vxmac_now.json", g_docs); snprintf(tmp, sizeof tmp, "%s/.vxmac_now.json.tmp", g_docs);
@@ -814,6 +898,14 @@ static void stats_tick(void) {
     { unsigned long pe, pt; void vx_xros_vr_pred_stats(unsigned long *, unsigned long *); vx_xros_vr_pred_stats(&pe, &pt);
       size_t l = strlen(npu); snprintf(npu + l, sizeof npu - l, ",\"pred_eyes\":%lu,\"eyes\":%lu,\"stick_y_zeroed\":%lu", pe, pt, (unsigned long)g_stick_y_zeroed); }
     if (g_vr) vx_xros_vr_stats(vr, sizeof vr);
+    {
+        static void (*stereo_stats)(char *, unsigned);
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ stereo_stats = dlsym(RTLD_DEFAULT, "vxpipe_stereo_stats"); });
+        char stereo[320] = "";
+        if (stereo_stats) stereo_stats(stereo, sizeof stereo);
+        if (*stereo) jlog("stereo_geometry", "%s", stereo);
+    }
     vxmtl_stats(mt, sizeof mt); vxfx_stats(fx, sizeof fx); vxkit_unknown_selectors(unk, sizeof unk);
     double ww, wh; vxkit_window_size(&ww, &wh);
     static int tick; char vm[900] = "\"vm\":0";
@@ -886,7 +978,7 @@ void vxmac_boot(void) {
         }
         vxmtl_set_present_hook(present_hook);
         if (g_vr) { vxmtl_set_pass_hook(pass_hook); vxmtl_set_target_hook(vxmac_vel_target);
-                    void vx_xros_vr_input_poll(void); vxkit_set_poll_hook(vx_xros_vr_input_poll); }   // (h38: the head's delta at the game's poll)
+                    vxkit_set_poll_hook(program_poll); }   // (h38: the head's delta at the game's poll)
         vx_xros_vr_enable(g_vr);
         input_setup();
         // the game's data, where its Mac bundle would have it

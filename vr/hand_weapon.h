@@ -31,6 +31,13 @@ typedef struct {
     int ok, from_arm;
 } hand_pose;
 
+// Visual weapon ownership. Tracking loss never counts as an intentional release.
+typedef struct {
+    int initialized, owner, support, closed[2];
+} hand_weapon_hold;
+
+void hand_weapon_hold_update(hand_weapon_hold *hold, const hand_pose pose[2], int default_owner, int enabled);
+
 #ifndef VX_HAND_BUTTONS_DEFINED
 #define VX_HAND_BUTTONS_DEFINED
 enum { HW_BTN_L_GRAB = 1u << 0, HW_BTN_L_TRIG = 1u << 1, HW_BTN_R_GRAB = 1u << 2,
@@ -41,8 +48,46 @@ enum { HW_MODE_AUTO, HW_MODE_BARE, HW_MODE_HYBRID };
 enum { HW_WPN_PISTOL = 0, HW_WPN_RIFLE, HW_WPN_SHOTGUN, HW_WPN_HEAVY, HW_WPN_N };
 
 typedef struct {
+    int initialized, support, support_held, consume, fire;
+    unsigned previous;
+    double support_seen_at;
+    float support_palm[3];
+} hand_weapon_controller;
+// Shared acquisition radius for the input and viewmodel solvers.
+#define HW_SUPPORT_RADIUS .18f
+#define HW_SUPPORT_RELEASE .22f
+#define HW_SUPPORT_CONTACT_GRACE .22
+typedef struct {
+    float grip, support; // Distance from the free palm to the rendered contacts, in metres.
+    int button_support;  // Long guns attach the support hand on ZL, regardless of distance.
+} hand_weapon_contact;
+
+// The right trigger fires. The left trigger can only support the weapon.
+void hand_weapon_controller_update(hand_weapon_controller *c, const hand_pose pose[2],
+                                   unsigned buttons, double now, int enabled, const hand_weapon_contact *contact);
+enum { HW_JOY_FIRE = 1, HW_JOY_AIM = 2 };
+int hand_weapon_controller_actions(const hand_weapon_controller *c, int enabled, int loaded);
+int hand_weapon_aim_angles(const float forward[3], const float head[16], float out[2]);
+
+typedef struct {
     int init, lefty, state, rack;
-    int mode, auto_mag, weapon_type, ammo_used, arm_tracked[2], arm_extrapolated[2];
+    int mode, auto_mag, manual_mag, weapon_type, ammo_used, arm_tracked[2], arm_extrapolated[2];
+    unsigned manual_prev, manual_ejections;
+    double manual_ejected_at;
+    double shake_sample_at, shake_started;
+    float shake_prev[3], shake_start[3], shake_low;
+    int shake_enabled, shake_down;
+    int manual_slide_ready, manual_support, has_wrist_frames, wrist_primary;
+    int auto_chamber;                  // Rendered long gun; the game still owns the chamber state.
+    int game_reload_known, game_reload_phase;
+    unsigned game_ammo;
+    float wrist_frames[20];
+    float well_contact[3];
+    int well_contact_model, magazine_grab_model;
+    float rack_contact[3], rack_axis[3], rack_start, manual_pull;
+    float rack_axis_local[3];
+    int rack_contact_valid, rack_suspended;
+    float slide_contact[3], slide_axis[3], slide_grab_local[3];
     int auto_approach_ready, reload_block, pull_ready;
     unsigned reload_shots;
     float pull_at[3];
@@ -84,8 +129,12 @@ typedef struct {
 enum { HW_ARM_DRAW_HIP = 1, HW_ARM_DRAW_BACK = 2, HW_ARM_HOLSTER = 4, HW_ARM_INTERACT = 8, HW_ARM_N = 4 };
 
 void hand_weapon_set_auto_mag(hand_weapon *w, int enabled);
+int hand_weapon_has_magazine(const hand_weapon *w);
 void hand_weapon_set_arms(hand_weapon *w, const float arms[14]);
+void hand_pose_from_wrist(const float wrist[10], hand_pose *pose);
+void hand_weapon_set_wrist_frames(hand_weapon *w, const float wrists[20]);
 void hand_weapon_set_controller(hand_weapon *w, unsigned btns, double now);
+void hand_weapon_sample_poses(hand_weapon *w, const float head[16], const float *joints, double now);
 int hand_weapon_is_hybrid(const hand_weapon *w, double now);
 void hand_pose_from_joints(const float j[HW_JOINTS], hand_pose *p);
 // head: origin from device (column major); joints: left then right, HW_JOINTS each. Returns the steps made this frame.

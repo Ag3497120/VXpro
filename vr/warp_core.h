@@ -79,6 +79,10 @@ typedef struct {
 
 typedef struct vxw_core vxw_core;
 
+// Centre-camera offsets in each eye's coordinates from CompositorServices'
+// head-from-eye transforms. Invalid pairs leave out unchanged.
+int vxw_stereo_eye_offsets(const float left[16], const float right[16], float out[2][3]);
+
 // The pipelines (compiled from source at start: no metallib to ship). NULL if they did not compile.
 vxw_core *vxw_create(void *mtl_device);
 void vxw_destroy(vxw_core *c);

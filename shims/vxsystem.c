@@ -35,9 +35,90 @@ int _NSGetExecutablePath(char *buf, uint32_t *size) {
 #include <pthread.h>
 #include <sys/stat.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
 static struct { DIR *d; char *path; } g_dirs[64];
 static pthread_mutex_t g_dirs_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *libsys(const char *name) { return dlsym(dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD | RTLD_LAZY), name); }
+
+static void overlay_open_notice(const char *overlay) {
+    const char *name = strrchr(overlay, '/');
+    if (!name) return;
+    static unsigned logged;
+    if (!strcmp(name, "/final.redscripts")) {
+        void (*poll)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "vx_weapon_bridge_poll");
+        if (poll) poll();
+    }
+    unsigned bit = !strcmp(name, "/inputContexts.xml") ? 1u :
+                   !strcmp(name, "/inputUserMappings.xml") ? 2u : 4u;
+    if (!(__atomic_fetch_or(&logged, bit, __ATOMIC_RELAXED) & bit))
+        fprintf(stderr, "vxmac: VX Hands opened %s\n", overlay);
+}
+static int has_suffix(const char *path, const char *suffix) {
+    size_t n = strlen(path), m = strlen(suffix);
+    return n >= m && !strcmp(path + n - m, suffix) && (n == m || path[n - m - 1] == '/');
+}
+// Optional per-user script overlay. The original game data stays untouched; a missing overlay falls back to the game.
+static const char *script_overlay(const char *path, char out[2048]) {
+    const char *enabled = getenv("VXMAC_NO_AUTO_RELOAD"), *home = getenv("HOME"), *custom = getenv("VXMAC_SCRIPT_OVERLAY");
+    if (!enabled || strcmp(enabled, "1") || !path || (!home && !custom)) return path;
+    static int (*real_access)(const char *, int);
+    if (!real_access) real_access = (int (*)(const char *, int))libsys("access");
+    if (!real_access) return path;
+    const char *manual = getenv("VXMAC_MANUAL_MAG_ACTIVE");
+    int script = has_suffix(path, "r6/cache/final.redscripts");
+    int k;
+    if (manual && !strcmp(manual, "1") && home) {
+        const char *name = script ? "final.redscripts" :
+                           has_suffix(path, "r6/config/inputUserMappings.xml") ? "inputUserMappings.xml" :
+                           has_suffix(path, "r6/config/inputContexts.xml") ? "inputContexts.xml" : NULL;
+        if (!name) return path;
+        k = snprintf(out, 2048, "%s/Documents/vxhands_manual/%s", home, name);
+    } else {
+        if (!script) return path;
+        k = custom && custom[0] == '/' ? snprintf(out, 2048, "%s", custom) :
+            home ? snprintf(out, 2048, "%s/Documents/vxhands_no_auto_reload.redscripts", home) : -1;
+    }
+    if (k < 0 || k >= 2048) return path;
+    if (real_access(out, R_OK)) return path;
+    return out;
+}
+
+int open(const char *path, int flags, ...) {
+    static int (*real_open)(const char *, int, ...);
+    if (!real_open) real_open = (int (*)(const char *, int, ...))libsys("open");
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
+    char overlay[2048];
+    if ((flags & O_ACCMODE) == O_RDONLY && !(flags & (O_CREAT | O_TRUNC))) path = script_overlay(path, overlay);
+    int fd = (flags & O_CREAT) ? real_open(path, flags, mode) : real_open(path, flags);
+    if (fd >= 0 && path == overlay) overlay_open_notice(path);
+    return fd;
+}
+FILE *fopen(const char *path, const char *mode) {
+    static FILE *(*real_fopen)(const char *, const char *);
+    if (!real_fopen) real_fopen = (FILE *(*)(const char *, const char *))libsys("fopen");
+    char overlay[2048];
+    if (mode && mode[0] == 'r' && !strchr(mode, '+')) path = script_overlay(path, overlay);
+    FILE *file = real_fopen(path, mode);
+    if (file && path == overlay) overlay_open_notice(path);
+    return file;
+}
+int stat(const char *path, struct stat *st) {
+    static int (*real_stat)(const char *, struct stat *);
+    if (!real_stat) real_stat = (int (*)(const char *, struct stat *))libsys("stat");
+    char overlay[2048]; return real_stat(script_overlay(path, overlay), st);
+}
+int lstat(const char *path, struct stat *st) {
+    static int (*real_lstat)(const char *, struct stat *);
+    if (!real_lstat) real_lstat = (int (*)(const char *, struct stat *))libsys("lstat");
+    char overlay[2048]; return real_lstat(script_overlay(path, overlay), st);
+}
+int access(const char *path, int amode) {
+    static int (*real_access)(const char *, int);
+    if (!real_access) real_access = (int (*)(const char *, int))libsys("access");
+    char overlay[2048]; return real_access(script_overlay(path, overlay), amode);
+}
 DIR *opendir(const char *path) {
     static DIR *(*real)(const char *);
     if (!real) real = (DIR *(*)(const char *))libsys("opendir");

@@ -31,6 +31,25 @@ static unsigned g_frames_left = 60;   // (h51: 60 frames, one every 3 s: ~3 min 
 static double g_every = 3, g_next_at;
 static atomic_uint g_pipe_n, g_tex_n, g_pass_n;
 static const void *kPID = &kPID, *kTID = &kTID, *kRec = &kRec;
+static const void *kStereoInfo = &kStereoInfo, *kStereoSeen = &kStereoSeen;
+static atomic_ulong g_stereo_draws, g_stereo_indices, g_stereo_multi_target, g_stereo_single_target, g_stereo_depth_only;
+static int stereo_audit_enabled(void) {
+    static int enabled;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("VXMAC_STEREO_AUDIT");
+        enabled = e && !strcmp(e, "1");
+    });
+    return enabled;
+}
+
+void vxpipe_stereo_stats(char *out, unsigned n) {
+    if (!stereo_audit_enabled()) { if (n) out[0] = 0; return; }
+    snprintf(out, n, "\"stereo_fg_draws\":%lu,\"stereo_fg_indices\":%lu,\"stereo_fg_multi_target\":%lu,"
+                     "\"stereo_fg_single_target\":%lu,\"stereo_fg_depth_only\":%lu",
+             atomic_load(&g_stereo_draws), atomic_load(&g_stereo_indices), atomic_load(&g_stereo_multi_target),
+             atomic_load(&g_stereo_single_target), atomic_load(&g_stereo_depth_only));
+}
 
 static void out(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void out(const char *fmt, ...) {
@@ -207,15 +226,56 @@ static int is_ui_vs(id<MTLFunction> f) {   // (h51: the game's UI vertex shaders
 // (VRIK: a skinned vertex shader reads bone i of a draw at <bone buffer> + isd.x + i * isd.y, isd = its per-instance
 //  attribute instance_skinning_data0 (from the shaders' AIR); where that attribute comes from is kept with the pipeline)
 static const void *kISD = &kISD;
+static const void *kSkinSpan = &kSkinSpan;
+static const void *kInstanceRebase = &kInstanceRebase;
 static void vrik_pipe_note(id p, MTLRenderPipelineDescriptor *d) {
     id<MTLFunction> f = d.vertexFunction; if (!f || !d.vertexDescriptor) return;
+    // The saved AIR for these libraries uses blendindices * skin.y plus
+    // skin.x/current or skin.z/history. Bound the copy from the real vertex
+    // format, never from the size of the game's 64 MB allocation arena.
+    static NSSet *verified; static dispatch_once_t once;
+    dispatch_once(&once, ^{ verified = [NSSet setWithArray:@[
+        @"57dd4a0ad9a768b4",@"301a84323c240f3f",@"e04ba6ac5d13409c",@"803d926a019878c2",
+        @"d3bcb6137ac8450d",@"08d373dc6993b965",@"13c28302862f084d",@"18c14458f235f75e",
+        @"60580b19da79bd40",@"d84e7ce97c759ded",@"c247858edee1ee4b",@"716953424d52fabd",
+        @"42bb830ec774f0a8",@"bc3ecaeb59a7586d",@"bbeacd2e43a30c66",@"a9263ad2ea54c8bd",
+        @"c303351032556f38",@"d3f3e26df4fc32b2",@"9baf4cb3c1c9702c",@"99e000df370eb065",@"a74841c7f953769d"]]; });
+    int indices = 0, bounded = [verified containsObject:objc_getAssociatedObject(f, kHash)];
+    unsigned formats[2] = {0};
+    for (MTLVertexAttribute *a in f.vertexAttributes) {
+        if (!a.active || ![a.name hasPrefix:@"blendindices"]) continue;
+        indices++;
+        MTLVertexFormat format = d.vertexDescriptor.attributes[a.attributeIndex].format;
+        if (indices <= 2) formats[indices - 1] = (unsigned)format;
+        if (format != MTLVertexFormatUChar && format != MTLVertexFormatUChar2 &&
+            format != MTLVertexFormatUChar3 && format != MTLVertexFormatUChar4) bounded = 0;
+    }
+    if (bounded && indices) objc_setAssociatedObject(p, kSkinSpan, @256, OBJC_ASSOCIATION_RETAIN);
+    static atomic_uint reports;
+    if (indices && atomic_fetch_add(&reports, 1) < 48)
+        vxmac_log("VRIK compact shader %s index_inputs=%d formats=%u/%u bounded=%d", [objc_getAssociatedObject(f, kHash) UTF8String] ?: "unknown", indices, formats[0], formats[1], bounded);
     for (MTLVertexAttribute *a in f.vertexAttributes) {
         if (![a.name isEqualToString:@"instance_skinning_data0"] || !a.active) continue;
         MTLVertexAttributeDescriptor *A = d.vertexDescriptor.attributes[a.attributeIndex];
         MTLVertexBufferLayoutDescriptor *L = d.vertexDescriptor.layouts[A.bufferIndex];
         NSInteger it0 = -1;
         for (MTLVertexAttribute *b in f.vertexAttributes) if ([b.name isEqualToString:@"instance_transform0"] && b.active && d.vertexDescriptor.attributes[b.attributeIndex].bufferIndex == A.bufferIndex) it0 = (NSInteger)d.vertexDescriptor.attributes[b.attributeIndex].offset;
-        objc_setAssociatedObject(p, kISD, @[ @(A.bufferIndex), @(A.offset), @(L.stride), @(L.stepFunction), @(L.stepRate), @(A.format), @(it0) ], OBJC_ASSOCIATION_RETAIN);
+        NSUInteger record_size = 0; int one_record = bounded && indices;
+        if ((L.stepFunction == MTLVertexStepFunctionPerInstance && L.stepRate != 1) ||
+            (L.stepFunction != MTLVertexStepFunctionPerInstance && L.stepFunction != MTLVertexStepFunctionConstant)) one_record = 0;
+        for (MTLVertexAttribute *b in f.vertexAttributes) if (b.active) {
+            MTLVertexAttributeDescriptor *B = d.vertexDescriptor.attributes[b.attributeIndex];
+            if (d.vertexDescriptor.layouts[B.bufferIndex].stepFunction == MTLVertexStepFunctionPerInstance &&
+                B.bufferIndex != A.bufferIndex) one_record = 0;
+            if (B.bufferIndex == A.bufferIndex) {
+                if (B.format != MTLVertexFormatFloat4 && B.format != MTLVertexFormatUInt4) one_record = 0;
+                record_size = MAX(record_size, B.offset + 16);
+            }
+        }
+        // The verified AIR does not consume instance_id. With every instanced
+        // attribute in this one binding, the draw can use one private record.
+        if (one_record) objc_setAssociatedObject(p, kInstanceRebase, @1, OBJC_ASSOCIATION_RETAIN);
+        objc_setAssociatedObject(p, kISD, @[ @(A.bufferIndex), @(A.offset), @(L.stride), @(L.stepFunction), @(L.stepRate), @(A.format), @(it0), @(record_size) ], OBJC_ASSOCIATION_RETAIN);
         return;
     }
 }
@@ -223,6 +283,15 @@ static void render_note(id p, MTLRenderPipelineDescriptor *d, MTLRenderPipelineR
     if (!p) return;
     live_tag(p, &g_rp_made, &g_rp_live, NULL, 0);
     vrik_pipe_note(p, d);
+    if (stereo_audit_enabled()) {
+        NSMutableArray *formats = [NSMutableArray array];
+        for (int i = 0; i < 8; i++) [formats addObject:@(d.colorAttachments[i].pixelFormat)];
+        objc_setAssociatedObject(p, kStereoInfo,
+            @{@"formats": formats, @"depth": @(d.depthAttachmentPixelFormat),
+              @"vertex": d.vertexFunction ? objc_getAssociatedObject(d.vertexFunction, kHash) ?: @"unknown" : @"none",
+              @"fragment": d.fragmentFunction ? objc_getAssociatedObject(d.fragmentFunction, kHash) ?: @"unknown" : @"none",
+              @"skinned": @(objc_getAssociatedObject(p, kISD) != nil)}, OBJC_ASSOCIATION_RETAIN);
+    }
     if (d.vertexFunction) { id ld = objc_getAssociatedObject(d.vertexFunction, kLibData), lh = objc_getAssociatedObject(d.vertexFunction, kHash); if (ld) objc_setAssociatedObject(p, kLibData, ld, OBJC_ASSOCIATION_RETAIN); if (lh) objc_setAssociatedObject(p, kHash, lh, OBJC_ASSOCIATION_RETAIN); }
     if (is_ui_vs(d.vertexFunction)) { vxmtl_ui_pipe_add((__bridge void *)p); wui_twin(p, d, d.fragmentFunction); }
     if (vxprof_on() == 1) { id<MTLFunction> kf = d.fragmentFunction ?: d.vertexFunction; vxprof_pipe_key(p, kf ? objc_getAssociatedObject(kf, kHash) : nil, d.fragmentFunction ? 'f' : 'v'); }
@@ -649,7 +718,7 @@ static void pass_begin(id e, NSString *head, int compute) {
 static const char *load_s(MTLLoadAction a) { return a == MTLLoadActionClear ? "clear" : a == MTLLoadActionLoad ? "load" : "dontcare"; }
 static const char *store_s(MTLStoreAction a) { return a == MTLStoreActionStore ? "store" : a == MTLStoreActionDontCare ? "dontcare" : a == MTLStoreActionMultisampleResolve ? "resolve" : "other"; }
 static const void *kEncVM = &kEncVM;
-@interface VXEncVM : NSObject { @public int vp_fg, draw_idx; id<MTLBuffer> original, vb0; NSUInteger offset, vb0_off, vb0_stride; NSData *bytes; id pipe; int had_fg, cam_ok; float cam_m[16], cam_tx, cam_ty; __strong id vbuf[31]; NSUInteger voff[31], vst[31]; NSMutableDictionary *vbytes; }
+@interface VXEncVM : NSObject { @public int vp_fg, draw_idx, pose_bound, pose_instance_dynamic, pose_rebase; NSUInteger pose_instance; id<MTLBuffer> original, vb0; NSUInteger offset, vb0_off, vb0_stride; NSData *bytes; id pipe; int had_fg, cam_ok; float cam_m[16], cam_tx, cam_ty; __strong id vbuf[31]; NSUInteger voff[31], vst[31]; NSMutableDictionary *vbytes; }
 @end
 @implementation VXEncVM
 @end
@@ -802,6 +871,10 @@ typedef void (*sb_imp)(id, SEL, id, NSUInteger, NSUInteger);
 typedef void (*sbo_imp)(id, SEL, NSUInteger, NSUInteger);
 typedef void (*sby_imp)(id, SEL, const void *, NSUInteger, NSUInteger);
 static sb_imp o_svb2, o_sfb2; static sbo_imp o_svo2, o_sfo2; static sby_imp o_svy2, o_sfy2;
+typedef void (*sbs_imp)(id, SEL, id, NSUInteger, NSUInteger, NSUInteger);
+typedef void (*sbos_imp)(id, SEL, NSUInteger, NSUInteger, NSUInteger);
+typedef void (*sbys_imp)(id, SEL, const void *, NSUInteger, NSUInteger, NSUInteger);
+static sbs_imp o_svbs; static sbos_imp o_svos; static sbys_imp o_svys;
 // (h52: the game's camera, found from h51's dump (tools/cbv_find.py): in the G-buffer passes the vertex stage's
 //  top-level buffer's first word is a descriptor table; its second entry (byte 24) is the address of the view
 //  constants, whose bytes 320-383 are the world-to-view matrix, row-major: rows right, up, forward in the game's world
@@ -988,7 +1061,7 @@ static void vrik_draw_(id e, NSUInteger count, NSUInteger inst, NSUInteger bi, i
 #include "vrik.inc"   // (V's arms by the player's hands: two-bone IK on the bone buffer)
 // (the VRIK diagnostics: off unless VXMAC_VRIK_DIAG=1 - their dumps made the app be killed on the headset)
 static int vrik_diag(void) { static int on = -1; if (on < 0) { const char *v = getenv("VXMAC_VRIK_DIAG"); on = v && !strcmp(v, "1"); } return on; }
-static void vrik_draw(id e, NSUInteger count, NSUInteger inst, NSUInteger bi, id ib, NSUInteger io) { @autoreleasepool { vrik_apply(e, count, bi, ib, io); } if (!vrik_diag()) return; @autoreleasepool { vrik_draw_(e, count, inst, bi, ib, io); } }
+static void vrik_draw(id e, NSUInteger count, NSUInteger inst, NSUInteger bi, id ib, NSUInteger io, MTLIndexType it) { @autoreleasepool { vrik_apply(e, count, inst, bi, ib, io, it); } if (!vrik_diag()) return; @autoreleasepool { vrik_draw_(e, count, inst, bi, ib, io); } }
 static void vrik_draw_(id e, NSUInteger count, NSUInteger inst, NSUInteger bi, id ib, NSUInteger io) {
     VXEncVM *vm = objc_getAssociatedObject(e, kEncVM);
     if (!vm || !vm->vp_fg || !vm->pipe) return;
@@ -1264,10 +1337,6 @@ static void install_draws(Class rc) {
 }
 // (h57g: the converted shaders bind their vertex buffers with a dynamic stride (stride from the call): h58's dump had no
 //  vertex data without these)
-typedef void (*sbs_imp)(id, SEL, id, NSUInteger, NSUInteger, NSUInteger);
-typedef void (*sbos_imp)(id, SEL, NSUInteger, NSUInteger, NSUInteger);
-typedef void (*sbys_imp)(id, SEL, const void *, NSUInteger, NSUInteger, NSUInteger);
-static sbs_imp o_svbs; static sbos_imp o_svos; static sbys_imp o_svys;
 static void h_svbs(id self, SEL s, id b, NSUInteger o, NSUInteger st, NSUInteger i) { o_svbs(self, s, b, o, st, i); if (i < 31) { VXEncVM *v = objc_getAssociatedObject(self, kEncVM); if (v) v->vst[i] = st; } if (i == 0) { VXEncVM *vm = objc_getAssociatedObject(self, kEncVM); if (vm) vm->vb0_stride = st; } tl_note(self, 0, b, o, i, NULL, 0, 0); VXPassRec *r = g_f ? rec(self) : nil; if (r && r.ui) r.vb[[NSString stringWithFormat:@"s%lu", (unsigned long)i]] = @(st); }
 static void h_svos(id self, SEL s, NSUInteger o, NSUInteger st, NSUInteger i) { if (i < 31) { VXEncVM *v = objc_getAssociatedObject(self, kEncVM); if (v) v->vst[i] = st; } VXEncVM *vm = i == 2 ? objc_getAssociatedObject(self, kEncVM) : nil; if (i == 0) { VXEncVM *v0 = objc_getAssociatedObject(self, kEncVM); if (v0) v0->vb0_stride = st; } if (vm && vm->original) o_svbs(self, @selector(setVertexBuffer:offset:attributeStride:atIndex:), vm->original, o, st, i); else o_svos(self, s, o, st, i); tl_note(self, 0, nil, o, i, NULL, 0, 1); VXPassRec *r = g_f ? rec(self) : nil; if (r && r.ui) r.vb[[NSString stringWithFormat:@"s%lu", (unsigned long)i]] = @(st); }
 static void h_svys(id self, SEL s, const void *b, NSUInteger l, NSUInteger st, NSUInteger i) { o_svys(self, s, b, l, st, i); tl_note(self, 0, nil, 0, i, b, l, 0); VXPassRec *r = g_f ? rec(self) : nil; if (r && r.ui) r.vb[[NSString stringWithFormat:@"s%lu", (unsigned long)i]] = @(st); }
@@ -1403,9 +1472,35 @@ static void wbind(NSMutableDictionary *t, NSUInteger i, id buf, NSUInteger off, 
     if (offonly) { NSArray *o = t[k]; if (o && ![o[0] isKindOfClass:[NSData class]]) t[k] = @[ o[0], @(off), @(stride ? stride : [o[2] unsignedIntegerValue]) ]; return; }
     if (buf) t[k] = @[ buf, @(off), @(stride) ]; else [t removeObjectForKey:k];
 }
-static void vrik_draw(id e, NSUInteger count, NSUInteger inst, NSUInteger bi, id ib, NSUInteger io);
+static void vrik_draw(id e, NSUInteger count, NSUInteger inst, NSUInteger bi, id ib, NSUInteger io, MTLIndexType it);
+static void stereo_audit_draw(id e, NSUInteger count, NSUInteger instances) {
+    if (!stereo_audit_enabled()) return;
+    VXEncVM *vm = objc_getAssociatedObject(e, kEncVM);
+    if (!vm || !vm->vp_fg || !vm->pipe) return;
+    NSDictionary *info = objc_getAssociatedObject(vm->pipe, kStereoInfo);
+    if (!info) return;
+    unsigned targets = 0;
+    for (NSNumber *format in info[@"formats"]) if (format.unsignedIntegerValue != MTLPixelFormatInvalid) targets++;
+    atomic_fetch_add(&g_stereo_draws, 1);
+    atomic_fetch_add(&g_stereo_indices, count * instances);
+    if (targets > 1) atomic_fetch_add(&g_stereo_multi_target, 1);
+    else if (targets == 1) atomic_fetch_add(&g_stereo_single_target, 1);
+    else atomic_fetch_add(&g_stereo_depth_only, 1);
+    if (!objc_getAssociatedObject(vm->pipe, kStereoSeen)) {
+        pthread_mutex_lock(&g_fl);
+        int first = objc_getAssociatedObject(vm->pipe, kStereoSeen) == nil;
+        if (first) objc_setAssociatedObject(vm->pipe, kStereoSeen, @1, OBJC_ASSOCIATION_RETAIN);
+        pthread_mutex_unlock(&g_fl);
+        static atomic_uint logged;
+        if (first && atomic_fetch_add(&logged, 1) < 32)
+            vxmac_log("Stereo foreground: vertex=%s fragment=%s colors=%s depth=%lu skinned=%d indices=%lu instances=%lu",
+                      [info[@"vertex"] UTF8String], [info[@"fragment"] UTF8String],
+                      [[info[@"formats"] componentsJoinedByString:@","] UTF8String],
+                      [info[@"depth"] unsignedLongValue], [info[@"skinned"] boolValue],
+                      (unsigned long)count, (unsigned long)instances);
+    }
+}
 static void wdraw(id e, int kind, NSUInteger a0, NSUInteger a1, NSUInteger a2, NSUInteger inst, id ib, NSUInteger io, NSInteger base, NSUInteger bi) {
-    vrik_draw(e, kind ? a1 : a2, inst, bi, ib, io);
     VXUIRec *r = wrec(e);
     if (r && !r.segment) r.npre++;
     if (!r || r.segment || !r.pipe || r.draws.count >= 64) return;
@@ -1413,6 +1508,12 @@ static void wdraw(id e, int kind, NSUInteger a0, NSUInteger a1, NSUInteger a2, N
     [r.draws addObject:@{ @"pipe": r.pipe, @"vb": [r.vb copy], @"fb": [r.fb copy], @"vt": [r.vt copy], @"ft": [r.ft copy], @"fs": [r.fs copy],
                           @"res": [r.res copy], @"heaps": [r.heaps copy], @"sc": r.scissor ?: [NSNull null], @"vp": r.viewport ?: [NSNull null],
                           @"k": @[ @(kind), @(a0), @(a1), @(a2), @(inst), ib ?: [NSNull null], @(io), @(base), @(bi) ] }];
+}
+static NSUInteger wprepare(id e, NSUInteger count, NSUInteger instances, NSUInteger bi, id indices, NSUInteger offset, MTLIndexType type) {
+    vrik_draw(e, count, instances, bi, indices, offset, type);
+    stereo_audit_draw(e, count, instances);
+    VXEncVM *vm = objc_getAssociatedObject(e, kEncVM);
+    return vm && vm->pose_bound && vm->pose_rebase ? 0 : bi;
 }
 int vxpipe_ui_replay(id enc, id cbo, id tex, NSUInteger slice) {   // (vxmtl's ui_end, after the capture and the clear)
     VXUIRec *r = objc_getAssociatedObject(enc, kUIRec);
@@ -1501,16 +1602,16 @@ static void wh_hs(id self, SEL s, const id __unsafe_unretained *h, NSUInteger n,
 static void wh_sc(id self, SEL s, MTLScissorRect v) { w_sc(self, s, v); R_ r.scissor = [NSValue valueWithBytes:&v objCType:@encode(MTLScissorRect)]; } }
 static void wh_vp(id self, SEL s, MTLViewport v) { w_vp(self, s, v); R_ r.viewport = [NSValue valueWithBytes:&v objCType:@encode(MTLViewport)]; } }
 static void wh_vps(id self, SEL s, const MTLViewport *v, NSUInteger n) { w_vps(self, s, v, n); if (v && n) { R_ r.viewport = [NSValue valueWithBytes:&v[0] objCType:@encode(MTLViewport)]; } } }
-static void wh_dp(id self, SEL s, MTLPrimitiveType t, NSUInteger v, NSUInteger c) { w_dp(self, s, t, v, c); wdraw(self, 0, t, v, c, 1, nil, 0, 0, 0); }
-static void wh_dpi(id self, SEL s, MTLPrimitiveType t, NSUInteger v, NSUInteger c, NSUInteger i) { w_dpi(self, s, t, v, c, i); wdraw(self, 0, t, v, c, i, nil, 0, 0, 0); }
-static void wh_dpib(id self, SEL s, MTLPrimitiveType t, NSUInteger v, NSUInteger c, NSUInteger i, NSUInteger bi) { w_dpib(self, s, t, v, c, i, bi); wdraw(self, 0, t, v, c, i, nil, 0, 0, bi); }
-static void wh_dx(id self, SEL s, MTLPrimitiveType t, NSUInteger c, MTLIndexType it, id ib, NSUInteger io) { w_dx(self, s, t, c, it, ib, io); wdraw(self, 1, t, c, it, 1, ib, io, 0, 0); }
-static void wh_dxi(id self, SEL s, MTLPrimitiveType t, NSUInteger c, MTLIndexType it, id ib, NSUInteger io, NSUInteger i) { w_dxi(self, s, t, c, it, ib, io, i); wdraw(self, 1, t, c, it, i, ib, io, 0, 0); }
-static void wh_dxib(id self, SEL s, MTLPrimitiveType t, NSUInteger c, MTLIndexType it, id ib, NSUInteger io, NSUInteger i, NSInteger bv, NSUInteger bi) { w_dxib(self, s, t, c, it, ib, io, i, bv, bi); wdraw(self, 1, t, c, it, i, ib, io, bv, bi); }
+static void wh_dp(id self, SEL s, MTLPrimitiveType t, NSUInteger v, NSUInteger c) { wprepare(self,c,1,0,nil,0,0); w_dp(self, s, t, v, c); wdraw(self, 0, t, v, c, 1, nil, 0, 0, 0); }
+static void wh_dpi(id self, SEL s, MTLPrimitiveType t, NSUInteger v, NSUInteger c, NSUInteger i) { wprepare(self,c,i,0,nil,0,0); w_dpi(self, s, t, v, c, i); wdraw(self, 0, t, v, c, i, nil, 0, 0, 0); }
+static void wh_dpib(id self, SEL s, MTLPrimitiveType t, NSUInteger v, NSUInteger c, NSUInteger i, NSUInteger bi) { NSUInteger draw_bi=wprepare(self,c,i,bi,nil,0,0); w_dpib(self, s, t, v, c, i, draw_bi); wdraw(self, 0, t, v, c, i, nil, 0, 0, bi); }
+static void wh_dx(id self, SEL s, MTLPrimitiveType t, NSUInteger c, MTLIndexType it, id ib, NSUInteger io) { wprepare(self,c,1,0,ib,io,it); w_dx(self, s, t, c, it, ib, io); wdraw(self, 1, t, c, it, 1, ib, io, 0, 0); }
+static void wh_dxi(id self, SEL s, MTLPrimitiveType t, NSUInteger c, MTLIndexType it, id ib, NSUInteger io, NSUInteger i) { wprepare(self,c,i,0,ib,io,it); w_dxi(self, s, t, c, it, ib, io, i); wdraw(self, 1, t, c, it, i, ib, io, 0, 0); }
+static void wh_dxib(id self, SEL s, MTLPrimitiveType t, NSUInteger c, MTLIndexType it, id ib, NSUInteger io, NSUInteger i, NSInteger bv, NSUInteger bi) { NSUInteger draw_bi=wprepare(self,c,i,bi,ib,io,it); w_dxib(self, s, t, c, it, ib, io, i, bv, draw_bi); wdraw(self, 1, t, c, it, i, ib, io, bv, bi); }
 #undef R_
 static void install_wui(Class rc) {
     if (g_wui < 0) { const char *v = getenv("VXMAC_WORLD_UI"); g_wui = !(v && !strcmp(v, "0")); }
-    if (!g_wui) return;
+    if (!g_wui && !stereo_audit_enabled()) return;
 #define S(sel, h, o) (o = (__typeof__(o))swap(rc, @selector(sel), (IMP)h))
     S(setVertexBuffer:offset:atIndex:, wh_vb, w_vb); S(setFragmentBuffer:offset:atIndex:, wh_fb, w_fb);
     S(setVertexBufferOffset:atIndex:, wh_vbo, w_vbo); S(setFragmentBufferOffset:atIndex:, wh_fbo, w_fbo);

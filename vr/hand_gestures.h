@@ -37,3 +37,34 @@ const char *hand_gesture_name(int bit);
 // Returns how many were set.
 int hand_gestures_tune(const char *spec);
 void hand_gestures_params(char *out, unsigned size);
+
+// Head-locked action grid for the controller-free profile.
+enum {
+    BH_PHONE, BH_RADIO, BH_VEHICLE, BH_INVENTORY,
+    BH_INTERACT, BH_HEAL, BH_WEAPON, BH_HOLSTER,
+    BH_JUMP, BH_CROUCH, BH_SCAN, BH_BACK,
+    BH_UP, BH_DOWN, BH_CONFIRM, BH_CLOSE,
+    BH_ACTIONS
+};
+enum { BH_FORWARD = 1, BH_BACKWARD = 2, BH_LEFT = 4, BH_RIGHT = 8 };
+enum { BH_COLUMNS = 4, BH_ROWS = 4 };
+#define BH_MENU_X .62f
+#define BH_MENU_Y .38f
+#define BH_MENU_CENTER_Y .08f
+
+typedef struct {
+    int initialized, gameplay, menu, ready, chord, armed, moving, walk_needs_open, owner, shake_direction;
+    unsigned pinched, require_open;
+    double pinch_at[2], chord_at, shot_until, shake_at, shake_done, sampled_at, last_at;
+    float gap, previous[3], shake_axis[3], shake_origin, shake_peak;
+    float walk_origin[3], walk_right[3], walk_forward[3];
+} bare_hands;
+
+typedef struct {
+    unsigned pinches, movement;
+    int menu, hover, action, eject, blocked;
+} bare_hand_input;
+
+bare_hand_input bare_hands_update(bare_hands *b, const float head[16], const float hands[20],
+                                 const float wrists[20], const float middle[2], double now,
+                                 int enabled, int gameplay, int owner, int can_eject, int supporting);

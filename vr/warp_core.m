@@ -6,6 +6,43 @@
 #include <string.h>
 #include "warp_core.h"
 
+int vxw_stereo_eye_offsets(const float left[16], const float right[16], float out[2][3]) {
+    if (!left || !right || !out) return 0;
+    const float *views[2] = {left, right};
+    for (int eye = 0; eye < 2; eye++) {
+        const float *m = views[eye];
+        for (int i = 0; i < 16; i++) if (!isfinite(m[i])) return 0;
+        if (fabsf(m[3]) > .001f || fabsf(m[7]) > .001f ||
+            fabsf(m[11]) > .001f || fabsf(m[15] - 1.f) > .001f) return 0;
+        for (int axis = 0; axis < 3; axis++) {
+            const float *a = m + axis * 4;
+            float length = a[0]*a[0] + a[1]*a[1] + a[2]*a[2];
+            if (fabsf(length - 1.f) > .02f) return 0;
+            for (int other = 0; other < axis; other++) {
+                const float *b = m + other * 4;
+                if (fabsf(a[0]*b[0] + a[1]*b[1] + a[2]*b[2]) > .02f) return 0;
+            }
+        }
+        float determinant = m[0]*(m[5]*m[10] - m[9]*m[6]) -
+                            m[4]*(m[1]*m[10] - m[9]*m[2]) +
+                            m[8]*(m[1]*m[6] - m[5]*m[2]);
+        if (determinant < .98f) return 0;
+    }
+    float separation[3];
+    for (int i = 0; i < 3; i++) separation[i] = right[12+i] - left[12+i];
+    float distance = sqrtf(separation[0]*separation[0] + separation[1]*separation[1] +
+                           separation[2]*separation[2]);
+    if (distance < .03f || distance > .10f || separation[0] <= 0) return 0;
+    for (int eye = 0; eye < 2; eye++) {
+        const float *m = views[eye];
+        float sign = eye ? -.5f : .5f;
+        for (int axis = 0; axis < 3; axis++)
+            out[eye][axis] = sign * (m[axis*4]*separation[0] +
+                                    m[axis*4+1]*separation[1] + m[axis*4+2]*separation[2]);
+    }
+    return 1;
+}
+
 // (struct W: vxw_params, then the output's size, B's block grid (the map), the output's block grid (the keys) and the
 //  key's index bits)
 typedef struct { vxw_params p; uint32_t ow, oh, mw, mh, kw, kh, bits, flags2, kbs; float dr[4]; float hr[16]; uint32_t hn; float vig[4];

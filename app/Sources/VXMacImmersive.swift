@@ -15,6 +15,7 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
     private let arSession = ARKitSession()
     private let worldTracking = WorldTrackingProvider()
     private let handTracking = HandTrackingProvider()
+    private let systemStereo = vx_xros_vr_system_stereo() != 0
     private var tracking = false
     private var hands = false
     private var lastReport = CACurrentMediaTime()
@@ -126,6 +127,21 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
         for d in drawables {
             d.deviceAnchor = anchor
             d.depthRange = SIMD2<Float>(Self.far, Self.near)
+            if systemStereo && d.views.count == 2 {
+                var left = d.views[0].transform
+                var right = d.views[1].transform
+                withUnsafePointer(to: &left) { lp in
+                    lp.withMemoryRebound(to: Float.self, capacity: 16) { l in
+                        withUnsafePointer(to: &right) { rp in
+                            rp.withMemoryRebound(to: Float.self, capacity: 16) { r in
+                                vx_xros_vr_set_eye_views(l, r)
+                            }
+                        }
+                    }
+                }
+            } else if systemStereo {
+                vx_xros_vr_set_eye_views(nil, nil)
+            }
             for i in d.views.indices {
                 let color = d.colorTextures[min(i, d.colorTextures.count - 1)]
                 let depth = d.depthTextures[min(i, d.depthTextures.count - 1)]
@@ -193,21 +209,92 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
     // Both hands' thumb tip, index tip and pointing anchor (between the index finger's and the thumb's knuckles) in the
     // room, for the runtime's hand input.
     private var handsLogged = false
+    private var wristBasis = [(forward: SIMD3<Float>, across: SIMD3<Float>)?](repeating: nil, count: 2)
+    private var wristOffset = [SIMD3<Float>](repeating: .zero, count: 2)
+    private var wristCalibrated = [Bool](repeating: false, count: 2)
+    private var joyWristIDs = [UUID?](repeating: nil, count: 2)
+    private var joyAnchors = [(anchor: HandAnchor, received: Double)?](repeating: nil, count: 2)
+    private lazy var joyWristTracking = vx_xros_vr_bare_enabled() == 0 &&
+        getenv("VXMAC_JOY_HOLD").map { String(cString: $0) == "1" } == true
     private func feedHands(_ head: simd_float4x4) {
         let (left, right) = handTracking.latestAnchors
+        let now = CACurrentMediaTime()
         var v = [Float](repeating: 0, count: 20)
         var j = [Float](repeating: 0, count: 50)      // (h70: the joints for the magazine by hand, vr/hand_weapon.h)
         var arms = [Float](repeating: 0, count: 14)
         var skeleton = [Float](repeating: 0, count: 134)
-        let buttons = vx_xros_vr_controller_buttons(CACurrentMediaTime())
-        for (k, a) in [left, right].enumerated() {
-            guard let a, a.isTracked, let sk = a.handSkeleton else { continue }
+        var wrists = [Float](repeating: 0, count: 20)
+        var middlePinch = [Float](repeating: -1, count: 2)
+        let bare = vx_xros_vr_bare_enabled() != 0
+        let joy = joyWristTracking
+        let buttons = vx_xros_vr_controller_buttons(now)
+        for (k, update) in [left, right].enumerated() {
+            var sample = update
+            if joy {
+                // Reading latestAnchors consumes each update. An empty read between
+                // samples must not cancel a grip or make one hand disappear.
+                if let update, update.isTracked { joyAnchors[k] = (update, now) }
+                if handTracking.state != .running { joyAnchors[k] = nil }
+                if let cached = joyAnchors[k], now - cached.received <= 0.14 { sample = cached.anchor }
+                else { sample = nil }
+            }
+            guard let a = sample, a.isTracked else { continue }
+            let sk = a.handSkeleton
+            if joy && joyWristIDs[k] != a.id {
+                joyWristIDs[k] = a.id
+                wristBasis[k] = nil
+                wristOffset[k] = .zero
+                wristCalibrated[k] = false
+            }
+            func localPosition(_ joint: HandSkeleton.Joint) -> SIMD3<Float> {
+                let p = joint.anchorFromJointTransform.columns.3
+                return SIMD3(p.x, p.y, p.z)
+            }
+            if let sk {
+                let wrist = sk.joint(.wrist)
+                let middle = sk.joint(.middleFingerKnuckle)
+                let index = sk.joint(.indexFingerKnuckle)
+                let little = sk.joint(.littleFingerKnuckle)
+                let trackedBasis = wrist.isTracked && middle.isTracked && index.isTracked && little.isTracked
+                if !joy && wrist.isTracked { wristOffset[k] = localPosition(wrist) }
+                if (!joy || !wristCalibrated[k]) && (trackedBasis || (joy && wristBasis[k] == nil)) {
+                    let offset = localPosition(wrist)
+                    let forward = localPosition(middle) - offset
+                    let across = (localPosition(index) - localPosition(little)) * (k == 0 ? -1 : 1)
+                    if (0.015...0.16).contains(simd_length(forward)), (0.015...0.13).contains(simd_length(across)),
+                       abs(simd_dot(simd_normalize(forward), simd_normalize(across))) < 0.8 {
+                        wristBasis[k] = (simd_normalize(forward), simd_normalize(across))
+                        if joy && trackedBasis {
+                            wristOffset[k] = offset
+                            wristCalibrated[k] = true
+                        }
+                    }
+                }
+            }
+            // The ARKit hand anchor is based at the wrist. Seed from its rest
+            // axes if even the skeleton is absent, then calibrate once when visible.
+            let basis = wristBasis[k] ?? (forward: SIMD3<Float>(0, 0, -1), across: SIMD3<Float>(-1, 0, 0))
+            if joy || (wristBasis[k] != nil && (!bare || sk?.joint(.wrist).isTracked == true)) {
+                let m = a.originFromAnchorTransform
+                let f = m * SIMD4(basis.forward, 0)
+                let s = m * SIMD4(basis.across, 0)
+                let t = m * SIMD4(wristOffset[k], 1)
+                let base = k * 10
+                wrists[base] = 1
+                for i in 0..<3 {
+                    wrists[base + 1 + i] = t[i]
+                    wrists[base + 4 + i] = f[i]
+                    wrists[base + 7 + i] = s[i]
+                }
+            }
+            guard let sk else { continue }
             func p(_ j: HandSkeleton.JointName) -> SIMD3<Float> {
                 let m = a.originFromAnchorTransform * sk.joint(j).anchorFromJointTransform
                 return SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z)
             }
             let elbow = p(.forearmArm), fwrist = p(.forearmWrist)
-            let armOK = simd_distance(elbow, fwrist) > 0.05
+            let armOK = simd_distance(elbow, fwrist) > 0.05 &&
+                (!joy || (sk.joint(.forearmArm).isTracked && sk.joint(.forearmWrist).isTracked))
             if armOK {
                 arms[k * 7] = 1
                 for i in 0..<3 { arms[k * 7 + 1 + i] = elbow[i]; arms[k * 7 + 4 + i] = fwrist[i] }
@@ -224,7 +311,7 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
             let ref = abs(forward.y) < 0.9 ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
             let across = simd_normalize(simd_cross(forward, ref)) * (k == 0 ? -1 : 1)
             let normal = simd_normalize(simd_cross(across, forward))
-            let active = (buttons & (1 << 15)) != 0
+            let active = !bare && (buttons & (1 << 15)) != 0
             let grab = (buttons & (1 << (k == 0 ? 0 : 2))) != 0
             let trigger = (buttons & (1 << (k == 0 ? 1 : 3))) != 0
             skeleton[k * 67] = 1
@@ -244,14 +331,18 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
             }
             let thumb = p(.thumbTip), index = p(.indexFingerTip)
             let anchor = (p(.indexFingerKnuckle) + p(.thumbKnuckle)) * 0.5
-            v[k * 10] = 1
+            let thumbTracked = sk.joint(.thumbTip).isTracked
+            let indexTracked = sk.joint(.indexFingerTip).isTracked
+            if bare && thumbTracked && sk.joint(.middleFingerTip).isTracked {
+                middlePinch[k] = simd_distance(thumb, p(.middleFingerTip))
+            }
+            v[k * 10] = (!bare && !joy) || (thumbTracked && indexTracked) ? 1 : 0
             for i in 0..<3 { v[k * 10 + 1 + i] = thumb[i]; v[k * 10 + 4 + i] = index[i]; v[k * 10 + 7 + i] = anchor[i] }
             j[k * 25] = 1
-            let wrist = p(.wrist)
             for (n, name) in [HandSkeleton.JointName.wrist, .indexFingerKnuckle, .middleFingerKnuckle, .littleFingerKnuckle,
                               .middleFingerTip, .ringFingerTip, .littleFingerTip, .indexFingerTip].enumerated() {
                 var q = p(name)
-                if n > 0 && simd_distance(q, wrist) < 0.005 && armOK {
+                if n > 0 && simd_distance(q, wristPoint) < 0.005 && armOK {
                     let d = fwrist - elbow
                     let f = simd_length(d) > 0.001 ? simd_normalize(d) : SIMD3<Float>(0, 0, -1)
                     let ref = abs(f.y) < 0.9 ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
@@ -262,11 +353,14 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
             }
         }
         skeleton.withUnsafeBufferPointer { vx_xros_vr_hand_skeleton($0.baseAddress) }
+        wrists.withUnsafeBufferPointer { vx_xros_vr_wrist_poses($0.baseAddress) }
+        if bare { middlePinch.withUnsafeBufferPointer { vx_xros_vr_middle_pinches($0.baseAddress) } }
         arms.withUnsafeBufferPointer { vx_xros_vr_hand_arms($0.baseAddress) }
         j.withUnsafeBufferPointer { vx_xros_vr_hand_joints($0.baseAddress) }
-        if !handsLogged && (v[0] > 0 || v[10] > 0) {
+        let detected = joy ? wrists : v
+        if !handsLogged && (detected[0] > 0 || detected[10] > 0) {
             handsLogged = true
-            vxmac_jlog("input_source", "\"source\":\"hand_tracking\",\"first_hand\":\"\(v[10] > 0 ? "right" : "left")\"")
+            vxmac_jlog("input_source", "\"source\":\"hand_tracking\",\"first_hand\":\"\(detected[10] > 0 ? "right" : "left")\"")
         }
         var h = head
         withUnsafePointer(to: &h) { hp in

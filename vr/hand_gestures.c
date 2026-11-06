@@ -149,3 +149,176 @@ const char *hand_gesture_name(int bit) {
     switch (bit) { case HG_RELOAD: return "reload"; case HG_MELEE: return "melee"; case HG_GRENADE: return "grenade"; case HG_HEAL: return "heal"; case HG_INTERACT: return "interact"; case HG_SCAN: return "scan"; }
     return "?";
 }
+
+static int bare_menu_target(const float head[16], const float *hand) {
+    if (hand[0] < .5f) return -1;
+    float ray[3];
+    for (int i = 0; i < 3; i++) ray[i] = hand[7 + i] - head[12 + i];
+    float depth = -dot3(ray, head + 8);
+    if (depth < .12f) return -1;
+    float x = dot3(ray, head) / depth;
+    float y = dot3(ray, head + 4) / depth - BH_MENU_CENTER_Y;
+    if (fabsf(x) >= BH_MENU_X || fabsf(y) >= BH_MENU_Y) return -1;
+    int column = (int)((x + BH_MENU_X) * BH_COLUMNS / (2 * BH_MENU_X));
+    int row = (int)((BH_MENU_Y - y) * BH_ROWS / (2 * BH_MENU_Y));
+    return row * BH_COLUMNS + column;
+}
+
+bare_hand_input bare_hands_update(bare_hands *b, const float head[16], const float hands[20],
+                                 const float wrists[20], const float middle[2], double now,
+                                 int enabled, int gameplay, int owner, int can_eject, int supporting) {
+    bare_hand_input result = { .hover = -1, .action = -1 };
+    if (!enabled) { memset(b, 0, sizeof *b); return result; }
+    int other = 1 - owner;
+    unsigned owner_bit = 1u << owner, other_bit = 1u << other;
+    unsigned valid = 0, pinched = 0, previously_blocked = b->require_open;
+    for (int h = 0; h < 2; h++) {
+        unsigned bit = 1u << h;
+        const float *hand = hands + h * 10;
+        if (hand[0] < .5f || wrists[h * 10] < .5f) { b->require_open |= bit; b->pinch_at[h] = 0; continue; }
+        valid |= bit;
+        if (dist3(hand + 1, hand + 4) < (b->pinched & bit ? .034f : .019f)) pinched |= bit;
+        else b->require_open &= ~bit;
+    }
+    if (!b->initialized) {
+        b->initialized = 1;
+        b->armed = 1;
+        b->owner = owner;
+        b->require_open |= pinched;
+    }
+    if (b->owner != owner) {
+        b->owner = owner;
+        b->require_open |= pinched;
+        b->shot_until = 0;
+        b->moving = b->shake_direction = 0;
+        b->sampled_at = 0;
+    }
+    if ((b->last_at && now - b->last_at > .20) || (gameplay && !b->gameplay)) {
+        b->require_open |= pinched;
+        previously_blocked |= b->pinched;
+        b->shot_until = b->sampled_at = 0;
+        b->moving = b->shake_direction = b->menu = b->chord = 0;
+        b->walk_needs_open = 1;
+    }
+    b->gameplay = gameplay;
+    b->last_at = now;
+    unsigned pressed = pinched & ~b->pinched & ~b->require_open;
+    unsigned released = b->pinched & ~pinched & valid & ~previously_blocked;
+    b->pinched = pinched;
+    for (int h = 0; h < 2; h++) if (pressed & (1u << h)) b->pinch_at[h] = now;
+
+    if (!pinched && valid == 3) b->chord = 0;
+    if (b->chord && (pinched != 3 || valid != 3)) b->chord = 2;
+    if (!b->menu && !b->chord && pinched == 3 && !(b->require_open & 3) &&
+        fabs(b->pinch_at[0] - b->pinch_at[1]) <= .20) {
+        b->gap = dist3(hands + 7, hands + 17);
+        if (b->gap <= .40f) {
+            b->chord = 1;
+            b->chord_at = now;
+            b->shot_until = 0;
+        }
+    }
+    if (b->chord == 1) {
+        if (now - b->chord_at > 1.0) b->chord = 2;
+        else if (dist3(hands + 7, hands + 17) >= b->gap + .16f) {
+            b->menu = 1;
+            b->ready = 0;
+            b->chord = 2;
+        }
+    }
+    if (b->menu) {
+        if (!pinched && valid == 3) b->ready = 1;
+        if (valid == 0) b->menu = b->ready = 0;
+        int target[2] = { valid & 1u ? bare_menu_target(head, hands) : -1,
+                          valid & 2u ? bare_menu_target(head, hands + 10) : -1 };
+        int cursor = pressed & 2u ? 1 : pressed & 1u ? 0 : target[1] >= 0;
+        result.hover = target[cursor];
+        if (b->ready && !b->chord && (pressed & (1u << cursor)) && result.hover >= 0) {
+            result.action = result.hover;
+            b->menu = 0;
+            b->require_open |= pinched;
+            if (result.action == BH_WEAPON) b->armed = 1;
+            if (result.action == BH_HOLSTER) b->armed = 0;
+        }
+        result.menu = b->menu;
+    }
+    result.blocked = b->menu || b->chord || result.action >= 0 || !gameplay;
+    if (result.blocked) {
+        b->shot_until = b->sampled_at = 0;
+        b->moving = b->shake_direction = 0;
+        return result;
+    }
+
+    const float *walk = wrists + other * 10, *gun = wrists + owner * 10;
+    if (walk[0] < .5f || middle[other] < 0) b->walk_needs_open = 1;
+    else if (middle[other] >= .034f) b->walk_needs_open = 0;
+    int walk_pinch = !b->walk_needs_open && middle[other] < (b->moving ? .034f : .019f);
+    if (!walk_pinch || (pinched & other_bit)) b->moving = 0;
+    else if (!b->moving && walk[2] - head[13] < -.28f && walk[2] - head[13] > -.9f) {
+        float n = hypotf(head[0], head[2]);
+        if (n > .01f) {
+            b->moving = 1;
+            memcpy(b->walk_origin, walk + 1, sizeof b->walk_origin);
+            b->walk_right[0] = head[0] / n;
+            b->walk_right[2] = head[2] / n;
+            b->walk_forward[0] = b->walk_right[2];
+            b->walk_forward[2] = -b->walk_right[0];
+        }
+    }
+    if (b->moving) {
+        float delta[3];
+        for (int i = 0; i < 3; i++) delta[i] = walk[1 + i] - b->walk_origin[i];
+        float x = dot3(delta, b->walk_right), z = dot3(delta, b->walk_forward);
+        if (x > .065f) result.movement |= BH_RIGHT;
+        if (x < -.065f) result.movement |= BH_LEFT;
+        if (z > .065f) result.movement |= BH_FORWARD;
+        if (z < -.065f) result.movement |= BH_BACKWARD;
+    }
+
+    if (!(valid & owner_bit) || gun[0] < .5f || !b->armed) b->shot_until = 0;
+    else if ((released & owner_bit) && b->pinch_at[owner] > 0 && now - b->pinch_at[owner] >= .04 && now - b->pinch_at[owner] < .20)
+        b->shot_until = now + .07;
+    if (b->armed && gun[0] > .5f && (valid & owner_bit) && !(b->require_open & owner_bit) &&
+        (((pinched & owner_bit) && now - b->pinch_at[owner] >= .20) || now < b->shot_until))
+        result.pinches |= owner_bit;
+    if (!b->moving && walk[0] > .5f) result.pinches |= pinched & other_bit & ~b->require_open;
+
+    // A deliberate lateral sweep and reversal, measured in the room against
+    // a fixed axis, so head movement cannot eject a magazine.
+    if (!can_eject || !b->armed || supporting || pinched || !(valid & owner_bit) ||
+        (b->shake_done && now - b->shake_done < 1.0)) {
+        b->sampled_at = 0;
+        b->shake_direction = 0;
+        return result;
+    }
+    double dt = now - b->sampled_at;
+    if (b->sampled_at && dt > .001 && dt < .09) {
+        if (b->shake_direction && now - b->shake_at > .42) b->shake_direction = 0;
+        if (!b->shake_direction) {
+            float n = hypotf(head[0], head[2]);
+            b->shake_axis[0] = n > .01f ? head[0] / n : 1;
+            b->shake_axis[2] = n > .01f ? head[2] / n : 0;
+        }
+        float position = dot3(gun + 1, b->shake_axis);
+        float previous = dot3(b->previous, b->shake_axis);
+        float speed = (position - previous) / (float)dt;
+        if (!b->shake_direction && fabsf(speed) > 1.45f) {
+            b->shake_direction = speed > 0 ? 1 : -1;
+            b->shake_at = now;
+            b->shake_origin = previous;
+            b->shake_peak = position;
+        } else if (b->shake_direction) {
+            int dir = b->shake_direction;
+            if ((position - b->shake_peak) * dir > 0) b->shake_peak = position;
+            if ((b->shake_peak - b->shake_origin) * dir >= .09f &&
+                (b->shake_peak - position) * dir >= .08f && speed * dir < -1.25f) {
+                result.eject = 1;
+                b->shake_direction = 0;
+                b->shake_done = now;
+            }
+        }
+    } else b->shake_direction = 0;
+    memcpy(b->previous, gun + 1, sizeof b->previous);
+    b->sampled_at = now;
+    return result;
+}

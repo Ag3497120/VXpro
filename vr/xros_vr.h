@@ -29,6 +29,10 @@ void vx_xros_vr_submit(void *cb, void *back, uint32_t w, uint32_t h, void (*wait
 // right-up-back axes) and its predicted presentation time (CACurrentMediaTime's clock). Also the tick that paces
 // sync-interval presents (src/xros_ui.m). Returns 1 when a game frame is there to show.
 int vx_xros_vr_begin_frame(const float origin_from_device[16], double presentation_time);
+// Set this drawable's head-from-eye transforms before drawing either eye.
+// NULL / a non-stereo drawable clears the pair for this frame.
+void vx_xros_vr_set_eye_views(const float left[16], const float right[16]);
+int vx_xros_vr_system_stereo(void);
 // One eye: the warp of the frame into out (the drawable's colour texture for that view) and out_depth (its depth
 // texture), encoded in cb. view_from_origin: the eye's view matrix (inverse of origin-from-device x the view's
 // transform), tan: the eye's frustum tangents (left, right, top, bottom, all positive outwards), near_m: the near
@@ -52,6 +56,10 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now);
 // for the gun handled by hand (VXMAC_MAG=1, VXMAC_ARMS=1).
 void vx_xros_vr_hand_joints(const float joints[50]);
 void vx_xros_vr_hand_skeleton(const float skel[134]);
+// Each tracked wrist: valid, position, palm forward, palm across, in world space.
+void vx_xros_vr_wrist_poses(const float wrists[20]);
+int vx_xros_vr_bare_enabled(void);
+void vx_xros_vr_middle_pinches(const float distances[2]);
 unsigned vx_xros_vr_controller_buttons(double now);
 #ifndef VX_HAND_BUTTONS_DEFINED
 #define VX_HAND_BUTTONS_DEFINED

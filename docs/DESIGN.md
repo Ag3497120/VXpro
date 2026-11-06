@@ -860,6 +860,130 @@ Each gesture seen shows a short label for 0.7 s in the labels' language ("Reload
 
 ## h70: the gun handled by hand - magazine, draw, holster, aim, trigger (VXMAC_MAG=1, VXMAC_ARMS=1; off by default)
 
+### Controller-free hand tracking
+
+Add `-env VXMAC_FULL_HAND=1` to `Documents/vxmac_args.txt` and restart VXMacHost. The
+gameplay input in this mode comes from the tracked hands. The game uses its default
+keyboard mappings for the action menu.
+
+- Pinch thumb and index finger on the weapon hand to fire. A short pinch fires on
+  release. Holding starts the trigger after 0.20 s so the two-hand gesture can take priority.
+- With the other hand, pinch and hold near the foregrip to support it. A short pinch
+  at the trigger grip transfers the weapon on release. Long-gun ADS requires support.
+- Flick the weapon wrist sideways and back to eject a magazine, including when empty.
+  With the free hand, pinch at the hip on that side and keep pinching while bringing
+  the magazine to the well. A pistol needs another pinch and a pull on its slide.
+  Other weapons chamber automatically after insertion.
+- Pinch with both hands close together, then spread them. Open both hands, point one
+  hand at an item, and pinch to select. The menu covers phone, pocket radio, vehicle
+  summon, inventory, interaction, healing, weapon selection, holster, jump, crouch,
+  scanner, and basic navigation. The game's flat menus still use the hand pointer.
+- At waist height, pinch thumb and middle finger on the free hand. Move the wrist
+  around the point where the pinch began for W/A/S/D movement. Open the pinch to stop.
+
+Manual reload requires the three-file `Documents/vxhands_manual` overlay below.
+The game still controls where bullets land. Gesture thresholds and compatibility
+with individual weapon meshes need on-device validation.
+
+### Experimental stereo calibration
+
+The stereo calibration experiment uses `-env VXMAC_STEREO_EYES=system` in warp modes 6/7.
+It centres the camera between CompositorServices' two view transforms and uses each eye's measured offset,
+including eye rotation. It adds no GPU passes. An explicit `VXMAC_IPD` keeps the fixed-baseline path.
+Invalid or missing view pairs fall back to the fixed baseline for both eyes together.
+This changes the existing depth reprojection. Native per-eye hand and weapon geometry rendering is still pending.
+Game FPS and headset timing must be compared on the device before enabling this by default.
+
+`-env VXMAC_STEREO_AUDIT=1` reports foreground draw counts and their colour/depth attachment formats.
+The `stereo_geometry` host events and at most 32 `Stereo foreground` pipeline log entries identify which
+material/depth passes need replay. Multiple colour outputs alone do not establish whether a pass is deferred.
+This records metadata only. The existing `VXMAC_PASS_PROFILE=overlap` can measure GPU stages without the
+profiler's serial mode.
+
+### Experimental tracked-hand weapon hold
+
+`-env VXMAC_JOY_HOLD=1` enables the Joy-Con version in VR. The right wrist sets the gun's direction and ZR fires.
+On a long gun, holding ZL attaches the left hand to the support grip and holds ADS, without a proximity test.
+Releasing ZL releases both. Reload interactions take priority over support. Pistols still acquire support by proximity.
+Both native triggers are intercepted in VR and firing is
+sent as the game's mouse attack. Outside VR they retain their normal bindings.
+
+With a validated current hand capture, the renderer latches one game-space rigid correction for the frame.
+The receiver and mounted parts share it even when object origins, bone palettes and pass cameras differ.
+The cache remains the fallback when the arm draw is absent. A preliminary wrist draw cannot override the
+validated hand, and pistol support no longer uses an absolute point near an assumed model origin.
+`tests/vrik_grip_alignment_mac.m` covers stale equip data, different part origins, repeated passes, later native
+hand changes in the same frame, support attachment and release. This checks coordinates without GPU execution;
+headset stability and correct contact for each weapon remain unverified. The engine pose writer is still pending;
+see `HAND_SESSION.md` for the current boundary and device evidence.
+
+With `-env VXMAC_MUZZLE_AIM=1` and a recognized gun, the experimental game camera follows the rendered barrel
+during firing or supported aim. The headset
+reprojects that camera to the head pose and draws the reticle at the game camera's aim. This works within the
+rendered view's aiming cone and waits for camera alignment before sending fire. The stock game still chooses the
+shot origin and spread. Head-directed aim is the default.
+
+`-env VXMAC_EJECT_MAG=1` with `-env VXMAC_NO_AUTO_RELOAD=1` uses the manual reload overlay from
+`Documents/vxhands_manual`. In VR, press X or flick the right wrist quickly down and back up to eject. Hold ZL
+at the left hip and keep holding while bringing the magazine to the well. With a pistol, release ZL, then
+hold it near the slide and pull back along the barrel. The slide has a capsule-shaped grab zone (6.5 cm either side
+along its axis, 7.5 cm radius). ZL attaches the displayed hand at the closest point; the actual wrist's motion relative
+to the weapon drives the pull. Releasing ZL detaches it. Shake ejection is disabled during the chamber step.
+Other weapons chamber automatically after insertion.
+Unity/Liberty have an authored slide contact. The game chooses the chamber policy from the equipped item type.
+The overlay asks the game
+to empty and refill the equipped weapon through its own ammo inventory, with standard player reload transitions
+disabled. The hip and magazine well are tracked interaction zones. The manual mode draws no replacement
+magazine or ring. VRIK moves the game's magazine mesh when the indexed geometry matches a supported one-bone
+magazine, including Unity/Liberty, Tsunami Nue, D5 Copperhead and Guillotine. Other meshes and the slide still
+require weapon-specific bindings.
+
+The app and the compiled manual overlay must be deployed together. In particular, the older overlay that waits
+for a chamber command for every weapon is incompatible with the app's automatic non-pistol chamber policy.
+The current overlay refills on insertion and keeps only `Wea_Handgun` weapons locked until a slide command;
+other equipped ranged item types become ready after the game's refill completes. Compile from the user's
+unmodified script bundle, stop the app before copying all three overlay files, and compare their readback hashes
+before launching. A successful overlay compilation does not establish native game startup or reload behavior.
+
+For game-confirmed equipment, ammo and reload status, compile with `--weapon-bridge` and enable
+`-env VXMAC_WEAPON_BRIDGE=1`. This uses the version-checked native report bridge described above. The overlay
+uses the stock native reload duration, finishes it, then checks ammunition on subsequent game ticks. It reports
+the equipped item type and real magazine count rather than treating a hand insertion as a completed reload.
+Long-gun completion and pistol chamber locks follow those reports. This does not splice an isolated cocking
+animation out of every weapon's stock reload clip; native inventory accounting and the visible slide binding
+are separate. Models without a verified slide bone use a grab zone but do not gain a guessed moving mesh.
+The bridge does not change the manual script's source directory: all three files come from `vxhands_manual`.
+An old `vxhands_weapon_probe` directory must not shadow that script. The shim logs the full opened path;
+`tests/script_manual_overlay_mac.c` checks actual reads and metadata with a stale probe present and the bridge enabled.
+
+Experimental auto-reload suppression: `tools/vxhands_compile_overlay.py` compiles the original user's 2.5.0
+`r6/cache/final.redscripts` and `mod/VXHands/r6/scripts/vxhands_no_auto_reload.reds` into a private overlay using
+`redscript-cli`; it must never overwrite or distribute the original or generated game bundle. Put the overlay at
+`Documents/vxhands_no_auto_reload.redscripts` and set `-env VXMAC_NO_AUTO_RELOAD=1`. `libvxsystem` redirects reads and
+metadata only for that script cache; if the overlay is missing it falls back to the original. The wrapper waits for a
+reload action before allowing the game's empty-magazine reload transition. It does not remove the normal reload animation
+or cover every possible gameplay transition. Compilation and filesystem redirection are tested locally; whether the
+game actually uses the overlay and handles reload correctly must be verified on the headset. Turn off the environment
+option to restore the original script cache. Recompile against the user's installed version after game updates.
+
+`-env VXMAC_HAND_HOLD=1` enables a visual two-hand hold and hand-to-hand transfer in VRIK. Close both hands near
+the weapon, then open the current holding hand to transfer it. Open the support hand to stop the two-hand aim. The
+feature uses finger tracking, not pinch, and is disabled while controller-assisted mode is active; use
+`-env VXMAC_HAND_MODE=bare` to force hand tracking. A lost or forearm-only hand cannot initiate a grip or transfer.
+The thresholds and weapon alignment are experimental and have not been validated on Vision Pro. This changes the
+rendered weapon pose only: the game's firing, aiming and reload state still use the separate input options below,
+whose gun hand does not currently follow the visual transfer.
+
+The existing weapon palette path applies a rigid transform to the whole foreground weapon. It does not identify
+magazine or slide bones; the separate magazine overlay is not the game's magazine mesh. Per-weapon palette identity,
+bone mappings, bind transforms and captures are needed before those parts can safely be moved independently. No game
+assets or extracted bone tables should be distributed as part of this experiment.
+
+The current `tests/hand_weapon_mac.c` suite has existing failures, including false reloads from support-hand motions;
+the older test counts below describe its earlier revision, not the present implementation. `tests/hand_weapon_hold_mac.c`
+checks ownership and tracking loss; `tests/hand_weapon_rack_mac.c` checks that an inserted magazine does not complete
+a rack-required reload before racking and that a timeout cancels it. Neither replaces a headset playtest.
+
 Stage 3 of the hand controls, still outside the game: Half-Life: Alyx-style handling of the gun from the hands'
 skeleton (`vr/hand_weapon.{h,c}`), each step becoming the keys the game's default bindings have (2.5.0
 `inputUserMappings.xml`: `Reload_Button` R, `WeaponSlot1/2_Button` 1 / 2, `HolsterWeapon_Button` B,
