@@ -18,14 +18,49 @@
 #import <Foundation/Foundation.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
+#include <dlfcn.h>
+static int current_frame;
+static int suppress_present(void *cb, void *texture, uint32_t w, uint32_t h) {
+    assert(cb && texture && w && h); return 0;
+}
+int vx_xros_vr_driving(void) {
+    const char *after=getenv("PP_DRIVING_AFTER");
+    return !after || current_frame>=atoi(after);
+}
 int main(int argc, char **argv) { @autoreleasepool {
     if (argc < 2) { fprintf(stderr, "usage: pp <metallib> [frames]\n"); return 2; }
+    const char *late = getenv("PP_LATE_PROFILE");
+    if (late) { // Home-view launch: Metal constructors ran before Documents/-env was parsed.
+        int (*profile_on)(void) = dlsym(RTLD_DEFAULT, "vxprof_on");
+        void (*set_hook)(void *) = dlsym(RTLD_DEFAULT, "vxmtl_set_present_hook");
+        assert(profile_on && set_hook && profile_on() == 0);
+        setenv("VXMAC_PASS_PROFILE", late, 1);
+        void (*configure)(void) = dlsym(RTLD_DEFAULT, "vxprof_configure_startup");
+        if (configure) { configure(); configure(); } // Idempotent; old shims reproduce the missing record.
+        set_hook((void *)suppress_present);
+    }
+    const char *dump = getenv("PP_LATE_PIPE_DUMP");
+    if (dump || getenv("PP_CONFIGURE_PIPE")) {
+        int (*is_on)(void) = dlsym(RTLD_DEFAULT,"vxpipe_on");
+        void (*configure)(void) = dlsym(RTLD_DEFAULT,"vxpipe_configure_startup");
+        void (*set_hook)(void *) = dlsym(RTLD_DEFAULT,"vxmtl_set_present_hook");
+        assert(is_on && set_hook);
+        if (dump) { assert(!is_on());if (!strcmp(dump,"0")) unsetenv("VXMAC_PIPE_DUMP");else setenv("VXMAC_PIPE_DUMP",dump,1); }
+        if (configure) { configure();configure(); }
+        set_hook((void *)suppress_present);
+    }
     int frames = argc > 2 ? atoi(argv[2]) : 40;
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     NSData *lib_bytes = [NSData dataWithContentsOfFile:@(argv[1])];
     dispatch_data_t dd = dispatch_data_create(lib_bytes.bytes, lib_bytes.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
     NSError *err = nil;
     id<MTLLibrary> lib = [dev newLibraryWithData:dd error:&err];
+    const char *source = getenv("PP_SOURCE");
+    if (source && *source) {
+        NSString *text = [NSString stringWithContentsOfFile:@(source) encoding:NSUTF8StringEncoding error:&err];
+        lib = text ? [dev newLibraryWithSource:text options:nil error:&err] : nil;
+    }
     if (!lib) { fprintf(stderr, "library: %s\n", err.localizedDescription.UTF8String); return 1; }
     MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
     rd.vertexFunction = [lib newFunctionWithName:@"vs_full"];
@@ -39,6 +74,27 @@ int main(int argc, char **argv) { @autoreleasepool {
     id<MTLComputePipelineState> k1 = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"cs_a"] error:&err];
     id<MTLComputePipelineState> k2 = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"cs_b"] error:&err];
     if (!heavy || !light || !todraw || !k1 || !k2) { fprintf(stderr, "pipelines: %s\n", err.localizedDescription.UTF8String); return 1; }
+    if (getenv("PP_PIPE_APIS")) {
+        // Caller-requested reflection must survive compute-only/off modes too.
+        MTLAutoreleasedRenderPipelineReflection rr=nil;
+        assert([dev newRenderPipelineStateWithDescriptor:rd options:MTLPipelineOptionBindingInfo reflection:&rr error:&err] && rr);
+        MTLAutoreleasedComputePipelineReflection cr=nil;
+        id<MTLFunction> fn=[lib newFunctionWithName:@"cs_a"];
+        assert([dev newComputePipelineStateWithFunction:fn options:MTLPipelineOptionBindingInfo reflection:&cr error:&err] && cr);
+        MTLComputePipelineDescriptor *cd=[MTLComputePipelineDescriptor new]; cd.computeFunction=fn;
+        assert([dev newComputePipelineStateWithDescriptor:cd options:MTLPipelineOptionBindingInfo reflection:&cr error:&err] && cr);
+        dispatch_semaphore_t done=dispatch_semaphore_create(0);
+        [dev newRenderPipelineStateWithDescriptor:rd completionHandler:^(id<MTLRenderPipelineState> p,NSError *e) { assert(p && !e); dispatch_semaphore_signal(done); }];
+        assert(dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC))==0);
+        [dev newRenderPipelineStateWithDescriptor:rd options:MTLPipelineOptionBindingInfo completionHandler:^(id<MTLRenderPipelineState> p,MTLRenderPipelineReflection *r,NSError *e) { assert(p && r && !e); dispatch_semaphore_signal(done); }];
+        assert(dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC))==0);
+        [dev newComputePipelineStateWithFunction:fn completionHandler:^(id<MTLComputePipelineState> p,NSError *e) { assert(p && !e); dispatch_semaphore_signal(done); }];
+        assert(dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC))==0);
+        [dev newComputePipelineStateWithFunction:fn options:MTLPipelineOptionBindingInfo completionHandler:^(id<MTLComputePipelineState> p,MTLComputePipelineReflection *r,NSError *e) { assert(p && r && !e); dispatch_semaphore_signal(done); }];
+        assert(dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC))==0);
+        [dev newComputePipelineStateWithDescriptor:cd options:MTLPipelineOptionBindingInfo completionHandler:^(id<MTLComputePipelineState> p,MTLComputePipelineReflection *r,NSError *e) { assert(p && r && !e); dispatch_semaphore_signal(done); }];
+        assert(dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC))==0);
+    }
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:2048 height:2048 mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
     id<MTLTexture> ta = [dev newTextureWithDescriptor:td], tb = [dev newTextureWithDescriptor:td];
@@ -48,6 +104,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     id<MTLCommandQueue> q = [dev newCommandQueue], qc = [dev newCommandQueue]; qc.label = @"VX Mac compositor";
     uint64_t sum_all = 0;
     for (int f = 0; f < frames; f++) @autoreleasepool {
+        current_frame=f;
         id<CAMetalDrawable> d = [layer nextDrawable];
         id<MTLCommandBuffer> cb = [q commandBuffer];
         id<MTLTexture> ts[2] = { ta, tb }; id<MTLRenderPipelineState> ps[2] = { heavy, light };
@@ -73,6 +130,13 @@ int main(int argc, char **argv) { @autoreleasepool {
             });
         }
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        if (getenv("PP_PIPE_APIS")) {
+            // Unused slots exercise metadata without changing the workload's result.
+            uint32_t v=7; [ce setBytes:&v length:sizeof v atIndex:2];
+            id<MTLBuffer> bs[2]={out,nil}; NSUInteger offsets[2]={0,0};
+            [ce setBuffers:bs offsets:offsets withRange:NSMakeRange(3,2)]; [ce setBufferOffset:4 atIndex:3];
+            id<MTLTexture> ts[2]={ta,nil}; [ce setTextures:ts withRange:NSMakeRange(2,2)];
+        }
         [ce setComputePipelineState:k1]; [ce setTexture:ta atIndex:0]; [ce setBuffer:out offset:0 atIndex:0];
         [ce dispatchThreadgroups:MTLSizeMake(1024 / 16, 1024 / 16, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
         [ce setComputePipelineState:k2]; [ce setTexture:tb atIndex:0];

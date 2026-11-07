@@ -55,6 +55,7 @@ enum {
     VXW_DEPTH_STD = 16,   // standard depth (near 0, far 1): turned around before z_a / (d - z_b)
     VXW_CAM_MV = 32,      // the motion vectors' camera turn (cam: A's camera from B's) taken out before t: only the
                           // objects' own motion is predicted (the pose reprojects the camera's)
+    VXW_EDGE_FILL = 64,   // extend this view's missing periphery using the existing same-frame edge sampling
 };
 
 typedef struct {

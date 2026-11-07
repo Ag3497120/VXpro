@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# VX Mac's frame-prediction model for the Neural Engine ("method 3", docs/DESIGN.md "NPU interpolation: method 3").
-# Optional file. Our own network, trained from scratch: no third-party code or
+# VX Mac's frame-prediction model for the Neural Engine ("method 3", ../AVP_MAC.md "NPU interpolation: method 3").
+# Strength file (t7 only, never in the public tree). Our own network, trained from scratch: no third-party code or
 # weights (PyTorch BSD-3 and coremltools BSD-3 are tools only).
 #
 # What it does. The Neural Engine cannot gather or scatter (no warp on it), and the presenter needs a picture at every
@@ -34,12 +34,12 @@ CH_IN, CH_OUT = 6, 6
 MOTION_UNIT = 16.0          # (model pixels per input unit of motion)
 DEPTH_LOG_RANGE = 12.0      # (log2 of distance / near, 0..12: 0.2 m .. 820 m)
 DEFAULT_W, DEFAULT_H = 416, 240
-DEFAULT_WIDTHS = (32, 64, 96, 128)   # (0.91 M parameters: the paced M1 Max bench, docs/DESIGN.md)
+DEFAULT_WIDTHS = (32, 64, 96, 128)   # (0.91 M parameters: the paced M1 Max bench, AVP_MAC.md)
 VEL_K_DEFAULT = (-1.05, -1.05)   # (vel_check's measured scale, h-AVP 2026-11-01: corr ~-0.78, k ~-1.05)
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# The capture format (app/Sources/interp_capture.m writes it; docs/DESIGN.md "Capture format")
+# The capture format (app/Sources/interp_capture.m writes it; ../AVP_MAC.md "Capture format")
 # file:   "VXIC" u32 version u32 w u32 h u32 planes u32 reserved[3]                                  (32 bytes)
 # record: "VXFR" u32 header_bytes u32 payload_bytes u32 raw_bytes u32 flags u32 burst u32 index
 #         u32 src_w src_h depth_w depth_h vel_w vel_h  u64 seq u64 cam_seq  f64 t_present f64 t_prev
@@ -427,11 +427,16 @@ class WarpPairs:
         cf = min(max((age - FADE0) / (AGE_CAP - FADE0), 0), 1); cf = cf * cf * (3 - 2 * cf)
         return dict(rot=Rc @ Rb.T, camt=Ra @ Rb.T, tan=np.array(b["tan"], np.float32), t=np.float32(t), ct=np.float32(min(t, 1)),
                     cf=np.float32(cf), age=np.float32(age))
+    mtarget_dir = None   # (run4: tools/interp_oracle.py flow layers per pair - the motion that lands each pixel where it went)
     def __getitem__(self, i):
         ia, ib, ic = self.pairs[i]
-        mb, pb = self.frames[ib]; pc = self.frames[ic][1]
+        mb, pb = self.frames[ib]; mc, pc = self.frames[ic]
         x = encode_input(pb.astype(np.float32), mb, self.W, self.H)
-        return x, np.clip(pc[0:3].astype(np.float32), 0, 1), self.geom(i)
+        g = self.geom(i)
+        if self.mtarget_dir:
+            f = os.path.join(self.mtarget_dir, "%d_%d.f16" % (mb["seq"], mc["seq"]))
+            g["mt"] = np.fromfile(f, np.float16).reshape(6, self.H, self.W)[3:5].astype(np.float32) if os.path.exists(f) else np.full((2, self.H, self.W), np.nan, np.float32)
+        return x, np.clip(pc[0:3].astype(np.float32), 0, 1), g
 
 
 def batch_of(ds, idx):
@@ -558,6 +563,19 @@ def loss_h63_v2(x, y, tgt, g):
     return tot + 2.0 * holes + reg + collapse, dict(l1=float(l), holes=float(holes), conf=float(y[:, 5].mean()))
 
 
+def loss_h63_v3(x, y, tgt, g):
+    """run4: v2 plus the motion supervised directly by the future flow (its own signal: the picture loss reaches the
+    motion only through one-pixel footprints), Huber in model units, where the flow is plausible."""
+    import torch, torch.nn.functional as F
+    l, parts = loss_h63_v2(x, y, tgt, g)
+    mt = g["mt"].to(x.device)
+    ok = torch.isfinite(mt).all(1, keepdim=True) & (mt.abs().amax(1, keepdim=True) < 12)
+    d = F.smooth_l1_loss(torch.where(ok, y[:, 3:5], torch.zeros_like(mt)), torch.where(ok, mt, torch.zeros_like(mt)), reduction="sum", beta=0.1)
+    mloss = d / ok.sum().clamp_min(1) / 2
+    parts["mot"] = float(mloss)
+    return l + 0.2 * mloss, parts
+
+
 def eval_h63(net, ds, n=None, bs=8, seed=0):
     """Mean squared error -> PSNR (8-bit, inside the mask) per age bucket, the model against fill = frame, the game's
     motion, conf 1 (= the raw velocity through the h63 path) and holding N. Fixed pairs (every one, or n spread)."""
@@ -621,6 +639,7 @@ def train2(a):
     import torch
     dev = device_pick()
     tr = WarpPairs(a.data, "train"); he = WarpPairs(a.data, "heldout")
+    if a.loss == "v3": tr.mtarget_dir = a.mtarget
     print("pairs: train %d (bursts %d), held-out %d (bursts %d)" % (len(tr), len({tr.frames[p[1]][0]["burst"] for p in tr.pairs}),
           len(he), len({he.frames[p[1]][0]["burst"] for p in he.pairs})), flush=True)
     widths = tuple(int(v) for v in a.widths.split(","))
@@ -629,6 +648,11 @@ def train2(a):
         ck = torch.load(a.init, map_location="cpu"); net.load_state_dict(ck["state"])
         torch.nn.init.zeros_(net.head.weight); torch.nn.init.zeros_(net.head.bias)    # (the collapsed heads reset: starts as the raw velocity)
     net.to(dev)
+    from interp_health import require_training_features
+    if not len(tr):
+        raise ValueError("no training pairs")
+    probe, _, _ = batch_of(tr, np.linspace(0, len(tr)-1, min(4,len(tr))).astype(int))
+    print("decoder health:", require_training_features(net, [probe.to(dev)]), flush=True)
     base = eval_h63(None, he, n=a.eval_n)
     print("held-out (h63 composite), no model:", {k: round(v["all"], 2) for k, v in base.items()}, flush=True)
     opt = torch.optim.AdamW(net.parameters(), lr=a.lr, weight_decay=1e-4)
@@ -639,7 +663,7 @@ def train2(a):
         x, tgt, g = batch_of(tr, rng.integers(0, len(tr), a.batch))
         x, tgt = x.to(dev), tgt.to(dev)
         y = net(x)
-        loss, parts = (loss_h63_v2 if a.loss == "v2" else loss_h63)(x, y, tgt, g)
+        loss, parts = {"v1": loss_h63, "v2": loss_h63_v2, "v3": loss_h63_v3}[a.loss](x, y, tgt, g)
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0); opt.step(); sched.step()
         if s % 200 == 0 or s == a.steps - 1:
             print("step %5d loss %.4f l1 %.4f holes %.4f conf %.3f (%.0f s)" % (s, float(loss), parts["l1"], parts["holes"], parts["conf"], time.time() - t0), flush=True)
@@ -657,7 +681,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["smoke", "train", "train2", "eval2", "export", "info", "params"])
     ap.add_argument("--init", help="train2: start from this checkpoint's body (its heads reset)")
-    ap.add_argument("--loss", default="v2", choices=["v1", "v2"], help="train2: v1 run2's (L1 + edge + hole-area L1 + conf pull), v2 run3's")
+    ap.add_argument("--mtarget", help="train2 --loss v3: the per-pair flow layers (tools/interp_oracle.py flow --split train)")
+    ap.add_argument("--loss", default="v2", choices=["v1", "v2", "v3"], help="train2: v1 run2's (L1 + edge + hole-area L1 + conf pull), v2 run3's")
     ap.add_argument("--eval-every", type=int, default=1000); ap.add_argument("--eval-n", type=int, default=600)
     ap.add_argument("--data"); ap.add_argument("--out", default="build/interp"); ap.add_argument("--ckpt"); ap.add_argument("--resume")
     ap.add_argument("--w", type=int, default=DEFAULT_W); ap.add_argument("--h", type=int, default=DEFAULT_H)

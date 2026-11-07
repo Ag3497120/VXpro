@@ -82,6 +82,11 @@ final class VXMacImmersiveRenderer: @unchecked Sendable {
 
     private func loop() {
         let cfg = layerRenderer.configuration
+        // Trial GPU budget: fewer complete eye warps; the system may repeat a frame.
+        // Depth, device anchors and the optimal-input timing below remain unchanged.
+        let repeats: Int32 = ProcessInfo.processInfo.environment["VXMAC_PRESENT_REPEAT"] == "1" ? 1 : 0
+        layerRenderer.minimumFrameRepeatCount = repeats
+        vxmac_jlog("compositor_policy", "\"minimum_repeat_count\":\(repeats),\"game_fps_includes_repeats\":false")
         vxmac_jlog("vr_start", "\"foveation\":\(cfg.isFoveationEnabled),\"layout\":\"\(cfg.layout)\",\"color\":\(cfg.colorFormat.rawValue),\"depth\":\(cfg.depthFormat.rawValue),\"tracking\":\(tracking)")
         vxmac_vr_space_set(1)
         while true {

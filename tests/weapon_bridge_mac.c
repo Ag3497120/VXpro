@@ -77,6 +77,49 @@ int main(void) {
     report("VXW1|U");
     assert(vx_weapon_bridge_snapshot().generation == 3 && !vx_weapon_bridge_snapshot().entity);
 
+    // Context heartbeats do not depend on an equipped weapon or mutate its identity.
+    assert(!vx_weapon_bridge_context().known);
+    report("VXW1|C|1|1|0");
+    vx_game_context ctx=vx_weapon_bridge_context();
+    assert(ctx.known && ctx.mounted && ctx.vehicle_mode==1 && !ctx.scene_tier);
+    uint64_t context_seq=ctx.sequence;
+    const char *bad_context[]={"VXW1|C|2|1|0","VXW1|C|1|8|0","VXW1|C|0|0|7","VXW1|C|1|1|0|9","VXW1|C|0|0", "VXW1|C|-1|0|0"};
+    for(unsigned i=0;i<sizeof bad_context/sizeof *bad_context;i++) report(bad_context[i]);
+    assert(vx_weapon_bridge_context().sequence==context_seq);
+    report("VXW1|C|0|4|3");ctx=vx_weapon_bridge_context();
+    assert(ctx.known && !ctx.mounted && ctx.vehicle_mode==4 && ctx.scene_tier==3);
+    assert(vx_weapon_bridge_snapshot().generation==3);
+    game_context.received_at=bridge_now()-2;
+    assert(!vx_weapon_bridge_context().known);
+    report("VXW1|C|0|0|0");assert(vx_weapon_bridge_context().known);
+
+    report("VXW1|M|1");ctx=vx_weapon_bridge_context();
+    assert(ctx.menu_known && ctx.menu_open);
+    context_seq=ctx.sequence;
+    report("VXW1|M|2");report("VXW1|M|0|1");report("VXW1|M|0|");report("VXW1|M|-1");
+    assert(vx_weapon_bridge_context().menu_open && vx_weapon_bridge_context().sequence==context_seq);
+    report("VXW1|C|1|1|3");assert(vx_weapon_bridge_context().menu_open);
+    game_context.received_at=bridge_now()-2;
+    report("VXW1|M|0");ctx=vx_weapon_bridge_context();
+    assert(!ctx.known && ctx.menu_known && !ctx.menu_open); // menu does not refresh stale vehicle state
+    report("VXW1|V|3");assert(vx_weapon_bridge_context().script_revision==3);
+    report("VXW1|V|0");report("VXW1|V|3|");report("VXW1|V|101");
+    report("VXW1|C|0|0|1");report("VXW1|M|0");
+    assert(vx_weapon_bridge_context().script_revision==3);
+
+    report("VXW1|J|0|1|1|78.4|78.4");ctx=vx_weapon_bridge_context();
+    assert(ctx.camera_known && ctx.vehicle_perspective==0 && ctx.vehicle_pitch_ready && ctx.vehicle_fov_owned);
+    assert(fabsf(ctx.foot_fov-78.4f)<.001f);
+    const char *bad_camera[]={"VXW1|J|8|1|1|78|78","VXW1|J|0|2|1|78|78","VXW1|J|0|1|2|78|78",
+        "VXW1|J|0|1|1|nan|78","VXW1|J|0|1|1|78|180","VXW1|J|0|1|1|-1|78","VXW1|J|0|1|1|78|78|","VXW1|J|0|1|1|78"};
+    for(unsigned i=0;i<sizeof bad_camera/sizeof *bad_camera;i++)report(bad_camera[i]);
+    assert(vx_weapon_bridge_context().vehicle_fov_owned && fabsf(vx_weapon_bridge_context().native_fov-78.4f)<.001f);
+    game_context.camera_received_at=bridge_now()-2;assert(!vx_weapon_bridge_context().camera_known);
+    report("VXW1|J|0|1|1|78|78");assert(vx_weapon_bridge_context().camera_known);
+    report("VXW1|C|1|1|1");assert(!vx_weapon_bridge_context().camera_known); // new mount cannot inherit an old camera capability
+    report("VXW1|J|1|1|0|68|78");assert(vx_weapon_bridge_context().camera_known && vx_weapon_bridge_context().vehicle_perspective==1);
+    report("VXW1|V|4");assert(vx_weapon_bridge_context().script_revision==4);
+
     // A root context records only its image-relative vtable. Fake entries are
     // deliberately non-functions: this read-only probe must never call them.
     struct segment_command_64 *segment = (void *)((char *)uuid + sizeof *uuid);

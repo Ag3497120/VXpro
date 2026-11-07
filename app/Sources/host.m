@@ -30,6 +30,8 @@
 #include <unistd.h>
 #include "xros_vr.h"
 #include "vxmac.h"
+#include "vxprof.h"
+#include "vxpipe.h"
 #include "interp_frame.h"
 #include "weapon_bridge.h"
 
@@ -137,6 +139,9 @@ static void parse_args(void) {
     // was killed for memory loading into the game, h11; with 4096 it ran at 6.55 GB, h10). -env overrides it)
     if (!strcmp(g_image, "Cyberpunk2077")) {
         setenv("VXMAC_GPU_WORKING_SET_MB", "4096", 0);
+        // Preserve the tested launch defaults in ordinary Home launches too; explicit 0 still overrides them.
+        setenv("VXMAC_FRAME_PIPELINE", "1", 0);
+        setenv("VXMAC_VEL_MEAN_PREFETCH", "1", 0);
         // (the presenter: the scene's depth from the game's main pass (no motion vectors: MetalFX temporal is not used),
         //  reversed infinite (REDengine), 0.2 m near; vr mode engages on depth, and the image check above hands back to
         //  the panel when the picture does not turn with the head)
@@ -194,6 +199,7 @@ static void snapshot(id<MTLCommandBuffer> cb, id<MTLTexture> t) {
 float vx_xros_vr_sent_yaw(void);
 float vx_xros_vr_sent_pitch(void);
 int vx_xros_vr_driving(void);
+int vx_xros_vr_vehicle_active(void);
 float vx_xros_vr_game_tan_x(void);
 void vx_xros_vr_follow_verdict(int follows, float gain, float sent_deg);
 void vx_xros_vr_add_camera_offset(float dyaw, float dpitch);
@@ -233,6 +239,13 @@ float vx_xros_vr_tan_y(void);
 void vx_xros_vr_seen_turn2(uint64_t pseq, float seen, float seen_y);
 void vx_xros_vr_cam_candidates(uint64_t pseq, const void *cands, int n);
 int vxmac_stick_active(void) { return stick_active(); }   // (h57b: for the presenter's yaw offset)
+int vxmac_move_active(void) {
+    for (GCController *c in GCController.controllers) {
+        GCExtendedGamepad *g=c.extendedGamepad;
+        if (g && (fabsf(g.leftThumbstick.xAxis.value)>.15f || fabsf(g.leftThumbstick.yAxis.value)>.15f)) return 1;
+    }
+    return 0;
+}
 // (h64: the player's combat input now - bit 1 aiming (a controller's left trigger, the mouse's right button), bit 2
 //  firing (the right trigger, the mouse's left button). The presenter's detectors hold still while it is down: ADS moves
 //  the game's camera to the sights and narrows its FOV, recoil and aim assist turn it - none of it is the head's)
@@ -428,11 +441,12 @@ static void watch_mouse(GCMouse *m) {
 // -[GCControllerAxisInput value] for the right sticks' y axes, and the handlers set on right sticks get y = 0.
 // VXMAC_STICK_PITCH=1: the stick's pitch kept.
 int vx_xros_vr_driving(void);
+int vx_xros_vr_vehicle_active(void);
 static NSHashTable *g_right_y, *g_right_pads, *g_vr_btns, *g_vr_axes, *g_vr_pads, *g_joy_triggers;
 static _Atomic unsigned long g_stick_y_zeroed;   // (reads of the right stick's y answered 0, for the stats)
 static int stick_pitch_blocked(void) {
     static int keep = -1; if (keep < 0) { const char *e = getenv("VXMAC_STICK_PITCH"); keep = e && !strcmp(e, "1"); }
-    return !keep && vx_xros_vr_driving();
+    return !keep && vx_xros_vr_driving() && !vx_xros_vr_vehicle_active();
 }
 static void note_controller(GCController *c) {
     GCExtendedGamepad *g = c.extendedGamepad;
@@ -469,7 +483,7 @@ static int vr_axes_blocked(void) {
     return block && vx_xros_vr_driving();
 }
 static BOOL blocked_btn(id b) {
-    if (vx_raw_button_depth) return NO;
+    if (vx_raw_button_depth || vx_xros_vr_vehicle_active()) return NO;
     static int joy_hold = -1;
     if (joy_hold < 0) { const char *e = getenv("VXMAC_JOY_HOLD"); joy_hold = e && !strcmp(e, "1"); }
     BOOL blocked; @synchronized (g_right_pads) {
@@ -624,6 +638,14 @@ static void warp_mode_poll_start(void) {
     });
     dispatch_resume(t);
 }
+static int manual_overlay_ready(NSString *directory) {
+    for (NSString *name in @[@"final.redscripts",@"inputUserMappings.xml",@"inputContexts.xml"]) {
+        struct stat st;
+        if(stat([directory stringByAppendingPathComponent:name].fileSystemRepresentation,&st) ||
+           !S_ISREG(st.st_mode) || st.st_size<=0) return 0;
+    }
+    return 1;
+}
 static void input_setup(void) {
     if (vx_xros_vr_bare_enabled()) {
         setenv("VXMAC_EJECT_MAG", "1", 1);
@@ -637,12 +659,16 @@ static void input_setup(void) {
     int requested = (eject && !strcmp(eject, "1")) ||
                     (manual && !strcmp(manual, "1") && mag && !strcmp(mag, "1"));
     int ready = requested && overlay && !strcmp(overlay, "1");
-    const char *files[] = { "final.redscripts", "inputUserMappings.xml", "inputContexts.xml" };
-    for (size_t i = 0; ready && i < sizeof files / sizeof files[0]; i++) {
-        char path[sizeof g_docs + 64];
-        snprintf(path, sizeof path, "%s/vxhands_manual/%s", g_docs, files[i]);
-        ready = access(path, R_OK) == 0;
-    }
+    // Keep a locally built app and its compiled overlay in the same signed
+    // installation. A Documents transfer may finish after an app auto-starts.
+    NSString *bundled=[NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"vxhands_manual"];
+    int bundled_ready=manual_overlay_ready(bundled);
+    NSString *directory=bundled_ready ? bundled : [@(g_docs) stringByAppendingPathComponent:@"vxhands_manual"];
+    ready=ready && manual_overlay_ready(directory);
+    if(ready) {
+        setenv("VXMAC_MANUAL_MAG_DIR",directory.fileSystemRepresentation,1);
+        jlog("manual_reload_source","\"source\":\"%s\"",bundled_ready ? "signed_app" : "documents");
+    } else unsetenv("VXMAC_MANUAL_MAG_DIR");
     setenv("VXMAC_MANUAL_MAG_ACTIVE", ready ? "1" : "0", 1);
     if (ready) setenv("VXMAC_MAG", "1", 1);
     if (requested && !ready) {
@@ -856,7 +882,7 @@ static void now_json(const char *vr, const char *mt, long thermal) {
       if (!once++) { mp = (void (*)(char *, unsigned))dlsym(RTLD_DEFAULT, "vxpipe_mem_stats"); mtr = (void (*)(char *, unsigned))dlsym(RTLD_DEFAULT, "vxsys_mtrace_stats"); }
       if (mp) mp(pm, sizeof pm);
       const char *e = getenv("VXMAC_MALLOC_TRACE"); if (mtr && e && atoi(e) > 0) mtr(tr, sizeof tr); }
-    char weapon_status[768];
+    char weapon_status[1024];
     vx_weapon_bridge_status_json(weapon_status, sizeof weapon_status);
     char pose_copy[320] = "\"pose_copy\":null";
     { static void (*stats)(char *, unsigned); static int once;
@@ -881,7 +907,7 @@ static void now_json(const char *vr, const char *mt, long thermal) {
     if (w == n) rename(tmp, path);
 }
 static void stats_tick(void) {
-    char vr[1400] = "", mt[900] = "", fx[300] = "", unk[1200] = "", npu[3600] = "";
+    char vr[2048] = "", mt[1100] = "", fx[300] = "", unk[1200] = "", npu[3600] = "";
     vxmac_npu_stats(npu, sizeof npu);
     { void vxmac_fsr_stats(char *, unsigned); char fs[400]; vxmac_fsr_stats(fs, sizeof fs);
       size_t l = strlen(npu); snprintf(npu + l, sizeof npu - l, ",%s", fs); }
@@ -1046,5 +1072,7 @@ __attribute__((constructor)) static void host_init(void) {
     vxmac_set_log_sink(shim_line);
     vx_host_jlog = vxmac_jlog;
     parse_args();
+    vxprof_configure_startup();
+    vxpipe_configure_startup();
     jlog("host_init", "\"docs\":\"%s\"", g_docs);
 }

@@ -1,4 +1,5 @@
 #include "../vr/hand_weapon.h"
+#include "../vr/weapon_contact.h"
 // vrik.inc: V's arms driven by the player's own hands (included by vxpipe.m) - the native counterpart of Cyberpunk
 // Universal Hands VR (RED4ext + CET, Windows only), done where visionOS lets us: the bones the GPU skins with.
 //
@@ -303,6 +304,11 @@ typedef struct {
     int support_valid, bore_sign;
     vrik_pose_memory drawn;
     vrik_mag_drop shell_drop;
+    aff slide_rest; unsigned slide_epoch; int slide_valid;
+    int slide_pending;
+    float slide_shown, slide_release_from;
+    double slide_release_at;
+
 } vrik_item_grip;
 typedef struct {
     uint8_t *P;
@@ -587,6 +593,11 @@ static struct {
     float slide_pull;
     vrik_grip_pose slide_hand;
     int slide_active;
+    vrik_grip_pose contact_hand;
+    int contact_active, contact_previous_valid;
+    float contact_previous[3];
+    unsigned contact_epoch;
+
     unsigned call_seq;
     vrik_known_bone known[192];
     int nknown;
@@ -662,7 +673,7 @@ static void vrik_publish_right_grip(void);
 
 static void vrik_held_begin_frame(aff camera) {
     g_vk.held.owner = -1;
-    g_vk.slide_active = 0;
+    g_vk.slide_active = g_vk.contact_active = 0;
     g_vk.held.right_grip_valid = 0;
     g_vk.held.at = CACurrentMediaTime();
     g_vk.held.wrists = 0;
@@ -727,6 +738,29 @@ static void vrik_held_begin_frame(aff camera) {
             p->at[i] -= .035f * p->fwd[i];
         }
     }
+    // Contact affects only the free visual wrist. Raw tracking remains the
+    // input to racking, and the accepted two-hand target retains ownership.
+    if ((wrists & 1u) && !g_vk.slide_active && g_vk.weap[4]<.5f && g_vk.weap[7]<.5f &&
+        g_vk.bore_at>0 && g_vk.held.at-g_vk.bore_at<.16 && g_vk.held.owner==1) {
+        aff room=g_vk.held.room_from_view;
+        float f[3],u[3],r[3],palm[3],local[3],last[3],clamped[3];
+        memcpy(f,g_vk.bore_room,12);memcpy(u,g_vk.bore_room+3,12);
+        v3norm(f);v3norm(u);v3cross(f,u,r);v3norm(r);v3cross(r,f,u);
+        const float *hand=g_vk.held.hands[0];
+        float view_palm[3]={hand[0]+.035f*hand[3],hand[1]+.035f*hand[4],-hand[2]-.035f*hand[5]};
+        aff_pt(room.m,view_palm,palm);
+        float rel[3],prior[3];for(int i=0;i<3;i++) { rel[i]=palm[i]-g_vk.bore_room[6+i];prior[i]=g_vk.contact_previous[i]-g_vk.bore_room[6+i]; }
+        local[0]=v3dot(rel,f);local[1]=v3dot(rel,r);local[2]=v3dot(rel,u);
+        last[0]=v3dot(prior,f);last[1]=v3dot(prior,r);last[2]=v3dot(prior,u);
+        float lo[3]={-.015f,-.06f,-.005f},hi[3]={fmaxf(.14f,fminf(.45f,g_vk.bore_room[9]+.06f)),.06f,.105f};
+        int previous=g_vk.contact_previous_valid && g_vk.contact_epoch==epoch;
+        g_vk.contact_active=vx_weapon_box_contact(previous?last:NULL,local,lo,hi,clamped);
+        for(int i=0;i<3;i++) palm[i]=g_vk.bore_room[6+i]+clamped[0]*f[i]+clamped[1]*r[i]+clamped[2]*u[i];
+        memcpy(g_vk.contact_previous,palm,sizeof palm);g_vk.contact_epoch=epoch;g_vk.contact_previous_valid=1;
+        vrik_grip_pose *p=&g_vk.contact_hand;
+        aff_pt(aff_inv(room).m,palm,p->at);
+        for(int i=0;i<3;i++) { float z=i==2?-1.f:1.f;p->fwd[i]=z*hand[3+i];p->up[i]=-z*hand[6+i];p->at[i]-=.035f*p->fwd[i]; }
+    } else g_vk.contact_previous_valid=0;
     if (!(wrists & (1u << side))) {
         if (side == 1) vrik_publish_right_grip();
         return;
@@ -1053,8 +1087,9 @@ static void vrik_solve_all(void) {
         for (int side = 0; side < 2; side++) {
             if (ok[side]) {
                 float rx = hf[side][0], ry = hf[side][1], rz = -hf[side][2];
-                if (side == 0 && g_vk.slide_active) {
-                    rx = g_vk.slide_hand.at[0]; ry = g_vk.slide_hand.at[1]; rz = g_vk.slide_hand.at[2];
+                if (side == 0 && (g_vk.slide_active || g_vk.contact_active)) {
+                    const vrik_grip_pose *contact=g_vk.slide_active?&g_vk.slide_hand:&g_vk.contact_hand;
+                    rx=contact->at[0];ry=contact->at[1];rz=contact->at[2];
                 }
                 float rf[3] = { hf[side][3], hf[side][4], -hf[side][5] };
                 float ra[3] = { hf[side][6], hf[side][7], -hf[side][8] };
@@ -2201,7 +2236,7 @@ static void vrik_note_reload_targets(const vrik_pal *pal, aff item_view, aff del
     if (g_vk.reload_frame == pal->frame && g_vk.reload_priority > 1) return;
     g_vk.reload_frame = pal->frame; g_vk.reload_priority = 1;
     aff posed = aff_mul(g_vk.held.room_from_view, aff_mul(item_view, delta));
-    aff_pt(aff_mul(posed, pal->orig[0]).m, vrik_ammo_center(pal), g_vk.well_room);
+    aff_pt(aff_mul(posed, pal->orig[pal->asset ? pal->asset->root : 0]).m, vrik_ammo_center(pal), g_vk.well_room);
     g_vk.reload_mesh = pal->magazine ? pal->magazine : VRIK_CATALOG_AMMO;
     g_vk.reload_owner = owner;
     g_vk.reload_at = g_vk.held.at;
@@ -2219,6 +2254,48 @@ static int vrik_mag_state(double *started, unsigned *ejection) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ if (!vrik_mag_query) vrik_mag_query=dlsym(RTLD_DEFAULT,"vx_xros_vr_manual_mag_frame"); });
     return vrik_mag_query && g_vk.held.owner >= 0 ? vrik_mag_query(started,ejection) : -1;
+}
+
+static aff vrik_manual_slide(const vrik_pal *pal, vrik_item_grip *item, unsigned index) {
+    int pistol=(pal->asset && (pal->asset->kind&8) && pal->asset->slide==(int)index) ||
+               (pal->receiver==VRIK_RECEIVER+2 && index==vrik_receivers[2].slide);
+    aff bone=pal->orig[index];
+    if (!pistol || !item) return bone;
+    unsigned root=pal->asset ? pal->asset->root : 0;
+    if (root>=pal->nb) return bone;
+    double started=0;unsigned ejection=0;int state=vrik_mag_state(&started,&ejection);
+    if(item->slide_epoch!=g_vk.held.epoch) {
+        item->slide_valid=item->slide_pending=0;
+        item->slide_shown=item->slide_release_from=0;item->slide_release_at=0;
+    }
+    int pending=state==HW_EMPTY || state==HW_HOLD_NEW || state==HW_IN_NO_ROUND;
+    if(!item->slide_valid && (state==HW_LOADED || pending) && g_vk.slide_pull<=0) {
+        item->slide_rest=aff_mul(aff_inv(pal->orig[root]),bone);
+        item->slide_epoch=g_vk.held.epoch;item->slide_valid=1;
+    }
+    if(!item->slide_valid) return bone;
+    float pull=fmaxf(0,g_vk.slide_pull);
+    if(pending) {
+        // Inserting ammunition is not a slide-release operation. The open
+        // position remains latched until the physical pull chambers the round.
+        pull=.035f+fminf(.045f,pull);
+        item->slide_pending=1;item->slide_release_at=0;
+    } else if(state==HW_LOADED && item->slide_pending) {
+        item->slide_pending=0;item->slide_release_at=g_vk.held.at;
+        item->slide_release_from=item->slide_shown;
+    }
+    if(item->slide_release_at) {
+        float t=fminf(1.f,fmaxf(0,(float)(g_vk.held.at-item->slide_release_at)/.10f));
+        pull=fmaxf(pull,item->slide_release_from*(1-t));
+        if(t>=1) item->slide_release_at=0;
+    }
+    item->slide_shown=pull;
+    if(pending || pull>0 || item->slide_release_at) {
+        bone=aff_mul(pal->orig[root],item->slide_rest);
+        float shift[3];aff_dir(pal->orig[root].m,(float[3]){0,-pull,0},shift);
+        for(int i=0;i<3;i++) bone.m[4*i+3]+=shift[i];
+    }
+    return bone;
 }
 
 static aff vrik_cylinder_pose(const vrik_pal *pal, aff bone, unsigned index) {
@@ -2280,12 +2357,13 @@ static aff vrik_magazine_pose(const vrik_pal *pal, vrik_item_grip *item, aff bon
             g_vk.held_mag.mesh = pal->magazine;
         }
         aff carried = aff_mul(palm_view, g_vk.held_mag.from_palm);
-        float approach = fmaxf(0.f, fminf(1.f, (.16f - vrik_distance(mount, palm.at)) / .09f));
-        // Guide rotation into the well while keeping the centre in the hand until seating.
+        float approach=fmaxf(0.f,fminf(1.f,(HW_MAG_GUIDE_RADIUS-vrik_distance(mount,palm.at))/(HW_MAG_GUIDE_RADIUS-HW_MAG_CAPTURE_RADIUS)));
+        // The same capture radius as the input state machine; guide both the
+        // centre and orientation rather than rotating a remote magazine.
         aff guided = vrik_blend_pose(carried, mounted, aff_id(), approach);
         float current[3];
         aff_pt(guided.m, center, current);
-        for (int i = 0; i < 3; i++) guided.m[i * 4 + 3] += palm.at[i] - current[i];
+        for (int i = 0; i < 3; i++) guided.m[i * 4 + 3] += palm.at[i]+approach*(mount[i]-palm.at[i])-current[i];
         return aff_mul(aff_inv(item_view),aff_mul(guided,relative));
     }
     // Each Satara shell has its own draw and bone even though the index
@@ -2505,11 +2583,11 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
         const aff *support_source=left_wrist>=0 ? &pal->orig[left_wrist] :
                                   g_vk.have_h[0] ? &g_vk.SH[0] : NULL;
         int place_support = 0;
-        if (target_valid && held_owner == 1 && support_source && g_vk.slide_active) {
+        if (target_valid && held_owner == 1 && support_source && (g_vk.slide_active || g_vk.contact_active)) {
             vrik_grip_pose native;
             if (vrik_wrist_frame_from(0, *support_source, native.at, native.fwd, native.up)) {
                 aff arm_from_view = aff_mul(arm_from_room, g_vk.held.room_from_view);
-                vrik_grip_pose snapped = vrik_grip_in(arm_from_view, &g_vk.slide_hand);
+                vrik_grip_pose snapped = vrik_grip_in(arm_from_view, g_vk.slide_active?&g_vk.slide_hand:&g_vk.contact_hand);
                 support_target=snapped;
                 support_delta = vrik_retarget_grip(native.at, native.fwd, native.up,
                                                    snapped.at, snapped.fwd, snapped.up);
@@ -2532,7 +2610,7 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
         int connected_support=place_support && vrik_support_arm(pal,support_source,&support_target,support_chain);
         pal->support_connected=connected_support;
         aff support_from_hand = aff_id(), supported_hand = aff_id();
-        int keep_support_pose = place_support && left_wrist>=0 && g_vk.support_pose.locked && !g_vk.slide_active;
+        int keep_support_pose = place_support && left_wrist>=0 && g_vk.support_pose.locked && !g_vk.slide_active && !g_vk.contact_active;
         if (keep_support_pose) {
             vrik_grip_pose wrist;
             keep_support_pose = vrik_wrist_frame_from(0, pal->orig[left_wrist], wrist.at, wrist.fwd, wrist.up);
@@ -2821,14 +2899,14 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
             slide = (int)receiver->slide;
             int key = pal->receiver == VRIK_RECEIVER + 1 ? VRIK_RECEIVER : pal->receiver;
             aff room_from_item = aff_mul(g_vk.held.room_from_view, aff_mul(o2v, delta));
-            vrik_note_rack(aff_mul(room_from_item, pal->orig[slide]), receiver->joint, key);
+            vrik_note_rack(aff_mul(room_from_item, vrik_manual_slide(pal,item,slide)), receiver->joint, key);
         }
     }
     if (pal->asset && held_owner >= 0 && live_item) {
         const vrik_asset_profile *asset=pal->asset;
         aff room_item=aff_mul(g_vk.held.room_from_view,aff_mul(o2v,delta));
         if (asset->slide>=0 && asset->slide<bones) {
-            vrik_note_rack(aff_mul(room_item,pal->orig[asset->slide]),asset->slide_at,VRIK_ASSET_BASE+asset->asset);
+            vrik_note_rack(aff_mul(room_item,vrik_manual_slide(pal,item,asset->slide)),asset->slide_at,VRIK_ASSET_BASE+asset->asset);
             g_vk.rack_auto=!(asset->kind&8);
         }
         if (asset->cylinder>=0 && asset->cylinder<bones) {
@@ -2840,15 +2918,8 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
     }
     for (uint32_t k = 0; k < bones; k++) {
         aff *dst = (aff *)(pal->P + (size_t)k * 48);
-        aff native = vrik_cylinder_pose(pal,pal->orig[k],k);
+        aff native = vrik_cylinder_pose(pal,vrik_manual_slide(pal,item,k),k);
         aff bone = aff_mul(delta, native);
-        if (pal->asset && pal->asset->slide == (int)k && (pal->asset->kind&8) && g_vk.slide_pull>0) {
-            float pull[3];aff_dir(aff_mul(delta,pal->orig[pal->asset->root]).m,(float[3]){0,-g_vk.slide_pull,0},pull);
-            for(int i=0;i<3;i++)bone.m[4*i+3]+=pull[i];
-        }
-        if ((int)k == slide && pal->receiver == VRIK_RECEIVER + 2 && g_vk.slide_pull > 0) {
-            for (int i = 0; i < 3; i++) bone.m[i*4+3] -= delta.m[i*4+1] * g_vk.slide_pull;
-        }
         int ammunition=pal->magazine || (pal->asset && (pal->asset->ammo & (UINT64_C(1)<<k)));
         *dst = ammunition ? vrik_magazine_pose(pal, item, bone,k) : bone;
     }

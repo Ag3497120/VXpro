@@ -14,6 +14,7 @@ options:
 settings:
   base:
     CODE_SIGN_STYLE: Automatic
+    GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) VXFP_SLOTS=4"
     XROS_DEPLOYMENT_TARGET: "26.0"
     TARGETED_DEVICE_FAMILY: "7"
     SUPPORTED_PLATFORMS: "xros xrsimulator"
@@ -28,6 +29,7 @@ targets:
       - path: Assets.xcassets
       - path: ../vr/xros_vr.m
       - path: ../vr/warp_core.m
+      - path: ../vr/frame_pipeline.c
       - path: ../vr/hand_gestures.c
       - path: ../vr/hand_weapon.c
       - path: ../vr/vxmac_vr_glue.m

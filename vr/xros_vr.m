@@ -62,6 +62,10 @@
 #include "npu_interp.h"
 #include "hand_gestures.h"
 #include "hand_weapon.h"
+#include "frame_pipeline.h"
+#include "room_view.h"
+#include "view_stability.h"
+#include <stdatomic.h>
 
 void vx_log(const char *fmt, ...);
 void vx_xros_pace_tick(void);
@@ -87,7 +91,18 @@ static float envf(const char *n, float d) { const char *e = getenv(n); return e 
 static struct { float tan_y, nearp, farp, scale, real_hz, max_hz, screen_m, screen_deg; int depth_std, predict, depth_out, screen, vr; float cpd, cpd_y;
                 float engage_s, scroll_cm; int engage, hand, hand_shoulder, calibrate, dibr, predict_vr; float stereo; } C;
 static float g_tan_x_h;   // (VX Mac, h31: the game's horizontal tangent (VXRT_VR_TAN_X): the frame's vertical one from its aspect)
+static vxfp_pipeline g_pipeline;
+static int g_pipeline_on;
+static vxfp_ticket g_frame_ticket = { .slot = -1 };
 static void config_once(void) {
+    const char *pipeline = getenv("VXMAC_FRAME_PIPELINE");
+    g_pipeline_on = pipeline && !strcmp(pipeline, "1");
+    // Hands, weapon and background still share the captured image. Until a real
+    // foreground split exists, never introduce intentional buffering here.
+    if (g_pipeline_on) {
+        vxfp_init(&g_pipeline, 0, .080);
+        vx_log("VR: bounded frame ownership on; existing three images, intentional delay 0 ms");
+    }
     C.tan_y = envf("VXRT_VR_TAN_Y", 0.7f);
     {   const char *l = getenv("VXMAC_FOV_LOCK"); g_tan_x_h = l && !strcmp(l, "v") ? 0 : envf("VXRT_VR_TAN_X", 0); }
     C.nearp = envf("VXRT_VR_NEAR", 0.1f);
@@ -140,7 +155,7 @@ static void config(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthre
 // ---- slots ----
 typedef struct {
     __strong id<MTLTexture> color, view, depth, mv, prev, prev_view;   // (prev: the frame before, for the HUD's still check)   // (view: the colour as the warp samples it, sRGB-decoded for 8-bit unorm)
-    uint32_t w, h, has_depth, has_mv, has_proj, flags;
+    uint32_t w, h, has_depth, has_mv, has_proj, flags, has_prev_image;
     __strong id<MTLBuffer> sdp_tmp;
     __strong id<MTLBuffer> cal_buf; uint32_t cal_n, cal_bpp;   // (the motion vectors' middle strip, for calibration)
     float tan_x, tan_y, z_a, z_b, mv_sx, mv_sy;
@@ -157,7 +172,7 @@ typedef struct {
     int writing, readers;
     float cam_rows[9], cam_vel[3]; int cam_ok;   // (VX Mac, h60: the game camera's axes (rows: right, up, forward; Z up) and velocity at this frame)
 } vr_slot;
-static vr_slot g_slot[3];
+static vr_slot g_slot[VXFP_SLOTS];
 static int g_newest = -1, g_held = -1;
 static uint64_t g_serial;
 static _Atomic uint64_t g_present_seq;
@@ -213,6 +228,7 @@ static void show_label(const char *text);
 static double g_max_gap; static unsigned g_dibr_frames;
 static float g_outside_sum, g_game_tan[2]; static unsigned g_outside_n;
 static unsigned g_frames, g_submits, g_draws, g_noframe, g_depth_frames, g_mv_frames;
+static uint64_t g_history_copies, g_history_skips; // Completed captures; protected by g_lock.
 static double g_gpu_ms, g_age_ms; static unsigned g_gpu_n;
 // (VX Mac, method 3: the warp's use of the model's layers - eyes asked / predicted with them, distinct frames, the
 //  predicted time (age) and t, eyes held at the gate, the compositor frames' GPU time with and without the layers;
@@ -359,24 +375,27 @@ static void inv_rigid(const float *a, float *o) {        // (rotation + translat
 // ---- vr mode: the head's yaw and pitch as mouse moves; the pose sent so far is the game camera's ----
 void vx_raw_mouse(int dx, int dy, uint16_t button_flags, int16_t wheel);   // (src/user32.c: WM_INPUT and the deltas)
 static float g_yaw_ref, g_pitch_ref, g_sent_yaw, g_sent_pitch; static int g_vr_ref, g_mouse_counts; static unsigned g_fsr2_frames;
-typedef struct { double t; float yaw, pitch; } sent_pose;
+typedef struct { double t; float yaw, pitch; double issued[2]; } sent_pose;
 static sent_pose g_sent_hist[256]; static unsigned g_sent_n;
+static double g_mouse_issued[2]; // actual raw deltas; never rebased with the logical head angle
+static unsigned g_ref_gen;
 // (VX Mac, h28: the frame's camera by what the game had taken. Each send is one mouse event; libvxkit counts the head's
 //  events the program has taken from its queue (vxkit_head_consumed). A game frame's camera is the pose of the last
 //  send it had taken - K presents before it (the game's pipeline: it simulates one frame while it renders another).
 //  K is chosen from the picture: per pair of frames the image check's measured turn (host.m) against each K's camera
 //  turn, the smallest error over ~3 s wins (VXMAC_CAM_K=n fixes it). The time-based stamp (sent by now - input lag)
 //  made the picture snap back at each new game frame when frames came unevenly (h28's judder: +48 / -40 px).)
-typedef struct { unsigned long seq; float yaw, pitch; } send_rec;
+typedef struct { unsigned long seq; float yaw, pitch; double issued[2]; unsigned generation; } send_rec;
 static send_rec g_sendq[1024]; static unsigned long g_send_seq;
 static unsigned long g_cons[64]; static float g_yk[64][4][2]; static unsigned char g_yk_ok[64][4];
+static double g_yk_issued[64][4][2];
 static int g_cam_k = 1, g_cam_k_fixed = -1; static double g_k_err[4]; static unsigned g_k_n;
 unsigned long vx_head_consumed(void);   // (vxmac_vr_glue.m: libvxkit's count)
-static int sent_by_seq(unsigned long c, float *yaw, float *pitch) {   // (with g_lock held)
+static int sent_by_seq(unsigned long c, float *yaw, float *pitch, double issued[2]) {   // (with g_lock held)
     if (!c || c > g_send_seq || g_send_seq - c >= 1024) return 0;
     const send_rec *r = &g_sendq[c % 1024];
-    if (r->seq != c) return 0;
-    *yaw = r->yaw; *pitch = r->pitch; return 1;
+    if (r->seq != c || r->generation != g_ref_gen) return 0;
+    *yaw = r->yaw; *pitch = r->pitch; memcpy(issued,r->issued,sizeof r->issued); return 1;
 }
 static double g_input_lag_s = 0.044;                     // (the game's input latency: VXRT_VR_INPUT_LAG s, else measured)
 static float wrap180(float a) { while (a > 180) a -= 360; while (a < -180) a += 360; return a; }
@@ -436,8 +455,19 @@ void vx_xros_vr_sensitivity(float factor) {
     char t[64]; snprintf(t, sizeof t, "Sensitivity %.1f counts/deg", C.cpd); show_label(t);
 }
 static double g_move_sum; static unsigned g_move_n;   // (h60: the translation applied, for the log)
-static unsigned g_ref_gen; static unsigned long g_cam_skips, g_yaw_clamps, g_pitch_clamps; static int g_pitch_follows = 1;
-static int g_vehicle; static float g_game_hfov;
+static unsigned long g_cam_skips, g_yaw_clamps, g_pitch_clamps; static int g_pitch_follows = 1;
+static int g_vehicle, g_scripted_scene, g_context_known;
+static int g_vehicle_view_ready;
+static vx_view_context g_view_context;
+static int g_menu_known, g_menu_open, g_play_world_seen;
+static _Atomic int g_scene_world;
+static double g_native_camera_at;
+static double g_camera_stick_until;
+static double g_alignment_sum[2]; static float g_alignment_max[2]; static unsigned g_alignment_n;
+static _Atomic int g_native_vehicle;
+static vx_room_view g_room_view;
+int vx_xros_vr_vehicle_active(void) { return atomic_load(&g_native_vehicle); }
+static float g_game_hfov;
 // (h64: combat input and the game's FOV changing hold the detectors still. A run with fights (hab1 d.jsonl, 1800 s)
 //  had 162 vehicle_mode flips at the on-foot FOV (strafing while turning reads as an orbit: |v / w| metres), 89 pitch
 //  axis_freeze "camera moves itself" (recoil, aim snap, ADS's zoom read as a shift), pitch_follow flipping with them -
@@ -548,6 +578,8 @@ static int warp_start_mode(void) {   // (VXMAC_WARP_MODE 0-6, default 6; h64: 7 
 }
 static void vr_mouse(const float *m, double now, int send) {        // (with g_lock held)
     float yaw, pitch; head_angles(m, &yaw, &pitch);
+    int vxmac_stick_active(void);
+    if(vxmac_stick_active()) g_camera_stick_until=now+.5;
     if (g_rebase_due) { g_rebase_due = 0; pitch_rebase(); }   // (h64: after vehicle mode, here: no present half-way)
     if (!g_vr_ref || g_recenter) {
         { const char *e = getenv("VXMAC_PITCH_LIMIT"); if (e && *e) { g_pitch_hi = (float)atof(e); g_pitch_lo = -g_pitch_hi; } else if (!pitch_learn_old()) { g_pitch_hi = 80; g_pitch_lo = -80; } }
@@ -561,8 +593,12 @@ static void vr_mouse(const float *m, double now, int send) {        // (with g_l
         vx_log("VR: vr mode's zero: yaw %.1f (the game's camera is taken as level there)", yaw);
     }
     float want_y = wrap180(yaw - g_yaw_ref), want_p = pitch - g_pitch_ref;
-    if (g_vehicle) { g_pitch_ref += want_p - g_sent_pitch; want_p = g_sent_pitch; }   // (h57e: on a vehicle no head pitch is sent: the vehicle camera keeps its own)
-    if (now < g_ignore_until) {   // (h54: the game ignores the head and VR stays: the head's moves go into the zero, nothing sent)
+    if (g_scene_world && !g_look_hold) send=0; // constrained camera: reproject, never queue ignored mouse turns
+    // A freely controlled vehicle camera can take the same pitch input as a
+    // stick now that reprojection uses its actual captured rotation.
+    int vehicle_look=g_scene_world && g_vehicle_view_ready && g_look_hold && vx_view_native_camera(now,g_native_camera_at);
+    if (g_vehicle && !vehicle_look) { g_pitch_ref += want_p - g_sent_pitch; want_p = g_sent_pitch; }
+    if (now < g_ignore_until && !g_scene_world) {
         g_yaw_ref = wrap180(g_yaw_ref + wrap180(want_y - g_sent_yaw)); g_pitch_ref += want_p - g_sent_pitch;
         want_y = g_sent_yaw; want_p = g_sent_pitch;
     }
@@ -600,22 +636,27 @@ static void vr_mouse(const float *m, double now, int send) {        // (with g_l
     //  sent pitch goes on (vx_xros_vr_seen_turn2): never sent beyond them, so the game's pitch and the head's stay one)
     if (want_p > g_pitch_hi) want_p = g_pitch_hi; if (want_p < g_pitch_lo) want_p = g_pitch_lo;
     float dy = wrap180(want_y - g_sent_yaw), dp = want_p - g_sent_pitch;
-    if (now < g_freeze_until[0]) dy = 0;                  // (h48: an axis the game ignores now is not sent - nothing piles up)
-    if (now < g_freeze_until[1]) dp = 0;
+    if (!vx_view_native_camera(now,g_native_camera_at)) {
+        if (now < g_freeze_until[0]) dy=0;
+        if (now < g_freeze_until[1]) dp=0;
+    }
     int cx = (int)lroundf(-dy * C.cpd), cy = (int)lroundf(-dp * C.cpd_y);   // (left turn: mouse left; head up: mouse up)
     if (send && (cx || cy)) {
         g_sent_yaw = wrap180(g_sent_yaw - cx / C.cpd); g_sent_pitch -= cy / C.cpd_y;
+        g_mouse_issued[0]-=cx/C.cpd; g_mouse_issued[1]-=cy/C.cpd_y;
         vx_raw_mouse(cx, cy, 0, 0);
         g_mouse_counts += abs(cx) + abs(cy);
-        unsigned long q = ++g_send_seq; g_sendq[q % 1024] = (send_rec){ q, g_sent_yaw, g_sent_pitch };
+        unsigned long q = ++g_send_seq;
+        g_sendq[q % 1024] = (send_rec){q,g_sent_yaw,g_sent_pitch,{g_mouse_issued[0],g_mouse_issued[1]},g_ref_gen};
     }
-    g_sent_hist[g_sent_n++ % 256] = (sent_pose){ now, g_sent_yaw, g_sent_pitch };
+    g_sent_hist[g_sent_n++ % 256] = (sent_pose){now,g_sent_yaw,g_sent_pitch,{g_mouse_issued[0],g_mouse_issued[1]}};
 }
-static int sent_at(double t, float *yaw, float *pitch) {   // (the pose sent by time t; with g_lock held)
+static int sent_at(double t, float *yaw, float *pitch, double issued[2]) {   // (the pose sent by time t; with g_lock held)
     int got = 0;
     for (unsigned k = 0; k < 256 && k < g_sent_n; k++) {
         const sent_pose *e = &g_sent_hist[(g_sent_n - 1 - k) % 256];
         *yaw = e->yaw; *pitch = e->pitch; got = 1;
+        if(issued) memcpy(issued,e->issued,sizeof e->issued);
         if (e->t <= t) break;
     }
     return got;
@@ -673,6 +714,7 @@ static void set_auto_screen(int on) {
     vx_log("VR: automatic screen for cutscenes %s (remembered)", on ? "on" : "off");
 }
 static void nocontrol(double t, double for_s) {   // (the game does not follow the head: the panel, or with it off the hold)
+    if (g_scene_world) { g_nocontrol_until=g_ignore_until=0; return; }
     if (auto_screen()) g_nocontrol_until = t + for_s;
     else { g_ignore_until = t + 4; if (vx_host_jlog) vx_host_jlog("ignore_hold", "\"s\":4"); }
 }
@@ -778,7 +820,7 @@ void vx_xros_vr_seen_turn2(uint64_t pseq, float seen, float seen_y) {
             float y = g_stamp_y[(pseq - 1) % 64] + seen, pc = g_stamp_p[(pseq - 1) % 64] + seen_y;
             y += 0.05f * wrap180(g_stamp_cons_y[pseq % 64] - y);
             g_stamp_y[pseq % 64] = y; g_stamp_p[pseq % 64] = pc;
-            for (int k = 0; k < 3; k++) if (g_slot[k].pseq == pseq && g_slot[k].head_valid)
+            for (int k = 0; k < VXFP_SLOTS; k++) if (g_slot[k].pseq == pseq && g_slot[k].head_valid)
                 camera_pose(g_yaw_ref + y + g_cam_off_yaw, g_pitch_ref + pc + g_cam_off_pitch, g_slot[k].head, g_slot[k].head);
         }
         {   // (h37: step traces - after a turn stops (5 frames over 0.8 deg a frame, then one under 0.15), the next 12 frames'
@@ -808,7 +850,9 @@ void vx_xros_vr_seen_turn2(uint64_t pseq, float seen, float seen_y) {
             memmove(hist + 1, hist, 5 * sizeof *hist); hist[0] = d;
         }
     }
-    if (pseq >= 6 && g_yk_ok[pseq % 64][1] && g_yk_ok[(pseq - 1) % 64][1]) {
+    int native_camera=vx_view_native_camera(CACurrentMediaTime(),g_native_camera_at);
+    if (native_camera) g_freeze_until[0]=g_freeze_until[1]=0;
+    if (!native_camera && pseq >= 6 && g_yk_ok[pseq % 64][1] && g_yk_ok[(pseq - 1) % 64][1]) {
         // (h48: per axis, at any angle - the response collapsing (sent > 0.5 deg a frame, the picture under 15 % of it, 6
         //  frames: a dialogue's look cone, a clamp) or the picture moving on its own (over 1 deg a frame with under 0.2
         //  sent, 6 frames: a cutscene's camera): that axis is not sent for 1 s and the last 6 frames' sent turn taken back,
@@ -937,7 +981,7 @@ static void calibrate_frame(vr_slot *S, double t) {
     int ok = 1;
     for (unsigned l = 0; l < NLAGS && ok; l++) {
         float y1 = 0, y0 = 0, p1 = 0, p0 = 0;
-        ok = sent_at(t - kLags[l], &y1, &p1) && sent_at(prev - kLags[l], &y0, &p0);
+        ok = sent_at(t - kLags[l], &y1, &p1,NULL) && sent_at(prev - kLags[l], &y0, &p0,NULL);
         sy[l] = wrap180(y1 - y0); sp[l] = p1 - p0;
     }
     pthread_mutex_unlock(&g_lock);
@@ -1026,7 +1070,7 @@ static void floor_fit(id<MTLCommandBuffer> cb, vr_slot *S, uint64_t pseq) {
         // Near-eye weapons and arms can be mistaken for a floor and repeatedly tilt the view.
         g_floor_on = e ? strcmp(e, "0") != 0 : !(joy && !strcmp(joy, "1"));
     }
-    if (!g_floor_on || !vr_now() || !S->has_depth || !S->depth || pseq % 6) return;
+    if (!g_floor_on || g_vehicle || g_scripted_scene || !vr_now() || !S->has_depth || !S->depth || pseq % 6) return;
     if (!g_floor_pso) {
         NSError *err = nil;
         id<MTLLibrary> lib = [cb.device newLibraryWithSource:kFloorSrc options:nil error:&err];
@@ -1099,6 +1143,14 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     id<MTLDevice> dev = cb.device;
     config();
     double now = CACurrentMediaTime();
+    uint64_t vxmtl_game_camera(float[16]);
+    float frame_camera[16],frame_tx=0,frame_ty=0;int camera_matched=0;
+    static uint64_t (*buffer_camera)(void *,float[16],float *,float *,int *);
+    static dispatch_once_t camera_api_once;
+    dispatch_once(&camera_api_once,^{buffer_camera=dlsym(RTLD_DEFAULT,"vxmtl_game_camera_for_buffer");});
+    uint64_t frame_camera_seq;
+    if(buffer_camera)frame_camera_seq=buffer_camera(cbp,frame_camera,&frame_tx,&frame_ty,&camera_matched);
+    else {int vxmtl_game_tan(float *,float *);frame_camera_seq=vxmtl_game_camera(frame_camera);vxmtl_game_tan(&frame_tx,&frame_ty);}
     pthread_mutex_lock(&g_lock);
     if (g_last_submit > 0 && now - g_last_submit > g_max_gap) g_max_gap = now - g_last_submit;
     if (g_last_submit > 0) { double d = now - g_last_submit; if (d > 0 && d < 0.5) g_interval = g_interval * 0.8 + d * 0.2;
@@ -1113,9 +1165,9 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     g_back_w = w; g_back_h = h;
     {   // (VX Mac, h56: the game's own projection when libvxmtl reads it - the FOV it really renders with (2.5.0 reset it to
         //  80 under the settings' 110: stretched turns); the settings' value only until then. VXMAC_GAME_TAN=0: off)
-        int vxmtl_game_tan(float *tx, float *ty); float tx, ty; static int on = -1;
+        float tx=frame_tx,ty=frame_ty;static int on = -1;
         if (on < 0) { const char *e = getenv("VXMAC_GAME_TAN"); on = !(e && !strcmp(e, "0")); }
-        if (on && vxmtl_game_tan(&tx, &ty) && tx > 0.1f && ty > 0.1f) {
+        if (on && frame_camera_seq && tx > 0.1f && ty > 0.1f) {
             g_tan_x_h = tx; if (w && h) C.tan_y = ty;
             float hf = 2 * atanf(tx) * 180 / (float)M_PI;
             if (g_game_hfov > 0 && fabsf(hf - g_game_hfov) > 0.5f) g_fov_change_t = now;   // (h64: ADS's zoom, a vehicle's camera)
@@ -1124,11 +1176,24 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
         else if (g_tan_x_h > 0 && w && h) C.tan_y = g_tan_x_h * (float)h / (float)w;   // (VX Mac, h31: the horizontal FOV kept at any aspect)
     }
     uint64_t pseq = ++g_present_seq;
+    {   // A later encoded frame must not change this frame's pose or lens.
+        static unsigned samples,matched;static float max_delta;static double log_at;
+        samples++;matched+=camera_matched;
+        float latest[16];uint64_t q=vxmtl_game_camera(latest);
+        if(q && frame_camera_seq) {
+            float trace=0;for(int r=0;r<3;r++)for(int c=0;c<3;c++)trace+=latest[4*r+c]*frame_camera[4*r+c];
+            float degrees=acosf(fmaxf(-1,fminf(1,(trace-1)*.5f)))*57.29578f;max_delta=fmaxf(max_delta,degrees);
+        }
+        if(now-log_at>5 && vx_host_jlog) {char f[240];snprintf(f,sizeof f,"\"buffer_api\":%d,\"frames\":%u,\"matched_buffer\":%u,\"latest_difference_max_deg\":%.3f,\"frame_camera_seq\":%llu,\"latest_camera_seq\":%llu",buffer_camera!=NULL,samples,matched,max_delta,(unsigned long long)frame_camera_seq,(unsigned long long)q);vx_host_jlog("camera_frame_source",f);samples=matched=0;max_delta=0;log_at=now;}
+    }
     {   int vxmac_combat_input(void); int cb_bits = vxmac_combat_input();   // (h64: the triggers / mouse buttons, for the gate)
         if (cb_bits) g_combat_t = now;
         g_combat_bits = cb_bits; }
     int s = -1;
-    for (int k = 0; k < 3 && s < 0; k++) if (k != g_held && k != g_newest && !g_slot[k].writing && !g_slot[k].readers) s = k;
+    vxfp_ticket write_ticket = { .slot = -1 };
+    if (g_pipeline_on) {
+        if (vxfp_acquire(&g_pipeline, pseq, now, &write_ticket)) s = write_ticket.slot;
+    } else for (int k = 0; k < VXFP_SLOTS && s < 0; k++) if (k != g_held && k != g_newest && !g_slot[k].writing && !g_slot[k].readers) s = k;
     // (the scene's depth this frame, and the pick for the next)
     int had_depth = g_copies > 0 && g_hold;
     id<MTLBuffer> hold = g_hold; uint32_t dw = g_pick_w, dh = g_pick_h; MTLPixelFormat df = g_pick_fmt;
@@ -1164,17 +1229,19 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     {   // (VX Mac: this present's camera for each K, from the head's events the game had taken)
         g_cons[pseq % 64] = vx_head_consumed();
         for (int k = 0; k < 4; k++) {
-            float y, pc;
-            g_yk_ok[pseq % 64][k] = pseq > (uint64_t)k && sent_by_seq(g_cons[(pseq - k) % 64], &y, &pc);
+            float y=0, pc=0;
+            g_yk_ok[pseq % 64][k] = pseq > (uint64_t)k && sent_by_seq(g_cons[(pseq - k) % 64], &y, &pc,g_yk_issued[pseq % 64][k]);
             if (g_yk_ok[pseq % 64][k]) { g_yk[pseq % 64][k][0] = y; g_yk[pseq % 64][k][1] = pc; }
         }
         if (g_cam_k_fixed < 0) { const char *e = getenv("VXMAC_CAM_K"); g_cam_k_fixed = e && *e ? atoi(e) : 9; if (g_cam_k_fixed < 4) g_cam_k = g_cam_k_fixed; }
     }
     if (vr_now() && g_vr_ref) {                        // (the camera the game rendered: the moves it had about a frame ago)
-        float y, pch, cons_y;
+        float y=0, pch=0, cons_y;
+        double camera_issued[2]={0};
         int got = g_yk_ok[pseq % 64][g_cam_k];
-        if (got) { y = g_yk[pseq % 64][g_cam_k][0]; pch = g_yk[pseq % 64][g_cam_k][1]; }
-        else got = sent_at(now - g_input_lag_s, &y, &pch);
+        float captured_roll=0;
+        if (got) { y = g_yk[pseq % 64][g_cam_k][0]; pch = g_yk[pseq % 64][g_cam_k][1]; memcpy(camera_issued,g_yk_issued[pseq % 64][g_cam_k],sizeof camera_issued); }
+        else got = sent_at(now - g_input_lag_s, &y, &pch,camera_issued);
         cons_y = y;
         {   // (VX Mac, h29: the game's own camera when found: its reading, offset once to the input-based pose)
             float cy, cp;
@@ -1190,21 +1257,23 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
             //  of the stamp below. Yaw stays the input's. VXMAC_GAME_CAM=0: off)
             uint64_t vxmtl_game_camera(float m[16]);
             static uint64_t last_q, last_q2; static double last_t, log_t, ylog_t; float gm[16];
-            uint64_t q = got ? vxmtl_game_camera(gm) : 0;
+            uint64_t q = got ? frame_camera_seq : 0;
+            if(q)memcpy(gm,frame_camera,sizeof gm);
             int fresh = 0;
             if (q && q != last_q) { last_q = q; last_t = now; fresh = 1; }
             float camera_input_pitch = pch;
             static float resid; static int corr_on = -1;
             if (corr_on < 0) { const char *e = getenv("VXMAC_PITCH_CORR"); corr_on = !(e && !strcmp(e, "0")); }
             if (q && now - last_t < 0.25) {
+                g_native_camera_at=last_t;
+                // Right/up rows contain sin/cos of camera roll times cos(pitch).
+                // atan2 keeps the slope's rigid rotation even when looking up/down.
+                if (hypotf(gm[2],gm[6])>.05f) captured_roll=atan2f(gm[2],gm[6]);
                 float gp = asinf(fmaxf(-1.f, fminf(1.f, gm[10]))) * 180 / (float)M_PI;
                 float np = gp - g_pitch_ref - g_cam_off_pitch;
-                // (h57d: does the game's camera follow the sent pitch? Over ~1 s windows with 2 deg or more sent: the game's
-                //  pitch change against the sent one (regression gain); under 0.25 it does not follow (a vehicle camera),
-                //  over 0.5 it does (on foot). Not following: the frame's pitch is drawn to the head's (input-based) with a
-                //  0.3 s time constant and the closed loop stops (nothing piles up) - looking down on a bike no longer
-                //  shows the area below the frame; following: back to the game's absolute pitch, same time constant)
-                static float pgp, ppi, Kp; static double psxy, psxx, pwin, pkt; static int pfollow = 1;
+                // Measure input response for on-foot feedback. The displayed pose
+                // always uses the captured matrix, regardless of this estimate.
+                static float pgp, ppi; static double psxy, psxx, pwin, pkt; static int pfollow = 1;
                 if (fresh) {
                     float pin = pch + g_pitch_ref, dg = gp - pgp, ds = pin - ppi;
                     // (h64: not while the gate holds (ADS's zoom sensitivity, recoil, aim assist), nor in mode 7 (the stick
@@ -1219,9 +1288,7 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                             if (was != pfollow && vx_host_jlog) { char f[80]; snprintf(f, sizeof f, "\"follows\":%d,\"gain\":%.2f", pfollow, gain); vx_host_jlog("pitch_follow", f); } }
                         psxy = psxx = 0; pwin = now;
                     }
-                    double dt = pkt > 0 ? now - pkt : 0; pkt = now; if (dt > 0.5) dt = 0.5;
-                    float target = pfollow ? 0 : pch - np;
-                    Kp += (target - Kp) * (float)(1 - exp(-dt / 0.3));
+                    pkt=now;
                 }
                 {   // (h60: the game camera's position (from its view matrix) and velocity between game frames, smoothed;
                     //  a jump over 30 m/s (a cut, a teleport) zeroes it)
@@ -1274,8 +1341,8 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                         if (enter) { if (!hi_since) hi_since = now; } else hi_since = 0;
                         if (n >= 5 && med < 1.0f) { if (!lo_since) lo_since = now; } else lo_since = 0;
                         int was = g_vehicle;
-                        if (!g_vehicle && hi_since && now - hi_since > (gate_on ? 2.0 : 1.0)) g_vehicle = 1;
-                        if (g_vehicle && lo_since && now - lo_since > 1.0) g_vehicle = 0;
+                        if (!g_context_known && !g_vehicle && hi_since && now - hi_since > (gate_on ? 2.0 : 1.0)) g_vehicle = 1;
+                        if (!g_context_known && g_vehicle && lo_since && now - lo_since > 1.0) g_vehicle = 0;
                         if (was != g_vehicle) { vx_log("VR: vehicle mode %s (the camera's pivot %.1f m ahead, %.1f without its translation; FOV %.1f)", g_vehicle ? "on: no head pitch sent, the frame within 10 deg of the head's pitch" : "off", med, med2, g_game_hfov);
                             if (vx_host_jlog) { char f[160]; snprintf(f, sizeof f, "\"on\":%d,\"pivot_m\":%.2f,\"pivot_vc_m\":%.2f,\"fov\":%.1f,\"combat\":%d", g_vehicle, med, med2, g_game_hfov, g_combat_bits); vx_host_jlog("vehicle_mode", f); }
                             if (!g_vehicle && gate_on) g_rebase_due = 1; }
@@ -1285,29 +1352,24 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                             vx_host_jlog("vehicle_signal", f); }
                     }
                 }
-                if (!g_vehicle) np += Kp;
-                g_pitch_follows = pfollow && !g_vehicle;
-                {   // (h57c: at most 25 deg from the input-based pitch; h57e: on a vehicle 10 - the frame's centre follows the head's
-                    //  pitch within 10 deg, the vehicle camera's own pitch inside that)
-                    float lim = g_vehicle ? 10.f : 25.f;
-                    if (!aim_on() && fabsf(np - pch) > lim) { np = pch + (np > pch ? lim : -lim); g_pitch_clamps++; }   // (h64: mode 7 - the stick pitches: the game's own pitch, unclamped)
-                }
-                // (h52b: the loop closed on the game's true pitch - each new game frame, the head's pitch (the controller's
-                //  share left out) against the game's: a quarter of the error, at most 3 deg a frame, outside 0.3 deg, is
-                //  sent on top of the head's moves (the sent pitch's account moved by it, vr_mouse sends the difference),
-                //  so the game's camera converges to the head's and the warp turns the frame by little. Not while the pitch
-                //  axis is frozen, the game ignores the head (cinematic) or its mouse look is off. VXMAC_PITCH_CORR=0: off)
+                g_pitch_follows = pfollow && !g_vehicle && !g_scripted_scene;
+                // A captured frame uses its actual pitch. Replacing it with an
+                // input-following estimate bends the world as that estimate catches up.
+                // Correct the source camera without re-issuing mouse movement
+                // already in flight. Free vehicle look needs this too: its mouse
+                // sensitivity and recentering differ from on-foot look.
                 if (fresh && g_head_valid && !g_muzzle.steering) {
                     float hy, hp; head_angles(g_head, &hy, &hp);
                     float err = (hp - g_cam_off_pitch) - gp; resid = err;
                     if (aim_on()) {   // (h64: mode 7 - only past the cone's edge: half the excess a game frame, at most 4 deg)
                         float ex = fabsf(err) - g_aim_cone_p;
                         g_aim_cam_t = now;
-                        if (ex > 0 && !g_vehicle && now >= g_nocontrol_until && now >= g_ignore_until && g_look_hold) { float c = 0.5f * ex; if (c > 4) c = 4; g_aim_push_p += err > 0 ? c : -c; }
+                        if (ex > 0 && !g_vehicle && !g_scripted_scene && now >= g_nocontrol_until && now >= g_ignore_until && g_look_hold) { float c = 0.5f * ex; if (c > 4) c = 4; g_aim_push_p += err > 0 ? c : -c; }
                     }
-                    else if (corr_on && g_pitch_follows && fabsf(err) > 0.3f && now >= g_freeze_until[1] && now >= g_nocontrol_until && now >= g_ignore_until && g_look_hold) {
-                        float c = 0.25f * err; if (c > 3) c = 3; if (c < -3) c = -3;
-                        g_sent_pitch -= c;
+                    else if (corr_on && (g_pitch_follows || g_vehicle_view_ready) && !g_scripted_scene && !g_menu_open &&
+                             now >= g_camera_stick_until && now >= g_freeze_until[1] && now >= g_nocontrol_until && now >= g_ignore_until && g_look_hold) {
+                        float pending=(float)(g_mouse_issued[1]-camera_issued[1])+(hp-g_pitch_ref-g_sent_pitch);
+                        g_sent_pitch-=vx_view_camera_correction(err,pending);
                     }
                 }
                 if (now - log_t > 5 && vx_host_jlog) { log_t = now; char f[240];
@@ -1348,12 +1410,8 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                             lgy = gy; lci = cons_y + g_cam_off_yaw; lh = 1;
                         }
                     }
-                    {   // (h57c: one rule, a complementary filter - the offset (game heading - input heading) follows its target
-                        //  with a 0.6 s time constant, always (0.05 s while the right stick is out): a head turn's timing error
-                        //  (under ~0.2 s) stays corrected by the game's heading (no snap-back, no haze), while any lasting camera
-                        //  motion the head did not make - a vehicle camera recentring or following the bike, the stick,
-                        //  cinematics, scripted turns - is absorbed and the frame stays in front. h57b's frozen offset let a
-                        //  bike's camera push the picture around (71 deg at 185 s). VXMAC_YAW_TAU=<s>)
+                    {   // Keep the room heading fixed for physical turns, including a free vehicle camera.
+                        // The stick still turns the world; constrained scripted cameras retain their filter.
                         int vxmac_stick_active(void); static double kt, stick_t, settle_t; static float tau = -1, pgy2; static int settling;
                         if (tau < 0) { const char *e = getenv("VXMAC_YAW_TAU"); tau = e && *e ? (float)atof(e) : 0.6f; }
                         float target = wrap180(gy - (cons_y + g_cam_off_yaw));
@@ -1368,15 +1426,19 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                                 if (rate < 5) { if (!settle_t) settle_t = now; } else settle_t = 0;
                                 if ((settle_t && now - settle_t >= 0.1) || now - stick_t > 0.5) settling = 0;
                             }
-                            if (settling) K = target;
-                            else if (fabsf(wrap180(target - K)) > 1.5f) K = wrap180(K + wrap180(target - K) * (float)(1 - exp(-dt / tau)));
+                            K=vx_view_heading_offset(K,target,dt,settling,
+                                g_look_hold && !g_scripted_scene,tau);
                         }
-                        // (a sane bound: the frame's heading never more than 25 deg from the input-based one; clamps counted)
-                        float dk = wrap180(target - K);
-                        if (fabsf(dk) > 25) { K = wrap180(target - (dk > 0 ? 25.f : -25.f)); g_yaw_clamps++; }
                     }
                     float yt = wrap180(gy - K);
                     cons_y = y; y = wrap180(yt - g_cam_off_yaw);
+                    if(fresh && g_vehicle_view_ready && !g_scripted_scene && !g_menu_open && g_look_hold && g_head_valid &&
+                       now>=g_camera_stick_until && now>=g_nocontrol_until && now>=g_ignore_until && !g_muzzle.steering) {
+                        float hy,hp;head_angles(g_head,&hy,&hp);
+                        float err=wrap180(hy-g_yaw_ref-y-g_cam_off_yaw);
+                        float pending=(float)(g_mouse_issued[0]-camera_issued[0])+wrap180(hy-g_yaw_ref-g_sent_yaw);
+                        g_sent_yaw=wrap180(g_sent_yaw-vx_view_camera_correction(err,pending));
+                    }
                     if (fresh && muzzle_aim_enabled()) {
                         g_muzzle.camera[0] = wrap180(g_yaw_ref + yt);
                         g_muzzle.camera[1] = gp;
@@ -1390,17 +1452,31 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
                         pthread_mutex_unlock(&g_weapon_view_lock);
                     }
                     if (fresh && g_head_valid) { float hy, hp; head_angles(g_head, &hy, &hp); yresid = wrap180((hy - g_yaw_ref) - y); }
+                    if(fresh && g_head_valid) {
+                        float e[2]={yresid,resid};
+                        for(int i=0;i<2;i++) {g_alignment_sum[i]+=(double)e[i]*e[i];g_alignment_max[i]=fmaxf(g_alignment_max[i],fabsf(e[i]));}
+                        g_alignment_n++;
+                    }
                 }
                 if (now - ylog_t > 5 && vx_host_jlog && yaw_on) { ylog_t = now; char f[360];
                     snprintf(f, sizeof f, "\"game_minus_input_yaw\":%.2f,\"head_minus_frame_yaw\":%.2f,\"cam_reads_skipped\":%lu,\"yaw_offset\":%.1f,\"yaw_clamps\":%lu,\"pitch_clamps\":%lu,"
                              "\"free_gain\":%.2f,\"free_n\":%u,\"aim_gain\":%.2f,\"aim_n\":%u,\"aim_mode\":%d", wrap180(y - cons_y), yresid, g_cam_skips, K, g_yaw_clamps, g_pitch_clamps,
                              g_gain_sxx[0] > 0 ? g_gain_sxy[0] / g_gain_sxx[0] : 0.0, g_gain_n[0], g_gain_sxx[1] > 0 ? g_gain_sxy[1] / g_gain_sxx[1] : 0.0, g_gain_n[1], aim_on());
                     memset(g_gain_sxy, 0, sizeof g_gain_sxy); memset(g_gain_sxx, 0, sizeof g_gain_sxx); memset(g_gain_n, 0, sizeof g_gain_n);
-                    vx_host_jlog("game_cam_yaw", f); }
+                    vx_host_jlog("game_cam_yaw", f);
+                    snprintf(f,sizeof f,"\"vehicle\":%d,\"scene\":%d,\"free_look\":%d,\"stick_settling\":%d,\"frames\":%u,\"rms_deg\":[%.2f,%.2f],\"max_deg\":[%.2f,%.2f],\"pending_deg\":[%.2f,%.2f],\"native_seq\":%llu,\"present_seq\":%llu,\"input_seq\":%lu,\"input_lag_frames\":%d",
+                        g_vehicle,g_scripted_scene,g_look_hold,now<g_camera_stick_until,g_alignment_n,
+                        sqrt(g_alignment_sum[0]/fmax(1,g_alignment_n)),sqrt(g_alignment_sum[1]/fmax(1,g_alignment_n)),
+                        g_alignment_max[0],g_alignment_max[1],(float)(g_mouse_issued[0]-camera_issued[0]),(float)(g_mouse_issued[1]-camera_issued[1]),
+                        (unsigned long long)q,(unsigned long long)pseq,g_cons[pseq%64],g_cam_k);
+                    vx_host_jlog("camera_alignment",f);
+                    memset(g_alignment_sum,0,sizeof g_alignment_sum);memset(g_alignment_max,0,sizeof g_alignment_max);g_alignment_n=0;
+                }
             }
             if (q && q != last_q2) { if (last_q2 && q > last_q2 + 1) g_cam_skips += q - last_q2 - 1; last_q2 = q; }
         }
-        if (got) { camera_pose(g_yaw_ref + y + g_cam_off_yaw, g_pitch_ref + pch + g_cam_off_pitch, g_head, head); head_valid = 1;
+        if (got) { camera_pose(g_yaw_ref + y + g_cam_off_yaw, g_pitch_ref + pch + g_cam_off_pitch, g_head, head);
+                   vx_view_roll(head,captured_roll); head_valid = 1;
                    g_stamp_y[pseq % 64] = y; g_stamp_p[pseq % 64] = pch; g_stamp_cons_y[pseq % 64] = cons_y; g_stamp_at[pseq % 64] = pseq; }
     }
     double interval = g_interval;
@@ -1431,14 +1507,23 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     {   // (the frame before, as it was shown: the HUD and text that stay put between two frames are held, not predicted)
         static __strong id<MTLTexture> last;
-        S->prev = slot_tex(dev, S->prev, back.pixelFormat, w, h);
-        if (!S->prev_view || S->prev_view.width != w || S->prev_view.height != h) {
-            MTLPixelFormat sf = srgb_of(back.pixelFormat);
-            S->prev_view = sf != MTLPixelFormatInvalid ? [S->prev newTextureViewWithPixelFormat:sf] : S->prev;
+        static int demand = -1;
+        if (demand < 0) { const char *e = getenv("VXMAC_HISTORY_COPY"); demand = e && !strcmp(e, "demand"); }
+        // The previous image is only read with camera-relative motion vectors
+        // or interpolation. Keep history through all interpolation modes, even
+        // before a model result arrives, and through any scene-motion packet.
+        S->has_prev_image = !demand || (scene && smv) || interp_mode() != 0;
+        if (S->has_prev_image) {
+            id<MTLTexture> old_prev = S->prev;
+            S->prev = slot_tex(dev, S->prev, back.pixelFormat, w, h);
+            if (S->prev != old_prev || !S->prev_view) {
+                MTLPixelFormat sf = srgb_of(back.pixelFormat);
+                S->prev_view = sf != MTLPixelFormatInvalid ? [S->prev newTextureViewWithPixelFormat:sf] : S->prev;
+            }
+            id<MTLTexture> from = last && last.width == w && last.height == h && last.pixelFormat == back.pixelFormat ? last : back;
+            [b copyFromTexture:from sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                     toTexture:S->prev destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
         }
-        id<MTLTexture> from = last && last.width == w && last.height == h && last.pixelFormat == back.pixelFormat ? last : back;
-        [b copyFromTexture:from sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
-                 toTexture:S->prev destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
         last = S->color;                                 // (our copy: its slot is not written while it is the newest)
     }
     [b copyFromTexture:back sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
@@ -1540,8 +1625,20 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
         if (C.depth_std) { S->z_a = C.farp * C.nearp / (C.farp - C.nearp); S->z_b = -C.nearp / (C.farp - C.nearp); S->flags = VXW_DEPTH_STD; }
         else { S->z_a = C.nearp; S->z_b = 0; S->flags = 0; }
     }
+    g_game_tan[0]=S->tan_x;g_game_tan[1]=S->tan_y;
     {   // (is the game rendering a 3D view? vr mode takes the camera after engage_s of it, lets go after 0.5 s without)
         int is3d = C.engage == 1 ? S->has_depth : (S->has_proj && S->has_mv);
+        vx_game_context player_context=vx_weapon_bridge_context();
+        pthread_mutex_lock(&g_lock);
+        int scene_world=vx_view_scene_world(is3d,g_play_world_seen,player_context.known,&g_view_context,g_menu_known,g_menu_open);
+        pthread_mutex_unlock(&g_lock);
+        g_scene_world=scene_world;
+        if(scene_world) g_play_world_seen=1;
+        static int old_scope=-1;
+        if(scene_world!=old_scope) {
+            old_scope=scene_world;
+            if(vx_host_jlog) { char f[80];snprintf(f,sizeof f,"\"world\":%d,\"played\":%d,\"3d\":%d",scene_world,g_play_world_seen,is3d);vx_host_jlog("scene_view",f); }
+        }
         // (VX Mac: the game's own signal first: its mouse look is on (the cursor dissociated, CGAssociateMouse...) only in
         //  free-look gameplay; menus, character creation, loading and cutscenes keep it off: the panel there. A new
         //  mouse-look period clears the image check's backoff)
@@ -1554,10 +1651,11 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
             //  then on for 3 s before the head takes the camera)
             if (look && !was_look) { g_nocontrol_until = 0; g_nocontrol_for = 20; g_cal_fail = 0; look_since = seen3d ? now : 0; }
             was_look = look;
-            if (!look || !look_since || now - look_since < 3.0) is3d = 0;
+            if ((!look || !look_since || now - look_since < 3.0) && !scene_world) is3d = 0;
             g_look_hold = look && look_since && now - look_since >= 3.0;
+            if (is3d && g_look_hold && g_engaged) g_play_world_seen=1;
         }
-        if (now < g_nocontrol_until && (!g_look_hold || g_nocontrol_strong)) is3d = 0;   // (VX Mac: the game ignores the head now, above - while its mouse look is on only on strong evidence, h45)
+        if (!scene_world && now < g_nocontrol_until && (!g_look_hold || g_nocontrol_strong)) is3d = 0;
         if (now >= g_nocontrol_until) g_nocontrol_strong = 0;
         pthread_mutex_lock(&g_lock);
         // (hysteresis, h2b flapped: a 3D view for engage_s (1.5 s) takes the camera, none for 2 s lets go, and no change
@@ -1596,17 +1694,30 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     uint64_t serial = ++g_serial;
     S->pseq = pseq;
     floor_fit(cb, S, pseq);                               // (VX Mac, h48: the game camera's pitch from the floor in the depth)
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> d) {
-        (void)d;
+    if (g_pipeline_on) {
         pthread_mutex_lock(&g_lock);
-        S->writing = 0; S->serial = serial;
-        if (g_newest < 0 || g_slot[g_newest].serial < serial) g_newest = s;
-        g_submits++;
-        if (S->has_depth) g_depth_frames++;
-        if (S->has_mv) g_mv_frames++;
-        if (S->has_proj) g_fsr2_frames++;
+        vxfp_process(&g_pipeline, write_ticket);  // Existing copy/prepare work, not an NPU model.
         pthread_mutex_unlock(&g_lock);
-        if (S->cal_n) calibrate_frame(S, now);
+    }
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> d) {
+        int success = !g_pipeline_on || d.status == MTLCommandBufferStatusCompleted;
+        // Calibration reads slot resources too; keep this writer's ownership
+        // until it finishes, rather than publishing first and racing a reuse.
+        if (g_pipeline_on && success && S->cal_n) calibrate_frame(S, now);
+        pthread_mutex_lock(&g_lock);
+        if (g_pipeline_on) vxfp_complete(&g_pipeline, write_ticket, CACurrentMediaTime(), success);
+        S->writing = 0;
+        if (success) {
+            S->serial = serial;
+            if (g_newest < 0 || g_slot[g_newest].serial < serial) g_newest = s;
+            g_submits++;
+            if (S->has_prev_image) g_history_copies++; else g_history_skips++;
+            if (S->has_depth) g_depth_frames++;
+            if (S->has_mv) g_mv_frames++;
+            if (S->has_proj) g_fsr2_frames++;
+        }
+        pthread_mutex_unlock(&g_lock);
+        if (!g_pipeline_on && S->cal_n) calibrate_frame(S, now);
         if (release) release(arg);
     }];
     static int told;
@@ -1663,6 +1774,7 @@ int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
             memcpy(last, m_in, sizeof last); have = 1;
         }
     }
+    vx_game_context context = vx_weapon_bridge_context();
     vx_input_chords_poll();
     {   // (the mode shown changed: vr's zero at the head as it is now; the screen placed again ahead of it)
         pthread_mutex_lock(&g_lock);
@@ -1679,6 +1791,27 @@ int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
     if (screen_now() && (!g_screen_valid || g_recenter) && (m[12] != 0 || m[13] != 0 || m[14] != 0)) { g_recenter = 0; place_screen(m); }
     vx_xros_pace_tick();
     pthread_mutex_lock(&g_lock);
+    int old_vehicle=g_vehicle, old_scene=g_scripted_scene;
+    vx_view_context_update(&g_view_context,context.sequence,context.mounted,context.vehicle_mode,context.scene_tier);
+    g_context_known=g_view_context.known;
+    if (g_context_known) { g_vehicle=g_view_context.vehicle; g_scripted_scene=g_view_context.scene; }
+    g_menu_known=context.menu_known; g_menu_open=context.menu_open;
+    int view_ready=vx_view_vehicle_look(context.camera_known,context.vehicle_perspective,context.vehicle_pitch_ready,
+                                      context.vehicle_mode,g_scripted_scene,g_menu_open);
+    if(view_ready!=g_vehicle_view_ready) {
+        g_vehicle_view_ready=view_ready;
+        if(view_ready) pitch_rebase();
+        if(vx_host_jlog) {char f[192];snprintf(f,sizeof f,"\"ready\":%d,\"perspective\":%d,\"pitch_ready\":%d,\"fov_owned\":%d,\"native_fov\":%.2f,\"foot_fov\":%.2f",view_ready,context.vehicle_perspective,context.vehicle_pitch_ready,context.vehicle_fov_owned,context.native_fov,context.foot_fov);vx_host_jlog("vehicle_view_profile",f);}
+    }
+    if (g_menu_open) g_scene_world=0;
+    atomic_store(&g_native_vehicle,g_vehicle);
+    int context_changed=old_vehicle!=g_vehicle || old_scene!=g_scripted_scene;
+    if (context_changed) {
+        if (old_vehicle!=g_vehicle) g_vr_ref=0;
+        g_muzzle.steering=0; memset(g_cam_vel,0,sizeof g_cam_vel);
+        if (vx_host_jlog) { char f[128]; snprintf(f,sizeof f,"\"known\":%d,\"vehicle\":%d,\"scene\":%d,\"sequence\":%llu",context.known,g_vehicle,g_scripted_scene,(unsigned long long)context.sequence); vx_host_jlog("game_context",f); }
+    }
+    vx_room_view_update(&g_room_view,m,1,g_recenter || !g_vr_ref || context_changed,vr_now() ? (g_vehicle ? 2 : g_scripted_scene ? 3 : 1) : 0);
     memcpy(g_head, m, sizeof g_head);
     g_frame_eye_valid = 0;
     g_head_valid = 1;
@@ -1688,13 +1821,21 @@ int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
         double t = CACurrentMediaTime();
         if (vr_now()) vr_mouse(m, t, !g_poll_in || t - g_last_poll > 0.1);
     }
-    for (int k = 0; k < 3; k++) if (!g_slot[k].writing && !g_slot[k].head_valid) { memcpy(g_slot[k].head, m, sizeof g_head); g_slot[k].head_valid = 1; }
+    for (int k = 0; k < VXFP_SLOTS; k++) if (!g_slot[k].writing && !g_slot[k].head_valid) { memcpy(g_slot[k].head, m, sizeof g_head); g_slot[k].head_valid = 1; }
     g_present_time = presentation_time;
     g_frames++;
-    if (g_newest >= 0) g_held = g_newest;
-    int have = g_held >= 0;
+    int have;
+    if (g_pipeline_on) {
+        vxfp_reason reason;
+        have = vxfp_select(&g_pipeline, CACurrentMediaTime(), g_combat_bits != 0, &g_frame_ticket, &reason);
+        if (have) g_held = g_frame_ticket.slot;
+        else g_frame_ticket = (vxfp_ticket){ .slot = -1 };
+    } else {
+        if (g_newest >= 0) g_held = g_newest;
+        have = g_held >= 0;
+    }
     if (have) g_slot[g_held].readers++;              // (until this frame's command buffer completes: vx_xros_vr_end_frame)
-    g_frame_slot = g_held;
+    g_frame_slot = have ? g_held : -1;
     if (have) g_age_ms += (presentation_time - g_slot[g_held].content_time) * 1e3; else g_noframe++;
     pthread_mutex_unlock(&g_lock);
     return have;
@@ -1796,9 +1937,18 @@ static int draw_screen(id<MTLCommandBuffer> cb, vr_slot *S, const float *view_fr
 // ---- a short label in front of the eyes (the mode, the sensitivity), 2.5 s, head-locked ----
 static int g_bare_menu, g_bare_hover = -1;
 static id<MTLTexture> g_label_tex; static double g_label_until; static char g_label_text[160]; static int g_label_dirty;
+enum { WS_OUT=1, WS_GRAB, WS_IN, WS_RACK, WS_READY, WS_WARN, WS_POUCH };
+static int g_label_symbol;
+static void show_weapon_symbol(int symbol) {
+    pthread_mutex_lock(&g_lock);
+    g_label_dirty=1;g_label_symbol=symbol;g_label_big=0;
+    g_label_until=CACurrentMediaTime()+(symbol==WS_WARN?1.5:1.0);
+    pthread_mutex_unlock(&g_lock);
+}
 static id<MTLRenderPipelineState> g_label_pso; static MTLPixelFormat g_label_cf;
 static void show_label(const char *text) {
     pthread_mutex_lock(&g_lock);
+    g_label_symbol=0;
     snprintf(g_label_text, sizeof g_label_text, "%s", text);
     g_label_dirty = 1; g_label_until = CACurrentMediaTime() + 2.5; g_label_big = 0;
     pthread_mutex_unlock(&g_lock);
@@ -1834,6 +1984,41 @@ static id<MTLTexture> label_texture(id<MTLDevice> dev, const char *text, size_t 
     CGContextRelease(c);
     return t;
 }
+// Original vector marks; small status feedback without a sentence across the view.
+static id<MTLTexture> weapon_symbol_texture(id<MTLDevice> dev, int symbol) {
+    unsigned W=128;CGColorSpaceRef cs=CGColorSpaceCreateDeviceRGB();
+    CGContextRef c=CGBitmapContextCreate(NULL,W,W,8,W*4,cs,kCGImageAlphaPremultipliedLast);CGColorSpaceRelease(cs);
+    if(!c) return nil;
+    CGContextSetRGBFillColor(c,.015,.035,.045,.72);
+    CGContextMoveToPoint(c,12,8);CGContextAddLineToPoint(c,100,8);CGContextAddLineToPoint(c,120,28);
+    CGContextAddLineToPoint(c,120,116);CGContextAddLineToPoint(c,28,116);CGContextAddLineToPoint(c,8,96);CGContextClosePath(c);CGContextFillPath(c);
+    CGContextSetRGBStrokeColor(c,symbol==WS_WARN?1:.05,symbol==WS_WARN?.32:.90,symbol==WS_WARN?.12:.95,1);
+    CGContextSetLineWidth(c,5);CGContextSetLineJoin(c,kCGLineJoinMiter);
+    if(symbol==WS_READY) {
+        CGContextMoveToPoint(c,30,63);CGContextAddLineToPoint(c,54,37);CGContextAddLineToPoint(c,99,88);
+    } else if(symbol==WS_WARN) {
+        CGContextMoveToPoint(c,64,102);CGContextAddLineToPoint(c,22,28);CGContextAddLineToPoint(c,106,28);CGContextClosePath(c);
+        CGContextMoveToPoint(c,64,78);CGContextAddLineToPoint(c,64,53);CGContextMoveToPoint(c,64,44);CGContextAddLineToPoint(c,64,38);
+    } else if(symbol==WS_RACK) {
+        CGContextStrokeRect(c,CGRectMake(24,41,77,27));
+        CGContextMoveToPoint(c,98,88);CGContextAddLineToPoint(c,40,88);CGContextAddLineToPoint(c,54,101);
+        CGContextMoveToPoint(c,40,88);CGContextAddLineToPoint(c,54,75);
+    } else {
+        CGContextStrokeRect(c,CGRectMake(27,28,35,66));
+        CGContextMoveToPoint(c,35,80);CGContextAddLineToPoint(c,54,80);
+        CGContextMoveToPoint(c,35,67);CGContextAddLineToPoint(c,54,67);
+        float a=symbol==WS_OUT ? 35:94,b=symbol==WS_OUT ? 94:35;
+        CGContextMoveToPoint(c,91,b);CGContextAddLineToPoint(c,91,a);
+        CGContextAddLineToPoint(c,78,a+(symbol==WS_OUT?13:-13));
+        CGContextMoveToPoint(c,91,a);CGContextAddLineToPoint(c,104,a+(symbol==WS_OUT?13:-13));
+        if(symbol==WS_GRAB || symbol==WS_POUCH) { CGContextMoveToPoint(c,20,17);CGContextAddLineToPoint(c,68,17); }
+    }
+    CGContextStrokePath(c);
+    MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:W height:W mipmapped:NO];
+    d.usage=MTLTextureUsageShaderRead;id<MTLTexture> t=[dev newTextureWithDescriptor:d];
+    [t replaceRegion:MTLRegionMake2D(0,0,W,W) mipmapLevel:0 withBytes:CGBitmapContextGetData(c) bytesPerRow:W*4];
+    CGContextRelease(c);return t;
+}
 static NSString *const kLabelSrc = @
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
@@ -1849,7 +2034,7 @@ static void draw_label(id<MTLCommandBuffer> cb, void *outp, const float tan[4]) 
     double now = CACurrentMediaTime();
     char text[160]; int dirty = 0;
     pthread_mutex_lock(&g_lock);
-    int menu = g_bare_menu, hover = g_bare_hover;
+    int menu = g_bare_menu, hover = g_bare_hover, symbol=g_label_symbol;
     if (!menu && now > g_label_until) { pthread_mutex_unlock(&g_lock); return; }
     if (!menu) {
         dirty = g_label_dirty;
@@ -1858,7 +2043,7 @@ static void draw_label(id<MTLCommandBuffer> cb, void *outp, const float tan[4]) 
     }
     pthread_mutex_unlock(&g_lock);
     id<MTLDevice> dev = cb.device;
-    if (!menu && (dirty || !g_label_tex)) g_label_tex = label_texture(dev, text, 1024);
+    if (!menu && (dirty || !g_label_tex)) g_label_tex = symbol ? weapon_symbol_texture(dev,symbol) : label_texture(dev, text, 1024);
     if (!menu && !g_label_tex) return;
     if (!g_label_pso || g_label_cf != out.pixelFormat) {
         NSError *err = nil;
@@ -1883,7 +2068,9 @@ static void draw_label(id<MTLCommandBuffer> cb, void *outp, const float tan[4]) 
     float ew, eh; eye_size(out, &ew, &eh);
     float aspect = ew / (eh > 0 ? eh : 1);
     float hw = g_label_big ? 0.5f : 0.32f, hh = hw * aspect * 128.0f / 1024.0f;   // (h47: the mode's label larger)
-    float r[4] = { -hw, 0.42f + hh, hw, 0.42f - hh };   // (left, top, right, bottom in NDC, a little above the centre)
+    if(symbol && !menu) { hw=.035f;hh=hw*aspect; }
+    float centre=symbol && !menu ? -.40f : .42f;
+    float r[4] = { -hw, centre + hh, hw, centre - hh };   // (left, top, right, bottom in NDC, a little above the centre)
     [e setRenderPipelineState:g_label_pso];
     if (menu) {
         static id<MTLTexture> tiles[BH_ACTIONS], title;
@@ -2036,7 +2223,7 @@ static void draw_vignette(id<MTLCommandBuffer> cb, void *outp, const float tan[4
     // (h33: 0.97 - the tall frame covers the eye up and down; at the sides a dark band moving with the frame showed it as
     //  a screen. The blend to the world cache over the last 3 % only, the cache undimmed)
     // (h38: 0.93 - a 7 % blend from the frame to the cache; 3 % left a hard seam)
-    if (start < 0) { const char *e = getenv("VXMAC_VR_VIGNETTE"); start = e && *e ? (float)atof(e) : 0.93f; }
+    if (start < 0) { const char *e = getenv("VXMAC_VR_VIGNETTE"); start = e && *e ? (float)atof(e) : 0; }
     if (start <= 0 || g_eff != 2) return;
     pthread_mutex_lock(&g_lock); int s = g_frame_slot; pthread_mutex_unlock(&g_lock);
     if (s < 0) return;
@@ -2253,7 +2440,7 @@ static int draw_hud_layer(id<MTLCommandBuffer> cb, void *outp, int eye, const fl
     // (h43: a menu / guide over the scene (the UI covers over 30 %): the whole frame, scene and UI, as the centred
     //  head-locked panel (+-30 deg), opaque - world-size its edge popups fell out of view)
     int vxmtl_ui_menu(void);
-    int menu = vxmtl_ui_menu() && S->view && g_force != 1;   // (h47: a forced vr mode shows no menu panel)
+    int menu = vxmtl_ui_menu() && S->view && g_force != 1 && !g_scene_world;
     id<MTLTexture> hv = S->has_hud && S->hud_view ? S->hud_view : (g_hud_keep_view && CACurrentMediaTime() - g_hud_keep_t < 0.3 ? g_hud_keep_view : nil);
     if (!menu && !hv) return 0;
     id<MTLTexture> out = (__bridge id<MTLTexture>)outp;
@@ -2717,6 +2904,8 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
     pthread_mutex_lock(&g_lock);
     int s = g_frame_slot;
     double pt = g_present_time;
+    vx_room_view room_view=g_room_view;
+    int anchored_camera=g_vehicle || g_scripted_scene;
     float eye_offset[3];
     int eye_valid = eye >= 0 && eye < 2 && g_frame_eye_valid;
     if (eye_valid) memcpy(eye_offset, g_frame_eye_offsets[eye], sizeof eye_offset);
@@ -2745,6 +2934,9 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
     vxw_params p = { 0 };
     p.w = S->w; p.h = S->h;
     p.flags = VXW_POSE | S->flags;
+    // Keep ordinary VR continuous at the source rectangle without changing its camera.
+    // Restricted vehicle/story views retain their separate missing-view policy.
+    if (!anchored_camera) p.flags |= VXW_EDGE_FILL;
     p.tan_x = S->tan_x; p.tan_y = S->tan_y; p.z_a = S->z_a; p.z_b = S->z_b;
     // (VX Mac, h26: the gate was 55 ms / 100 ms: at the game's 28-31 fps the shown frame is 83-96 ms old, so eyes went
     //  between the depth warp and the far-plane one as the age crossed 100 ms (20 % of eyes) - the same scale jump as the
@@ -2801,13 +2993,17 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
                          M[12], M[13], M[14]);
                 if (vx_host_jlog) vx_host_jlog("stereo_eyes", fields);
             }
+            float physical[3]; vx_room_view_offset(&room_view, view_from_origin, physical);
+            for (int i=0;i<3;i++) M[12+i]+=physical[i];
             // (h60: the game camera's own motion since its frame - running, a vehicle - carried on to this eye's time:
             //  velocity x the frame's age, in the frame camera's axes, as a translation of the depth warp (at most
             //  VXMAC_MOVE_MAX m, default 0.3; VXMAC_MOVE=0 off): new frames no longer step forward every 50-150 ms)
             static int mv_on = -1; static float mv_max = 0.3f;
             if (mv_on < 0) { const char *e = getenv("VXMAC_MOVE"); mv_on = !(e && !strcmp(e, "0")); e = getenv("VXMAC_MOVE_MAX"); if (e && *e) mv_max = (float)atof(e); }
             // (method 3: not with the model's motion - the camera's own motion is in it (VXMAC_INTERP_MOVE=1: both))
-            if (mv_on && use_dibr && S->cam_ok && vr_now() && !(i_use && !i_move)) {
+            int vxmac_move_active(void);
+            if (mv_on && vx_view_predict_translation(vxmac_move_active(),anchored_camera) &&
+                use_dibr && S->cam_ok && vr_now() && !(i_use && !i_move)) {
                 float age = (float)(pt - S->content_time); if (age < 0) age = 0; if (age > 0.2f) age = 0.2f;
                 float dw[3] = { S->cam_vel[0] * age, S->cam_vel[1] * age, S->cam_vel[2] * age };
                 float d[3] = { S->cam_rows[0] * dw[0] + S->cam_rows[1] * dw[1] + S->cam_rows[2] * dw[2],
@@ -2934,7 +3130,7 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
     id<MTLTexture> mv = S->has_mv ? S->mv : g_zero_mv;
     if (i_use && i_vel) { mv = S->vmv; p.mv_sx = -S->vk[0] * (float)S->w; p.mv_sy = -S->vk[1] * (float)S->h; }   // (h63c: the raw velocity as motion vectors)
     void *a = NULL;
-    if (p.flags & VXW_CAM_MV && S->prev_view) { a = (__bridge void *)S->prev_view; p.flags |= VXW_STILL; p.thr = 0.03f; }
+    if (p.flags & VXW_CAM_MV && S->has_prev_image && S->prev_view) { a = (__bridge void *)S->prev_view; p.flags |= VXW_STILL; p.thr = 0.03f; }
     {   // (VX Mac: the Neural Engine's sharper centre of this very frame, when it is ready (app/Sources/fsr.m; off: none))
         int vxmac_fsr_detail(uint64_t seq, void **tex, float rect[4]);
         void *dt = NULL; float dr[4] = { 0 };
@@ -3040,17 +3236,24 @@ void vx_xros_vr_end_frame(void *cbp) {
     id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)cbp;
     pthread_mutex_lock(&g_lock);
     int s = g_frame_slot;
+    vxfp_ticket ticket = g_frame_ticket;
+    g_frame_ticket = (vxfp_ticket){ .slot = -1 };
     g_frame_slot = -1;
-    if (!cb && s >= 0) g_slot[s].readers--;           // (a frame the compositor cancelled)
+    if (!cb && s >= 0) {
+        if (g_pipeline_on) vxfp_release(&g_pipeline, ticket);
+        g_slot[s].readers--;
+    }                                               // (a frame the compositor cancelled)
     int iu = g_iw_frame_used; g_iw_frame_used = 0;    // (method 3: this frame's eyes used the model's layers)
     pthread_mutex_unlock(&g_lock);
     if (!cb) return;
-    void vxmtl_warp_begin(void), vxmtl_warp_end(void);   // (h55: the game's commits wait while the warp is on the GPU)
-    vxmtl_warp_begin();
+    void vxmtl_warp_track(void *);
+    vxmtl_warp_track(cbp); // Submission pacing only; frame readers still live until GPU completion below.
     [cb addCompletedHandler:^(id<MTLCommandBuffer> d) {
-        vxmtl_warp_end();
         pthread_mutex_lock(&g_lock);
-        if (s >= 0) g_slot[s].readers--;
+        if (s >= 0) {
+            if (g_pipeline_on) vxfp_release(&g_pipeline, ticket);
+            g_slot[s].readers--;
+        }
         if (d.GPUEndTime > d.GPUStartTime) { g_gpu_ms += (d.GPUEndTime - d.GPUStartTime) * 1e3; g_gpu_n++;
             if (iu) { g_iw_gpu_ms += (d.GPUEndTime - d.GPUStartTime) * 1e3; g_iw_gpu_n++; } else { g_iw_gpu_ms0 += (d.GPUEndTime - d.GPUStartTime) * 1e3; g_iw_gpu_n0++; } }
         pthread_mutex_unlock(&g_lock);
@@ -3618,7 +3821,9 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         static hand_weapon_controller joy_weapon;
         static bare_hands full_hands;
         bare_hand_input hand_input = { .action = -1, .hover = -1 };
-        int gameplay = vr && vx_game_mouse_look();
+        vx_game_context context=vx_weapon_bridge_context();
+        int native_context=vx_xros_vr_vehicle_active() || (context.known && context.scene_tier>=2 && context.scene_tier<=5);
+        int gameplay = vr && !native_context && vx_game_mouse_look();
         if (bare) {
             hand_input = bare_hands_update(&full_hands, head, hands, g_wrists, g_middle_dist,
                                            now, vr, gameplay, 1, hw.manual_mag && hand_weapon_has_magazine(&hw),
@@ -3653,8 +3858,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         if (direct_commands && equipment.command_serial != command_notice &&
             equipment.command_status >= VX_COMMAND_REJECTED) {
             command_notice = equipment.command_serial;
-            show_label(equipment.command_status == VX_COMMAND_TIMEOUT ? "ゲームから操作の応答がありません" :
-                       "ゲームが操作を受け付けませんでした");
+            show_weapon_symbol(WS_WARN);
             // Restore the gesture state to the last game-confirmed state.
             hw.state = equipment.reload_phase == 0 ? HW_LOADED :
                        equipment.reload_phase == 5 ? HW_IN_NO_ROUND : HW_EMPTY;
@@ -3667,10 +3871,10 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             if (reload_report != equipment.reload_report) {
                 reload_report = equipment.reload_report;
                 if (previous_reload_phase >= 2 && previous_reload_phase != 5 &&
-                    (equipment.reload_phase == 0 || equipment.reload_phase == 5) && equipment.ammo > 0) {
-                    show_label(equipment.reload_phase == 5 ? "弾倉装着・ZLでスライドを引く" : "装填完了");
+                    ((equipment.reload_phase == 0 && equipment.ammo > 0) || equipment.reload_phase == 5)) {
+                    show_weapon_symbol(equipment.reload_phase==5 ? WS_RACK : WS_READY);
                 } else if ((previous_reload_phase == 7 || previous_reload_phase == 8) && equipment.reload_phase == 1) {
-                    show_label("装填できません・所持弾を確認");
+                    show_weapon_symbol(WS_WARN);
                 }
                 previous_reload_phase = equipment.reload_phase;
                 if (equipment.reload_phase == 0 || equipment.reload_phase == 5) {
@@ -3679,7 +3883,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
                 } else if (equipment.reload_phase == 1 && hw.state != HW_HOLD_NEW) {
                     hw.state = HW_EMPTY;
                     hw.state_at = now;
-                    if (direct_commands && equipment.ammo == 0) show_label("左腰で ZL 長押し");
+                    if (direct_commands && equipment.ammo == 0) show_weapon_symbol(WS_POUCH);
                 }
             }
         }
@@ -3689,7 +3893,8 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         if (joy_hold) hw.lefty = 0;
         if (hw.manual_mag || wrist_primary) hand_weapon_set_wrist_frames(&hw, g_wrists);
         int mb = 0;
-        int game_input = vr && (!hw.manual_mag || gameplay) && (!bare || !hand_input.blocked);
+        int game_input = vr && !native_context && (!hw.manual_mag || gameplay) && (!bare || !hand_input.blocked);
+        if (!game_input) hand_weapon_sample_poses(&hw, head, g_joints, now);
         float bore[10];
         static double (*drawn_direction)(float[10]);
         if (wrist_primary && !drawn_direction) drawn_direction = dlsym(RTLD_DEFAULT, "vxpipe_drawn_weapon_direction");
@@ -3740,7 +3945,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
                     if (kind) {
                         uint64_t serial = vx_weapon_bridge_command(kind);
                         if (!serial) {
-                            show_label("武器操作の接続を待っています");
+                            show_weapon_symbol(WS_WARN);
                             hw.state = equipment.reload_phase == 0 ? HW_LOADED :
                                        equipment.reload_phase == 5 ? HW_IN_NO_ROUND : HW_EMPTY;
                             hw.slide_hold = hw.manual_slide_ready = 0;
@@ -3760,30 +3965,10 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             int shown = mb & ~HW_EV_DONE; if (hw.rack && (mb & HW_EV_RACK)) shown = HW_EV_RACK;
             // A requested ejection has not yet been acknowledged by the game.
             if (direct_commands) shown &= ~HW_EV_OUT;
-            if (mag_labels && shown) {          // (a short label for the step: out, a new one, in, racked, cancelled)
-                static const char *ms[8][HW_EV_N] = {
-                    { "Magazine out", "New magazine", "Magazine in", "Chambered", "", "Reload cancelled" },
-                    { "マガジンを抜いた", "新しいマガジン", "弾倉挿入・装填を確認中", "コッキング操作", "", "リロード中止" },
-                    { "弹匣已取出", "新弹匣", "弹匣已插入", "已上膛", "", "取消装弹" },
-                    { "彈匣已取出", "新彈匣", "彈匣已插入", "已上膛", "", "取消裝彈" },
-                    { "탄창 분리", "새 탄창", "탄창 장착", "장전 완료", "", "재장전 취소" },
-                    { "Chargeur retiré", "Nouveau chargeur", "Chargeur inséré", "Chambré", "", "Rechargement annulé" },
-                    { "Magazin raus", "Neues Magazin", "Magazin drin", "Durchgeladen", "", "Nachladen abgebrochen" },
-                    { "Cargador fuera", "Cargador nuevo", "Cargador dentro", "Recámara cargada", "", "Recarga cancelada" } };
-                int i = 0; while (i < HW_EV_N - 1 && !(shown & (1 << i))) i++;
-                if (shown & HW_EV_RACK) i = 3;
-                if (ms[ui_lang()][i][0]) {
-                    int pouch_hint = hw.manual_mag && i == 0;
-                    const char *label = ms[ui_lang()][i];
-                    if (pouch_hint) {
-                        if (bare && ui_lang() == 1) label = hw.lefty ? "右腰でピンチしたまま持ち上げる" : "左腰でピンチしたまま持ち上げる";
-                        else if (bare) label = hw.lefty ? "Pinch at right hip and lift" : "Pinch at left hip and lift";
-                        else if (ui_lang() == 1) label = hw.lefty ? "右腰で ZR 長押し" : "左腰で ZL 長押し";
-                        else label = hw.lefty ? "Hold ZR at right hip" : "Hold ZL at left hip";
-                    }
-                    show_label(label);
-                    pthread_mutex_lock(&g_lock); g_label_until = now + (pouch_hint ? 2.5 : .7); g_label_big = 0; pthread_mutex_unlock(&g_lock);
-                }
+            if (mag_labels && shown) {
+                int symbol=shown&HW_EV_RACK ? WS_RACK : shown&HW_EV_IN ? WS_IN :
+                    shown&HW_EV_GRAB ? WS_GRAB : shown&HW_EV_OUT ? WS_OUT : WS_WARN;
+                show_weapon_symbol(symbol);
             }
         }
         // (h70b: the gun drawn, put away, aimed and fired by hand - VXMAC_ARMS=1; the trigger only with VXMAC_TRIGGER=1.
@@ -3869,13 +4054,13 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         static int hand_ads = -1;
         if (hand_ads < 0) { const char *e = getenv("VXMAC_HAND_ADS"); hand_ads = e && !strcmp(e, "1"); }
         // Joy-Con mode has one fire source. Finger tracking can look like a curled index finger while holding a pad.
-        int joy_actions = hand_weapon_controller_actions(&joy_weapon, joy_hold && vr, 1);
+        int joy_actions = hand_weapon_controller_actions(&joy_weapon, joy_hold && gameplay, 1);
         static int (*supported_grip)(void);
         if ((joy_actions & HW_JOY_AIM) && !supported_grip)
             supported_grip = dlsym(RTLD_DEFAULT, "vxpipe_supported_grip");
         int want_aim = joy_hold ? ((joy_actions & HW_JOY_AIM) && (button_support || (supported_grip && supported_grip()))) :
                                   (arms && hand_ads && vr && hw.ads && !hand_weapon_is_hybrid(&hw, now));
-        int want_trig = !joy_hold && arms && trig_on && vr && hw.trigger && !hand_weapon_is_hybrid(&hw, now);
+        int want_trig = !joy_hold && arms && trig_on && gameplay && hw.trigger && !hand_weapon_is_hybrid(&hw, now);
         if (!bare && want_aim != aim_down) { aim_down = want_aim; AKEY(akey[3], aim_down); }
         if (want_trig != trig_down) { trig_down = want_trig; AKEY(akey[4], trig_down); }
         pthread_mutex_lock(&g_lock);
@@ -4247,6 +4432,16 @@ void vx_xros_vr_stats(char *out, unsigned size) {
         l = strlen(out); snprintf(out + l, size > l ? size - l : 0, ",\"roll_deg_mean\":%.2f,\"roll_deg_max\":%.2f,\"pitch_offset_deg\":%.2f,\"pitch_limits\":[%.1f,%.1f],\"floor_pitch_deg\":%.1f,\"floor_conf\":%.2f",
                                   g_roll_n ? g_roll_sum / g_roll_n : 0.0, g_roll_max, g_pitch_off, g_pitch_lo, g_pitch_hi, g_floor_pitch, g_floor_conf);
         g_roll_sum = 0; g_roll_n = 0; g_roll_max = 0; }
+    if (g_pipeline_on) {
+        size_t l = strlen(out);
+        snprintf(out + l, size > l ? size - l : 0,
+                 ",\"frame_pipeline\":{\"delay_ms\":0,\"slots\":%d,\"admitted\":%llu,\"capacity_drops\":%llu,\"busy_drops\":%llu,\"failed\":%llu,\"rejected_callbacks\":%llu,\"selections\":%llu,\"repeats\":%llu,\"history_copies\":%llu,\"history_skips\":%llu}",
+                 VXFP_SLOTS, (unsigned long long)g_pipeline.admitted, (unsigned long long)g_pipeline.capacity_drops,
+                 (unsigned long long)g_pipeline.capacity_busy_drops,
+                 (unsigned long long)g_pipeline.failed, (unsigned long long)g_pipeline.rejected_callbacks,
+                 (unsigned long long)g_pipeline.selections, (unsigned long long)g_pipeline.repeats,
+                 (unsigned long long)g_history_copies, (unsigned long long)g_history_skips);
+    }
     g_mouse_counts = 0; g_fsr2_frames = 0; g_max_gap = 0; g_dibr_frames = 0; g_outside_sum = 0; g_outside_n = 0;
     g_hand_stats_reset = 1;
     g_frames = g_submits = g_draws = g_noframe = g_depth_frames = g_mv_frames = 0;

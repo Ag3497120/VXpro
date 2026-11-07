@@ -408,7 +408,7 @@ int hand_weapon_update(hand_weapon *w, const float head[16], const float joints[
             if (!held) set_state(w, HW_EMPTY, now);
             else if (po.ok && po.from_arm != 2 && w->well_ok &&
                      (!w->magazine_grab_model || w->magazine_grab_model == w->well_contact_model) &&
-                     dwell < (w->well_contact_model ? fminf(.11f, P[P_WELL_R]) : P[P_WELL_R]) &&
+                     dwell < (w->well_contact_model ? HW_MAG_CAPTURE_RADIUS : P[P_WELL_R]) &&
                      (!w->wrist_primary || (pg.ok && pg.from_arm != 2))) {
                 out |= ev(w, HW_EV_IN);
                 set_state(w, w->auto_chamber ? HW_LOADED : HW_IN_NO_ROUND, now);

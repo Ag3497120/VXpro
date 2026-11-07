@@ -16,6 +16,8 @@ extern "C" {
 // The app turns it on before the program starts (launch argument -present vr, the default); 0: the flat window.
 void vx_xros_vr_enable(int on);
 int vx_xros_vr_on(void);
+// Native driving / drive-by controls own the pad while mounted, including transitions.
+int vx_xros_vr_vehicle_active(void);
 
 // ---- the game's side (src/d3d12.m) ----
 // A render pass with a depth attachment ended (cb: its command buffer): as stereo.h's vx_stereo_depth_pass.

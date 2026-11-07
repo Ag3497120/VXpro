@@ -1,0 +1,32 @@
+name: VXMotionMeanBench
+options:
+  deploymentTarget:
+    visionOS: "26.0"
+settings:
+  base:
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    CLANG_ENABLE_OBJC_ARC: YES
+    GENERATE_INFOPLIST_FILE: YES
+    DEAD_CODE_STRIPPING: YES
+    INFOPLIST_KEY_CFBundleDisplayName: "Motion Mean Test"
+    INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+    INFOPLIST_KEY_UILaunchScreen_Generation: YES
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  VXMotionMeanBench:
+    type: application
+    platform: visionOS
+    sources:
+      - path: ../velocity_mean_mac.m
+      - path: ../velocity_mean_app.h
+      - path: ../velocity_mean_app.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.VXMotionMeanBench
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) VXMAC_VELOCITY_APP=1"
+        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/../../tests/velocity_mean_app.h"
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework

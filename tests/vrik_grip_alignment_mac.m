@@ -12,7 +12,7 @@ void vxmtl_ui_pipe_set(id encoder, id pipeline) { (void)encoder; (void)pipeline;
 int vxprof_live;
 int vxprof_on(void) { return 0; }
 void vxprof_pipe(id encoder, id pipeline) { (void)encoder; (void)pipeline; }
-void vxprof_pipe_key(id pipeline, NSString *hash, char kind) { (void)pipeline; (void)hash; (void)kind; }
+void vxprof_pipe_key(id pipeline, NSString *hash, char kind, NSString *name) { (void)pipeline; (void)hash; (void)kind; (void)name; }
 
 @interface PoseEncoderFixture : NSObject
 @property id<MTLDevice> device;
@@ -519,6 +519,56 @@ static int magazine_fixture_state;
 static double magazine_fixture_started;
 static int magazine_fixture(double *started, unsigned *ejection) {
     *started=magazine_fixture_started;*ejection=101;return magazine_fixture_state;
+}
+
+static void test_manual_slide_visual(void) {
+    memset(&g_vk,0,sizeof g_vk);g_vk.held.owner=1;g_vk.held.epoch=40;
+    vrik_mag_query=magazine_fixture;magazine_fixture_state=HW_LOADED;
+    vrik_asset_profile asset={.bones=2,.root=0,.slide=1,.kind=8};
+    vrik_pal pal={.asset=&asset,.nb=2};vrik_item_grip item={0};
+    pal.orig[0]=aff_id();pal.orig[1]=aff_id();pal.orig[1].m[11]=.04f;
+    g_vk.held.at=10;
+    aff rest=vrik_manual_slide(&pal,&item,1);assert(item.slide_valid);
+    magazine_fixture_state=HW_EMPTY;
+    aff open=rest;open.m[7]-=.035f;
+    aff shown=vrik_manual_slide(&pal,&item,1);
+    for(int i=0;i<12;i++)assert(fabsf(shown.m[i]-open.m[i])<.00001f);
+    // Insert, drop, pick up and insert again; native reload tries both open and
+    // closed positions. None may close the manual slide or complete its stroke.
+    int states[]={HW_HOLD_NEW,HW_IN_NO_ROUND,HW_EMPTY,HW_HOLD_NEW,HW_IN_NO_ROUND};
+    for(unsigned n=0;n<sizeof states/sizeof *states;n++) {
+        magazine_fixture_state=states[n];
+        pal.orig[1].m[7]=n%2 ? .05f : -.05f;
+        shown=vrik_manual_slide(&pal,&item,1);
+        for(int i=0;i<12;i++)assert(fabsf(shown.m[i]-open.m[i])<.00001f);
+    }
+    aff move=aff_rot((float[3]){1,0,0},.8f,(float[3]){0});move.m[3]=.3f;
+    pal.orig[0]=move;pal.orig[1]=aff_mul(move,pal.orig[1]);
+    shown=vrik_manual_slide(&pal,&item,1);aff expected=aff_mul(move,open);
+    for(int i=0;i<12;i++)assert(fabsf(shown.m[i]-expected.m[i])<.00001f);
+    // A physical pull alone adds travel; it is applied once even when the rack
+    // target and multiple render passes query this palette in the same frame.
+    g_vk.slide_pull=.02f;
+    aff pulled=open;pulled.m[7]-=.02f;pulled=aff_mul(move,pulled);
+    for(int pass=0;pass<8;pass++) {
+        shown=vrik_manual_slide(&pal,&item,1);
+        for(int i=0;i<12;i++)assert(fabsf(shown.m[i]-pulled.m[i])<.00001f);
+    }
+    magazine_fixture_state=HW_LOADED;g_vk.slide_pull=0;
+    shown=vrik_manual_slide(&pal,&item,1);
+    for(int i=0;i<12;i++)assert(fabsf(shown.m[i]-pulled.m[i])<.00001f);
+    g_vk.held.at+=.05;
+    shown=vrik_manual_slide(&pal,&item,1);
+    assert(item.slide_shown>.027f && item.slide_shown<.028f);
+    g_vk.held.at+=.06;shown=vrik_manual_slide(&pal,&item,1);
+    assert(!memcmp(&shown,&pal.orig[1],sizeof shown)); // live recoil resumes
+    g_vk.held.epoch++;magazine_fixture_state=HW_IN_NO_ROUND;
+    pal.orig[0]=aff_id();pal.orig[1]=aff_id();pal.orig[1].m[11]=.12f;
+    shown=vrik_manual_slide(&pal,&item,1);
+    assert(item.slide_epoch==g_vk.held.epoch && fabsf(shown.m[11]-.12f)<.00001f);
+    assert(fabsf(shown.m[7]+.035f)<.00001f); // new item, no old transform borrowed
+    vrik_mag_query=NULL;
+    puts("pistol slide: insertion cannot close it; physical travel applied once; manual release returns smoothly; recoil and item identity retained: ok");
 }
 
 static void test_ammunition_parts(void) {
@@ -1049,6 +1099,7 @@ int main(void) { @autoreleasepool {
     test_body_space();
     test_palm_contacts();
     test_ammunition_parts();
+    test_manual_slide_visual();
     test_asset_adapter();
     test_geometry_cache();
     test_view_handedness();
@@ -1202,7 +1253,12 @@ int main(void) { @autoreleasepool {
     for (unsigned i = 0; i < arm.nb; i++) arm_bones[i] = arm.orig[i];
     vrik_apply_pal(&arm);
     assert_grip(vrik_grip_in(arm_bones[left], &authored), g_vk.slide_hand);
-    g_vk.slide_active = 0; g_vk.weap[5] = 0;
+    g_vk.slide_active=0;g_vk.contact_active=1;
+    g_vk.contact_hand=(vrik_grip_pose){{-.07f,-.20f,.31f},{0,1,0},{1,0,0}};
+    for(unsigned i=0;i<arm.nb;i++)arm_bones[i]=arm.orig[i];
+    vrik_apply_pal(&arm);
+    assert_grip(vrik_grip_in(arm_bones[left],&authored),g_vk.contact_hand);
+    g_vk.contact_active=0;g_vk.weap[5]=0;
     for (unsigned i = 0; i < arm.nb; i++) arm_bones[i] = arm.orig[i];
     vrik_apply_pal(&arm);
     assert_grip(vrik_grip_in(arm_bones[left], &authored), authored);

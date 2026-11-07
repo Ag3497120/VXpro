@@ -13,6 +13,9 @@
 // by name (hand_weapon_params).
 #pragma once
 
+#define HW_MAG_CAPTURE_RADIUS .18f
+#define HW_MAG_GUIDE_RADIUS .27f
+
 // Each hand's joints in the room's frame (y up), from the system's hand skeleton: HW_JOINTS floats per hand -
 // tracked (0/1), then 8 points: the wrist, the index finger's knuckle, the middle finger's knuckle, the little
 // finger's knuckle, the middle finger's tip, the ring finger's tip, the little finger's tip, the index finger's tip.

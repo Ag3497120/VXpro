@@ -34,12 +34,15 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <dlfcn.h>
+#include <math.h>
+#include <ctype.h>
 #include "vxmac.h"
 #include "vxprof.h"
 
 int vxprof_live;                           // (read by vxmtl.m / vxpipe.m before calling in: 1 while a window samples)
 static int g_on = -1;                      // (VXMAC_PASS_PROFILE)
 static double g_every = 5; static unsigned g_frames = 5, g_max_windows = 240;
+static int g_driving_only;
 static FILE *g_f; static pthread_mutex_t g_fl = PTHREAD_MUTEX_INITIALIZER;
 static id<MTLCounterSet> g_ts; static id<MTLDevice> g_dev; static NSUInteger g_sb_n = 4096;
 static dispatch_queue_t g_q;               // (resolution and writing, off the GPU's completion threads)
@@ -58,15 +61,37 @@ int vxprof_on(void) {
 }
 
 // ---- pipelines' keys (vxpipe.m render_note / compute_note): 'f' fragment, 'v' vertex (no fragment), 'k' kernel --------
-// (a VXPKey associated with the pipeline: its function's library hash (64 bits) and the kind)
+// Lowercase keys identify library bytes. Uppercase keys identify the entry name of a source library;
+// they separate formerly-zero identities without pretending to identify the shader's compiled variant.
 typedef struct { uint64_t h; char kind; } pkey;
+static NSMutableDictionary<NSString *, NSString *> *g_function_names;
+static pthread_mutex_t g_names_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_names_ready;
 @interface VXPKey : NSObject { @public uint64_t h; char kind; }
 @end
 @implementation VXPKey
 @end
-void vxprof_pipe_key(id p, NSString *hash, char kind) {
+void vxprof_pipe_key(id p, NSString *hash, char kind, NSString *function_name) {
     if (!p || vxprof_on() != 1) return;
     VXPKey *k = [VXPKey new]; k->kind = kind; k->h = hash.length ? strtoull(hash.UTF8String, NULL, 16) : 0;
+    if (!hash.length && function_name.length) {
+        k->kind = (char)toupper((unsigned char)kind); k->h = 14695981039346656037ULL;
+        for (const unsigned char *s = (const unsigned char *)function_name.UTF8String; *s; s++) { k->h ^= *s; k->h *= 1099511628211ULL; }
+        NSString *key = [NSString stringWithFormat:@"%c%016llx", k->kind, (unsigned long long)k->h];
+        NSString *name = [function_name stringByAddingPercentEncodingWithAllowedCharacters:
+            [NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.$-"]];
+        pthread_mutex_lock(&g_names_lock);
+        if (!g_function_names) g_function_names = [NSMutableDictionary dictionary];
+        NSString *old = g_function_names[key];
+        if (!old && name) {
+            g_function_names[key] = name;
+            if (g_names_ready) fout("PNAME key=%s name=%s source=function_name", key.UTF8String, name.UTF8String);
+        } else if (old && ![old isEqualToString:name]) {
+            // A collision is unknown, never silently attached to the other function.
+            k->kind = kind; k->h = 0;
+        }
+        pthread_mutex_unlock(&g_names_lock);
+    }
     objc_setAssociatedObject(p, kKey, k, OBJC_ASSOCIATION_RETAIN);
 }
 
@@ -82,6 +107,7 @@ typedef struct {
     pkey pipes[MAXP]; unsigned npipes, pipe_sets, more_pipes;
     unsigned dispatches, indirect; double threads;
     uint64_t t[4];             // (resolved)
+    unsigned timing_valid, timing_omitted, timing_bad;
 } prec;
 @interface VXPFrame : NSObject {
 @public
@@ -159,8 +185,11 @@ static VXPFrame *alloc_rec(id cb, char kind, unsigned ns, unsigned *ri, id<MTLCo
         objc_setAssociatedObject(cb, kCBF, ct, OBJC_ASSOCIATION_RETAIN);
         atomic_fetch_add(&f->pending, 1);
         [(id<MTLCommandBuffer>)cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
-            unsigned k = atomic_fetch_add(&f->ncbt, 1);
-            if (k < 512) { f->cb_t[k][0] = c.GPUStartTime; f->cb_t[k][1] = c.GPUEndTime; }
+            unsigned k = ct->n; // Keep the execution bounds attached to their command buffer, despite completion order.
+            if (k < 512 && c.status == MTLCommandBufferStatusCompleted) {
+                f->cb_t[k][0] = c.GPUStartTime; f->cb_t[k][1] = c.GPUEndTime;
+            }
+            atomic_fetch_add(&f->ncbt, 1);
             frame_release(f);
         }];
     }
@@ -450,8 +479,60 @@ void vxprof_install_encoders(Class rc, Class cc) {   // (vxmtl.m macos_only_meth
     hook_compute_class(cc);
 }
 
+void vxprof_configure_startup(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Metal's constructors queried the environment before the host parsed
+        // Documents/-env. Recheck once, before game/presenter threads are started.
+        if (vxprof_enabled) return;
+        g_on = -1;
+        if (vxprof_on() != 1) return;
+        @autoreleasepool {
+            id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+            id<MTLCommandQueue> q = [dev newCommandQueue];
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            if (!ce) {
+                g_on = 0;
+                vxmac_log("Metal: startup pass profile unavailable (no compute encoder)");
+                return;
+            }
+            [ce endEncoding];
+            vxprof_install_encoders(Nil, object_getClass(ce));
+            vxprof_install_cb_class(object_getClass(cb));
+            vxmac_log("Metal: startup pass profile configured after host arguments");
+        }
+    });
+}
+
 // ---- results -------------------------------------------------------------------------------------------------------
 static int valid(uint64_t v) { return v != 0 && v != MTLCounterErrorValue; }
+// An unexecuted render stage can leave an older sample in a reused counter buffer. Only accept pairs
+// inside this encoder's completed command buffer. Omit unused stages; reject missing samples of actual work.
+static void validate_timing(prec *r, double cb_start, double cb_end) {
+    int ren = r->kind == 'R' || r->kind == 'P';
+    unsigned pairs = ren ? 2 : 1, expected = 0;
+    if (r->kind == 'P') expected = 3; // Parallel children are not individually recorded here.
+    else if (r->kind == 'R') {
+        if (r->npipes || r->more_pipes) expected = 1;
+        for (unsigned j = 0; j < r->npipes; j++) if (tolower((unsigned char)r->pipes[j].kind) == 'f') expected |= 2;
+        if (r->more_pipes) expected |= 2;
+    } else if (r->kind != 'C' || r->dispatches || r->indirect) expected = 1;
+    r->timing_valid = r->timing_omitted = r->timing_bad = 0;
+    // GPUStartTime and timestamp counters use the same clock on the supported Apple GPUs.
+    // Allow 50 us for boundary rounding, not an old sample from an earlier frame/window.
+    double lo = cb_start * 1e9 - 50000, hi = cb_end * 1e9 + 50000;
+    int bounds = isfinite(cb_start) && isfinite(cb_end) && cb_start > 0 && cb_end > cb_start;
+    for (unsigned j = 0; j < pairs; j++) {
+        uint64_t a = r->t[2*j], z = r->t[2*j+1];
+        if (bounds && valid(a) && valid(z) && z >= a && (double)a >= lo && (double)z <= hi) r->timing_valid |= 1u << j;
+        else {
+            r->t[2*j] = r->t[2*j+1] = 0;
+            if (expected & (1u << j)) r->timing_bad |= 1u << j;
+            else r->timing_omitted |= 1u << j;
+        }
+    }
+}
 static void sig_of(const prec *r, char *o, size_t n) {   // (signature: kind, attachments, pipelines)
     snprintf(o, n, "%c %s |", r->kind, r->att);
     unsigned np = r->npipes + r->more_pipes;
@@ -500,6 +581,8 @@ static int cmp_ev(const void *a, const void *b) { const double *x = a, *y = b; r
 //  time with the work it waits on. The window's first frame can still overlap the unsampled frame before it: it is
 //  written (lead=1) but left out of the window's groups (PTOP) and totals (PWIN) when the window has more frames.)
 static NSMutableArray<VXPFrame *> *g_wf;   // (the frames of the window being completed, on g_q)
+static NSMutableDictionary<NSNumber *, NSMutableDictionary<NSNumber *, VXPFrame *> *> *g_ready_windows;
+static NSMutableSet<NSNumber *> *g_finished_windows;
 static void process_window(void) {
     NSArray<VXPFrame *> *fs = [g_wf copy]; [g_wf removeAllObjects];
     if (!fs.count) return;
@@ -556,8 +639,9 @@ static void process_window(void) {
             double sp = a < 1e300 && z > a ? (z - a) / 1e6 : 0, sh = share[fi][i] / 1e6;
             char pl[MAXP * 19 + 16] = "";
             for (unsigned j = 0; j < r->npipes; j++) { size_t k = strlen(pl); snprintf(pl + k, sizeof pl - k, "%s%c%016llx", j ? "," : "", r->pipes[j].kind, (unsigned long long)r->pipes[j].h); }
-            fout("PENC w%u.%u i%u k=%c%s q%u cb%u start_ms=%.3f span_ms=%.3f vtx_ms=%.3f frag_ms=%.3f share_ms=%.3f sets=%u disp=%u ind=%u mthreads=%.3f label=%s att=%s pipes=%u:%s%s",
-                 f->window, f->frame, i, r->kind, r->ours ? " ours=1" : "", r->q, r->cb, a < 1e300 && t0 < 1e300 ? (a - t0) / 1e6 : -1, sp, vt, ft, sh, r->pipe_sets, r->dispatches, r->indirect, r->threads / 1e6,
+            fout("PENC w%u.%u i%u k=%c%s q%u cb%u start_ms=%.3f span_ms=%.3f vtx_ms=%.3f frag_ms=%.3f share_ms=%.3f timing_valid=%u timing_omitted=%u timing_bad=%u sets=%u disp=%u ind=%u mthreads=%.3f label=%s att=%s pipes=%u:%s%s",
+                 f->window, f->frame, i, r->kind, r->ours ? " ours=1" : "", r->q, r->cb, a < 1e300 && t0 < 1e300 ? (a - t0) / 1e6 : -1, sp, vt, ft, sh,
+                 r->timing_valid, r->timing_omitted, r->timing_bad, r->pipe_sets, r->dispatches, r->indirect, r->threads / 1e6,
                  r->label[0] ? r->label : "-", r->att[0] ? r->att : "-", r->npipes + r->more_pipes, pl[0] ? pl : "-", r->more_pipes ? ",..." : "");
             int ki = r->ours ? 4 : ren ? 0 : r->kind == 'C' ? 1 : r->kind == 'B' ? 2 : 3;
             kind_ms[ki] += sh; if (r->ours) ours_ms += sh;
@@ -579,6 +663,29 @@ static void process_window(void) {
     free(share); free(busy); free(ev); free(act);
     agg_flush();
 }
+static int collect_window_frame(VXPFrame *f) {  // Called only on the resolution queue.
+    if (!g_ready_windows) g_ready_windows = [NSMutableDictionary dictionary];
+    if (!g_finished_windows) g_finished_windows = [NSMutableSet set];
+    NSNumber *window = @(f->window), *index = @(f->frame);
+    NSMutableDictionary *frames = g_ready_windows[window];
+    if (!f->window || f->window > g_max_windows || f->frame >= g_frames ||
+        [g_finished_windows containsObject:window] || frames[index]) {
+        fout("PWARN w%u invalid_or_duplicate_frame=%u", f->window, f->frame);
+        return 0;
+    }
+    if (!frames) { frames = [NSMutableDictionary dictionary]; g_ready_windows[window] = frames; }
+    frames[index] = f;
+    if (frames.count == g_frames) {
+        // Completion callbacks can arrive in any order, even across windows.
+        // Never sweep just the tail of a window and later count its head again.
+        g_wf = [NSMutableArray arrayWithCapacity:g_frames];
+        for (unsigned i = 0; i < g_frames; i++) [g_wf addObject:frames[@(i)]];
+        [g_ready_windows removeObjectForKey:window];
+        [g_finished_windows addObject:window];
+        process_window();
+    }
+    return 1;
+}
 static void finish(VXPFrame *f) {   // (on g_q: every command buffer of the frame completed)
     @autoreleasepool {
     for (unsigned b = 0; b < f->nsb; b++) {
@@ -593,10 +700,13 @@ static void finish(VXPFrame *f) {   // (on g_q: every command buffer of the fram
         @synchronized (g_pool) { [g_pool addObject:f->sb[b]]; }
         f->sb[b] = nil;
     }
-    if (!g_wf) g_wf = [NSMutableArray array];
-    if (g_wf.count && g_wf.lastObject->window != f->window) process_window();   // (an earlier window left incomplete)
-    [g_wf addObject:f];
-    if (f->frame + 1 >= g_frames) process_window();
+    for (unsigned i = 0; i < f->nrec; i++) {
+        prec *r = &f->recs[i]; if (r->kind == 'x') continue;
+        double a = r->cb < 512 ? f->cb_t[r->cb][0] : 0, z = r->cb < 512 ? f->cb_t[r->cb][1] : 0;
+        validate_timing(r, a, z);
+        if (r->timing_bad) fout("PWARN w%u invalid_timing_frame=%u encoder=%u mask=%u", f->window, f->frame, i, r->timing_bad);
+    }
+    collect_window_frame(f);
     }
 }
 
@@ -604,8 +714,9 @@ static void finish(VXPFrame *f) {   // (on g_q: every command buffer of the fram
 static void setup(void) {
     const char *e;
     if ((e = getenv("VXMAC_PASS_PROFILE_EVERY")) && *e) g_every = atof(e);
-    if ((e = getenv("VXMAC_PASS_PROFILE_FRAMES")) && *e && atoi(e) > 0) g_frames = (unsigned)atoi(e);
-    if ((e = getenv("VXMAC_PASS_PROFILE_MAX")) && *e && atoi(e) > 0) g_max_windows = (unsigned)atoi(e);
+    if ((e = getenv("VXMAC_PASS_PROFILE_FRAMES")) && *e && atoi(e) > 0) g_frames = MIN(16u, (unsigned)atoi(e));
+    if ((e = getenv("VXMAC_PASS_PROFILE_MAX")) && *e && atoi(e) > 0) g_max_windows = MIN(240u, (unsigned)atoi(e));
+    g_driving_only = (e = getenv("VXMAC_PASS_PROFILE_DRIVING")) && !strcmp(e, "1");
     if ((e = getenv("VXMAC_PASS_PROFILE")) && !strcmp(e, "overlap")) g_mode = 1;
     else if (e && !strcmp(e, "serial")) g_mode = 2;
     g_dev = MTLCreateSystemDefaultDevice();
@@ -620,8 +731,15 @@ static void setup(void) {
     if (![ps isAbsolutePath]) ps = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:ps];
     g_f = fopen(ps.fileSystemRepresentation, "w");
     MTLTimestamp c, gt; [g_dev sampleTimestamps:&c gpuTimestamp:&gt];
-    fout("PPROF v1 mode=%s device=%s every_s=%.2f frames=%u max_windows=%u sample_buffer=%lu cpu_ts=%llu gpu_ts=%llu (timestamps ns, GPUStartTime's clock)", g_mode == 0 ? "alternate" : g_mode == 1 ? "overlap" : "serial", g_dev.name.UTF8String,
-         g_every, g_frames, g_max_windows, (unsigned long)g_sb_n, (unsigned long long)c, (unsigned long long)gt);
+    double mono = CACurrentMediaTime(), unix_s = NSDate.date.timeIntervalSince1970;
+    double clock_pair_ms = (CACurrentMediaTime() - mono) * 1e3;
+    fout("PPROF v4 timing_bounds=1 function_names=1 mode=%s device=%s every_s=%.2f frames=%u max_windows=%u sample_buffer=%lu cpu_ts=%llu gpu_ts=%llu mono_s=%.6f unix_s=%.6f clock_pair_ms=%.3f driving_only=%d (timestamps ns, GPUStartTime's clock)", g_mode == 0 ? "alternate" : g_mode == 1 ? "overlap" : "serial", g_dev.name.UTF8String,
+         g_every, g_frames, g_max_windows, (unsigned long)g_sb_n, (unsigned long long)c, (unsigned long long)gt,
+         mono, unix_s, clock_pair_ms, g_driving_only);
+    pthread_mutex_lock(&g_names_lock);
+    g_names_ready = 1;
+    for (NSString *key in g_function_names) fout("PNAME key=%s name=%s source=function_name", key.UTF8String, g_function_names[key].UTF8String);
+    pthread_mutex_unlock(&g_names_lock);
     if (g_f) fflush(g_f);
     vxprof_enabled = 1;
     g_win_left = g_max_windows; g_next_at = CACurrentMediaTime() + (g_every > 0 ? g_every : 0);
@@ -637,10 +755,11 @@ void vxprof_frame(void) {
     VXPFrame *old = g_cur; g_cur = nil;
     double now = CACurrentMediaTime();
     g_frame_n++;
-    if (!left_in_window && g_win_left && now >= g_next_at) { left_in_window = g_frames; wnum++; g_win_left--; g_next_at = now + g_every; }
+    int driving = drv ? drv() : -1;
+    if (!left_in_window && g_win_left && now >= g_next_at && (!g_driving_only || driving == 1)) { left_in_window = g_frames; wnum++; g_win_left--; g_next_at = now + g_every; }
     if (left_in_window) {
         VXPFrame *f = [VXPFrame new];
-        f->window = wnum; f->frame = g_frames - left_in_window; f->gframe = g_frame_n; f->t_cpu = now; f->serial = g_mode == 2 || (g_mode == 0 && !(wnum & 1)); f->driving = drv ? drv() : -1;
+        f->window = wnum; f->frame = g_frames - left_in_window; f->gframe = g_frame_n; f->t_cpu = now; f->serial = g_mode == 2 || (g_mode == 0 && !(wnum & 1)); f->driving = driving;
         g_cur = f; left_in_window--;
     }
     g_window = wnum;

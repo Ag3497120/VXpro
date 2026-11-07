@@ -2,7 +2,7 @@
 // Optional VX Hands input overlay. The game owns the weapon and its ammunition.
 @addField(WeaponObject)
 // 0 ready, 1 ejected, 2 inserted, 3 refilling, 4 refilling while waiting
-// for a pistol slide, 5 filled pistol waiting for slide, 6 slide pulled before refill,
+// for a pistol slide, 5 seated pistol magazine waiting for slide (native ammo still empty), 6 slide pulled before refill,
 // 7 verifying native refill, 8 verifying refill while waiting for the slide.
 public let vxHandsMagazinePhase: Int32;
 @addField(WeaponObject)
@@ -62,6 +62,130 @@ private let vxHandsCommandsRunning: Bool;
 private let vxHandsLastCommand: String;
 @addField(PlayerPuppet)
 private let vxHandsLastAck: String;
+@addField(PlayerPuppet)
+private let vxHandsContextTick: Int32;
+@addField(PlayerPuppet)
+private let vxHandsLastContext: String;
+@addField(PlayerPuppet)
+private let vxHandsMenuCallback: CallbackHandle;
+@addField(PlayerPuppet)
+private let vxHandsFootFOV: Float;
+@addField(PlayerPuppet)
+private let vxHandsVehiclePitchReady: Bool;
+@addField(PlayerPuppet)
+private let vxHandsMountViewRequested: Bool;
+
+@addMethod(PlayerPuppet)
+public func VXHandsVehicleViewEnabled() -> Bool {
+    return this.vxHandsCommandsRunning;
+}
+
+@addMethod(PlayerPuppet)
+public func VXHandsSetVehiclePitchReady(ready: Bool) {
+    this.vxHandsVehiclePitchReady = ready;
+}
+
+// Read the lens for diagnostics only. Vehicle look and seat-camera setup are
+// independent of it; no FOV property is written by this overlay.
+@addMethod(PlayerPuppet)
+private func VXHandsVehicleView(mounted: Bool, mode: Int32, tier: Int32) {
+    let camera = this.GetFPPCameraComponent();
+    if !IsDefined(camera) { return; }
+    let ui = GameInstance.GetBlackboardSystem(this.GetGame()).Get(GetAllBlackboardDefs().UI_System);
+    let menu = IsDefined(ui) && ui.GetBool(GetAllBlackboardDefs().UI_System.IsInMenu);
+    let nativeFOV = GameInstance.GetCameraSystem(this.GetGame()).GetActiveCameraFOV();
+    let perspective: Int32 = 7;
+    let vehicle = this.GetMountedVehicle();
+    if mounted && IsDefined(vehicle) {
+        perspective = EnumInt(vehicle.GetCameraManager().GetActivePerspective());
+    }
+    let normalView = !menu && tier < 2;
+    let driverView = mounted && normalView && (mode == 1 || mode == 3);
+    if this.vxHandsFootFOV <= 0.0 && camera.GetFOV() > 20.0 && camera.GetFOV() < 140.0 {
+        this.vxHandsFootFOV = camera.GetFOV(); // direct load in a vehicle: component's base lens until a foot sample
+    }
+    if !mounted {
+        this.vxHandsMountViewRequested = false;
+        if normalView && camera.GetZoom() <= 1.05 && nativeFOV > 20.0 && nativeFOV < 140.0 {
+            this.vxHandsFootFOV = nativeFOV;
+        }
+    }
+    // Start a new VR ride at the seat, not on a camera orbit metres away.
+    // Do not request a camera during a scene/transition or keep fighting a later
+    // manual perspective switch. Confirmation comes from GetActivePerspective.
+    if driverView && !this.vxHandsMountViewRequested {
+        let request = new vehicleRequestCameraPerspectiveEvent();
+        request.cameraPerspective = vehicleCameraPerspective.FPP;
+        this.QueueEvent(request);
+        this.vxHandsMountViewRequested = true;
+    }
+    if driverView && perspective == 0 && !this.vxHandsVehiclePitchReady {
+        // A save can load already mounted, before the host mailbox is ready at
+        // the normal vehicle setup boundary. Apply the same inputs once here.
+        let look = new AnimFeature_CameraGameplay();
+        look.is_pitch_off = 0.0;
+        look.is_yaw_off = 0.0;
+        AnimationControllerComponent.ApplyFeature(this, n"CameraGameplay", look);
+        AnimationControllerComponent.ApplyFeature(this, n"CameraBodyOffset", new AnimFeature_CameraBodyOffset());
+        this.vxHandsVehiclePitchReady = true;
+    }
+    ResourceMetricsReportGenerator.WriteReportToFile("VXW1|J|" + IntToString(perspective) + "|" +
+        (this.vxHandsVehiclePitchReady ? "1" : "0") + "|0|" +
+        FloatToString(nativeFOV) + "|" + FloatToString(this.vxHandsFootFOV));
+}
+
+// A VR camera looks independently of the animated upper body. Vehicle records
+// can disable pitch and add look-dependent camera translation. Replace those
+// two animation inputs at their native setup boundary, not by accumulating mouse
+// corrections against a disabled axis. The game's reset still runs on exit.
+@wrapMethod(VehicleTransition)
+protected final func SetVehFppCameraParams(stateContext: ref<StateContext>, scriptInterface: ref<StateGameScriptInterface>,
+    isPassenger: Bool, opt side: Bool, opt combat: Bool) {
+    wrappedMethod(stateContext, scriptInterface, isPassenger, side, combat);
+    let player = scriptInterface.executionOwner as PlayerPuppet;
+    if !IsDefined(player) || !player.VXHandsVehicleViewEnabled() { return; }
+    player.VXHandsSetVehiclePitchReady(!combat);
+    if combat { return; }
+    let look = new AnimFeature_CameraGameplay();
+    look.is_pitch_off = 0.0;
+    look.is_yaw_off = 0.0;
+    scriptInterface.SetAnimationParameterFeature(n"CameraGameplay", look, player);
+    scriptInterface.SetAnimationParameterFeature(n"CameraBodyOffset", new AnimFeature_CameraBodyOffset(), player);
+}
+
+@wrapMethod(VehicleTransition)
+protected final func ResetVehFppCameraParams(stateContext: ref<StateContext>, scriptInterface: ref<StateGameScriptInterface>) {
+    wrappedMethod(stateContext, scriptInterface);
+    let player = scriptInterface.executionOwner as PlayerPuppet;
+    if IsDefined(player) { player.VXHandsSetVehiclePitchReady(false); }
+}
+
+@addMethod(PlayerPuppet)
+protected cb func OnVXHandsMenuChanged(open: Bool) -> Bool {
+    ResourceMetricsReportGenerator.WriteReportToFile("VXW1|M|" + (open ? "1" : "0"));
+    return true;
+}
+
+@addMethod(PlayerPuppet)
+public func VXHandsPublishContext() {
+    let board = GameInstance.GetBlackboardSystem(this.GetGame())
+        .GetLocalInstanced(this.GetEntityID(), GetAllBlackboardDefs().PlayerStateMachine);
+    if !IsDefined(board) { return; }
+    let mounted = VehicleComponent.IsMountedToVehicle(this.GetGame(), this);
+    let vehicle = board.GetInt(GetAllBlackboardDefs().PlayerStateMachine.Vehicle);
+    let scene = board.GetInt(GetAllBlackboardDefs().PlayerStateMachine.HighLevel);
+    let report = "VXW1|C|" + (mounted ? "1" : "0") + "|" + IntToString(vehicle) + "|" + IntToString(scene);
+    this.VXHandsVehicleView(mounted, vehicle, scene);
+    this.vxHandsContextTick += 1;
+    if NotEquals(report, this.vxHandsLastContext) || this.vxHandsContextTick >= 5 {
+        this.vxHandsLastContext = report;
+        this.vxHandsContextTick = 0;
+        ResourceMetricsReportGenerator.WriteReportToFile("VXW1|V|5");
+        ResourceMetricsReportGenerator.WriteReportToFile(report);
+        let ui = GameInstance.GetBlackboardSystem(this.GetGame()).Get(GetAllBlackboardDefs().UI_System);
+        if IsDefined(ui) { this.OnVXHandsMenuChanged(ui.GetBool(GetAllBlackboardDefs().UI_System.IsInMenu)); }
+    }
+}
 
 @addMethod(PlayerPuppet)
 public func VXHandsStartCommands() {
@@ -71,6 +195,13 @@ public func VXHandsStartCommands() {
     let packet = IntToString(1448626226);
     if !StrBeginsWith(packet, "VXH2|") { return; }
     this.vxHandsCommandsRunning = true;
+    // A paused menu can suspend the game-time poll. Its blackboard callback
+    // still reports the transition; cursor association alone also occurs in dialogue.
+    let ui = GameInstance.GetBlackboardSystem(this.GetGame()).Get(GetAllBlackboardDefs().UI_System);
+    if IsDefined(ui) && !IsDefined(this.vxHandsMenuCallback) {
+        this.vxHandsMenuCallback = ui.RegisterListenerBool(GetAllBlackboardDefs().UI_System.IsInMenu,
+            this, n"OnVXHandsMenuChanged", true);
+    }
     this.VXHandsProbePoseContexts();
     ResourceMetricsReportGenerator.WriteReportToFile("VXW1|T|game-thread-commands-ready");
     GameInstance.GetDelaySystem(this.GetGame()).DelayEvent(this, new VXHandsPollCommands(), 0.02, false);
@@ -88,6 +219,7 @@ protected cb func OnVXHandsPollCommands(event: ref<VXHandsPollCommands>) -> Bool
         return true;
     }
     let parts = StrSplit(packet, "|");
+    this.VXHandsPublishContext();
     if ArraySize(parts) == 5 {
         if Equals(packet, this.vxHandsLastCommand) {
             ResourceMetricsReportGenerator.WriteReportToFile(this.vxHandsLastAck);
@@ -171,8 +303,30 @@ public func VXHandsEjectMagazine(weapon: wref<WeaponObject>) {
     GameInstance.GetDelaySystem(this.GetGame()).DelayEvent(this, confirm, 0.08, false);
 }
 
+@addMethod(PlayerPuppet)
+private func VXHandsFillPistolAfterRack(weapon: wref<WeaponObject>) -> Bool {
+    if !IsDefined(weapon) || !WeaponObject.CanReload(weapon) { return false; }
+    // Native ammo changes also drive the slide's animation graph. Do this
+    // only after the physical rack, including on render parts we cannot skin.
+    let fill = new SetAmmoCountEvent();
+    fill.ammoTypeID = WeaponObject.GetAmmoType(weapon);
+    fill.count = Cast<Uint32>(Min(Cast<Int32>(WeaponObject.GetMagazineCapacity(weapon)), Max(0, weapon.GetTotalAmmoCount())));
+    weapon.vxHandsMagazinePhase = 7;
+    weapon.vxHandsReloadSequence += 1;
+    weapon.QueueEvent(fill);
+    let verify = new VXHandsFinishReload();
+    verify.weapon = weapon;
+    verify.sequence = weapon.vxHandsReloadSequence;
+    verify.attempt = 1;
+    GameInstance.GetDelaySystem(this.GetGame()).DelayEvent(this, verify, 0.10, false);
+    return true;
+}
+
 @wrapMethod(PlayerPuppet)
 protected cb func OnAction(action: ListenerAction, consumer: ListenerActionConsumer) -> Bool {
+    if VehicleComponent.IsMountedToVehicle(this.GetGame(), this) {
+        return wrappedMethod(action, consumer);
+    }
     let command = ListenerAction.GetName(action);
     if NotEquals(command, n"Reload") && NotEquals(command, n"VXHandsEject") &&
         NotEquals(command, n"VXHandsInsert") && NotEquals(command, n"VXHandsChamber") {
@@ -212,7 +366,9 @@ private func VXHandsExecuteMagazineCommand(weapon: wref<WeaponObject>, command: 
         GameInstance.GetDelaySystem(this.GetGame()).DelayEvent(this, confirm, 0.08, false);
     } else if command == 3 &&
         Equals(WeaponObject.GetWeaponType(weapon.GetItemID()), gamedataItemType.Wea_Handgun) {
-        if (weapon.vxHandsMagazinePhase == 0 || weapon.vxHandsMagazinePhase == 5) && !weapon.IsMagazineEmpty() {
+        if weapon.vxHandsMagazinePhase == 5 && weapon.IsMagazineEmpty() {
+            return this.VXHandsFillPistolAfterRack(weapon);
+        } else if (weapon.vxHandsMagazinePhase == 0 || weapon.vxHandsMagazinePhase == 5) && !weapon.IsMagazineEmpty() {
             weapon.vxHandsMagazinePhase = 0;
             weapon.vxHandsNeedsRack = false;
             ScriptLog("VX Hands: game confirmed manual chamber");
@@ -240,17 +396,25 @@ protected cb func OnVXHandsFinishReload(event: ref<VXHandsFinishReload>) -> Bool
                 WeaponObject.SendAmmoUpdateEvent(this, weapon);
                 ScriptLog("VX Hands: game confirmed empty magazine");
                 if (weapon.vxHandsMagazinePhase == 2 || weapon.vxHandsMagazinePhase == 6) && WeaponObject.CanReload(weapon) {
-                    let manual = Equals(WeaponObject.GetWeaponType(weapon.GetItemID()), gamedataItemType.Wea_Handgun) &&
-                        weapon.vxHandsMagazinePhase != 6;
-                    weapon.vxHandsMagazinePhase = manual ? 4 : 3;
-                    weapon.vxHandsReloadSequence += 1;
-                    // Refill on insertion for every gun. A handgun keeps its
-                    // trigger locked until the separate physical slide action.
-                    let duration = weapon.StartReload();
-                    let finish = new VXHandsFinishReload();
-                    finish.weapon = weapon;
-                    finish.sequence = weapon.vxHandsReloadSequence;
-                    GameInstance.GetDelaySystem(this.GetGame()).DelayEvent(this, finish, MaxF(0.10, duration), false);
+                    let handgun = Equals(WeaponObject.GetWeaponType(weapon.GetItemID()), gamedataItemType.Wea_Handgun);
+                    let manual = handgun && weapon.vxHandsMagazinePhase != 6;
+                    if handgun {
+                        if manual {
+                            weapon.vxHandsMagazinePhase = 5;
+                            weapon.vxHandsNeedsRack = true;
+                            weapon.vxHandsReloadSequence += 1;
+                        } else {
+                            this.VXHandsFillPistolAfterRack(weapon);
+                        }
+                    } else {
+                        weapon.vxHandsMagazinePhase = 3;
+                        weapon.vxHandsReloadSequence += 1;
+                        let finish = new VXHandsFinishReload();
+                        finish.weapon = weapon;
+                        finish.sequence = weapon.vxHandsReloadSequence;
+                        let duration = weapon.StartReload();
+                        GameInstance.GetDelaySystem(this.GetGame()).DelayEvent(this, finish, MaxF(0.10, duration), false);
+                    }
                 }
             } else {
                 if weapon.vxHandsMagazinePhase == 1 || weapon.vxHandsMagazinePhase == 2 || weapon.vxHandsMagazinePhase == 6 {
@@ -328,7 +492,8 @@ protected const final func HandleWeaponEquip(scriptInterface: StateGameScriptInt
 private func VXHandsRackPending(scriptInterface: StateGameScriptInterface) -> Bool {
     let player = scriptInterface.executionOwner as PlayerPuppet;
     let weapon = scriptInterface.owner as WeaponObject;
-    return IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) && IsDefined(weapon) && weapon.vxHandsNeedsRack;
+    return IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) &&
+        !VehicleComponent.IsMountedToVehicle(player.GetGame(), player) && IsDefined(weapon) && weapon.vxHandsNeedsRack;
 }
 
 @wrapMethod(WeaponTransition)
@@ -345,7 +510,8 @@ protected const final func EnterCondition(const stateContext: StateContext, cons
 protected const func ToReload(const stateContext: StateContext, const scriptInterface: StateGameScriptInterface) -> Bool {
     let player = scriptInterface.executionOwner as PlayerPuppet;
     let weapon = scriptInterface.owner as WeaponObject;
-    if IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) && IsDefined(weapon) &&
+    if IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) &&
+        !VehicleComponent.IsMountedToVehicle(player.GetGame(), player) && IsDefined(weapon) &&
         weapon.IsRanged() && WeaponObject.GetMagazineCapacity(weapon) > 0u {
         if scriptInterface.IsActionJustTapped(n"Reload") {
             player.VXHandsEjectMagazine(weapon);
@@ -359,7 +525,8 @@ protected const func ToReload(const stateContext: StateContext, const scriptInte
 protected const func EnterCondition(const stateContext: StateContext, const scriptInterface: StateGameScriptInterface) -> Bool {
     let player = scriptInterface.executionOwner as PlayerPuppet;
     let weapon = scriptInterface.owner as WeaponObject;
-    if IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) && IsDefined(weapon) &&
+    if IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) &&
+        !VehicleComponent.IsMountedToVehicle(player.GetGame(), player) && IsDefined(weapon) &&
         weapon.IsRanged() && WeaponObject.GetMagazineCapacity(weapon) > 0u {
         if scriptInterface.IsActionJustTapped(n"Reload") {
             player.VXHandsEjectMagazine(weapon);

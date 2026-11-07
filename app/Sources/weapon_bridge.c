@@ -42,6 +42,7 @@ static atomic_bool attached;
 static atomic_bool commands_enabled, poll_attached;
 static pthread_mutex_t snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
 static vx_weapon_snapshot equipped;
+static vx_game_context game_context;
 static vx_weapon_bridge_diagnostic diagnostic;
 static struct {
     uint64_t serial, entity, record, generation;
@@ -61,6 +62,17 @@ static double bridge_now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+vx_game_context vx_weapon_bridge_context(void) {
+    pthread_mutex_lock(&snapshot_lock);
+    vx_game_context c = game_context;
+    pthread_mutex_unlock(&snapshot_lock);
+    double age = bridge_now() - c.received_at;
+    c.known = c.known && age >= 0 && age < 1.0;
+    age=bridge_now()-c.camera_received_at;
+    c.camera_known=c.camera_known && c.known && age>=0 && age<1.0;
+    return c;
 }
 
 void vx_weapon_bridge_publish_hands(const float head[16], const float wrists[20],
@@ -168,16 +180,22 @@ void vx_weapon_bridge_status_json(char *out, unsigned size) {
     vx_weapon_snapshot weapon = vx_weapon_bridge_snapshot();
     vx_weapon_bridge_diagnostic status = vx_weapon_bridge_diagnostics();
     vx_weapon_hand_frame hands = vx_weapon_bridge_hands();
+    vx_game_context context=vx_weapon_bridge_context();
     snprintf(out, size, "\"weapon_bridge\":{\"attached\":%d,\"ready\":%d,\"entity\":%llu,\"record\":%llu,"
              "\"generation\":%llu,\"phase\":%d,\"ammo\":%u,\"capacity\":%u,\"command\":%llu,\"command_status\":%d,"
-             "\"hands\":%llu,\"hands_valid\":%d,\"pose_vtable\":[%llu,%llu,%llu,%llu],\"pose_seen\":[%llu,%llu,%llu,%llu]}",
+             "\"hands\":%llu,\"hands_valid\":%d,\"pose_vtable\":[%llu,%llu,%llu,%llu],\"pose_seen\":[%llu,%llu,%llu,%llu],"
+             "\"context\":{\"known\":%d,\"sequence\":%llu,\"mounted\":%d,\"vehicle\":%d,\"scene\":%d,\"menu_known\":%d,\"menu\":%d,\"script_revision\":%u,"
+             "\"camera_known\":%d,\"perspective\":%d,\"pitch_ready\":%d,\"fov_owned\":%d,\"native_fov\":%.2f,\"foot_fov\":%.2f}}",
              status.attached, status.commands_ready, (unsigned long long)weapon.entity, (unsigned long long)weapon.record,
              (unsigned long long)weapon.generation, weapon.reload_phase, weapon.ammo, weapon.capacity,
              (unsigned long long)weapon.command_serial, weapon.command_status, (unsigned long long)hands.sequence, hands.valid,
              (unsigned long long)status.pose_vtable[0], (unsigned long long)status.pose_vtable[1],
              (unsigned long long)status.pose_vtable[2], (unsigned long long)status.pose_vtable[3],
              (unsigned long long)status.pose_observations[0], (unsigned long long)status.pose_observations[1],
-             (unsigned long long)status.pose_observations[2], (unsigned long long)status.pose_observations[3]);
+             (unsigned long long)status.pose_observations[2], (unsigned long long)status.pose_observations[3],
+             context.known,(unsigned long long)context.sequence,context.mounted,context.vehicle_mode,
+             context.scene_tier,context.menu_known,context.menu_open,context.script_revision,
+             context.camera_known,context.vehicle_perspective,context.vehicle_pitch_ready,context.vehicle_fov_owned,context.native_fov,context.foot_fov);
 }
 
 static int next_uint(char **cursor, uint64_t *value) {
@@ -235,6 +253,44 @@ static void read_report(const char *message, size_t length) {
     memcpy(text, message, length);
     text[length] = 0;
     char kind = text[5], *cursor = text + 7;
+    if (kind == 'V') {
+        uint64_t revision;
+        if (text[6]!='|' || strchr(cursor,'|') || !next_uint(&cursor,&revision) || *cursor || revision<1 || revision>100) return;
+        pthread_mutex_lock(&snapshot_lock);game_context.script_revision=(unsigned)revision;pthread_mutex_unlock(&snapshot_lock);
+        return;
+    }
+    if (kind == 'M') {
+        uint64_t open;
+        if (text[6] != '|' || strchr(cursor,'|') || !next_uint(&cursor,&open) || *cursor || open>1) return;
+        pthread_mutex_lock(&snapshot_lock);
+        game_context.menu_known=1; game_context.menu_open=(int)open;
+        pthread_mutex_unlock(&snapshot_lock);
+        return;
+    }
+    if(kind=='J') {
+        uint64_t v[3];float f[2];
+        if(text[6]!='|')return;
+        for(int i=0;i<3;i++)if(!next_uint(&cursor,&v[i]))return;
+        for(int i=0;i<2;i++)if(!next_float(&cursor,&f[i],i==1))return;
+        if(*cursor || v[0]>7 || v[1]>1 || v[2]>1 || f[0]<0 || f[0]>=180 || f[1]<0 || f[1]>=180)return;
+        pthread_mutex_lock(&snapshot_lock);
+        game_context.camera_known=1;game_context.vehicle_perspective=(int)v[0];
+        game_context.vehicle_pitch_ready=(int)v[1];game_context.vehicle_fov_owned=(int)v[2];
+        game_context.native_fov=f[0];game_context.foot_fov=f[1];game_context.camera_received_at=bridge_now();
+        pthread_mutex_unlock(&snapshot_lock);return;
+    }
+    if (kind == 'C') {
+        uint64_t v[3];
+        if (text[6] != '|') return;
+        for (int i=0; i<3; i++) if (!next_uint(&cursor,&v[i])) return;
+        if (*cursor || v[0]>1 || v[1]>7 || v[2]>6) return;
+        pthread_mutex_lock(&snapshot_lock);
+        if(game_context.mounted!=(int)v[0] || game_context.vehicle_mode!=(int)v[1])game_context.camera_known=0;
+        game_context.known=1; game_context.mounted=(int)v[0]; game_context.vehicle_mode=(int)v[1];
+        game_context.scene_tier=(int)v[2]; game_context.sequence++; game_context.received_at=bridge_now();
+        pthread_mutex_unlock(&snapshot_lock);
+        return;
+    }
     uint64_t entity = 0, record = 0, ranged = 0, reload[5] = {0};
     float shot[6] = {0};
     if (kind == 'U') {

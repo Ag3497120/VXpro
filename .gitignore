@@ -9,3 +9,11 @@ xcuserdata/
 .DS_Store
 __pycache__/
 *.pyc
+
+# Generated diagnostic app projects and private compiled overlays
+**/*.xcodeproj/
+**/*.xcworkspace/
+*.redscripts
+*.dylib
+*.metallib
+*.air

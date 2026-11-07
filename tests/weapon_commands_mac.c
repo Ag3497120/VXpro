@@ -110,6 +110,17 @@ int main(void) {
     poll_packet(); assert(!strcmp(answer, "VXH2|idle"));
     poll_seen -= 1;
     assert(!vx_weapon_bridge_commands_ready() && !vx_weapon_bridge_command(VX_WEAPON_EJECT));
+    // A physically seated pistol magazine still has zero native rounds until
+    // the rack. This state must permit the explicit chamber command, without
+    // the acknowledgement inventing ammunition on the native side.
+    report("VXW1|R|10|43|1|5|0|8|1");poll_packet();
+    uint64_t chamber=vx_weapon_bridge_command(VX_WEAPON_CHAMBER);
+    assert(chamber);
+    poll_packet();assert(strstr(answer,"|3"));
+    ack(chamber,VX_WEAPON_CHAMBER,0);
+    assert(vx_weapon_bridge_snapshot().ammo==0 && vx_weapon_bridge_snapshot().reload_phase==5);
+    report("VXW1|R|10|43|1|0|8|8|2");
+    assert(vx_weapon_bridge_snapshot().ammo==8 && vx_weapon_bridge_snapshot().reload_phase==0);
     report("VXW1|U"); poll_packet();
     assert(!vx_weapon_bridge_commands_ready());
     munmap(base, size);

@@ -1,0 +1,33 @@
+name: VXFPSBudgetBench
+options:
+  deploymentTarget:
+    visionOS: "26.0"
+settings:
+  base:
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    CLANG_ENABLE_OBJC_ARC: YES
+    GENERATE_INFOPLIST_FILE: YES
+    DEAD_CODE_STRIPPING: YES
+    INFOPLIST_KEY_CFBundleDisplayName: "GPU Budget Test"
+    INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+    INFOPLIST_KEY_UILaunchScreen_Generation: YES
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  VXFPSBudgetBench:
+    type: application
+    platform: visionOS
+    sources:
+      - path: ../velocity_demand_mac.m
+      - path: ../warp_black_skip_mac.m
+      - path: ../fps_budget_app.h
+      - path: ../fps_budget_app.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.VXFPSBudgetBench
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) VXMAC_VELOCITY_DEMAND_APP=1 VXMAC_FPS_BUDGET_APP=1"
+        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/../../tests/fps_budget_app.h"
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework

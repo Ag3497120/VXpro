@@ -1,6 +1,6 @@
 # VXpro — hand-tracking branch
 
-**Temporary completion checkpoint (一時完成) · 2026-11-06.** This branch develops tracked hands and
+**Hand-tracking, performance and camera checkpoint · 2026-11-08.** This branch develops tracked hands and
 Joy-Con-assisted weapon handling. The standard controller version remains on
 [`main`](https://github.com/Ag3497120/VXpro/tree/main).
 
@@ -8,22 +8,43 @@ Joy-Con-assisted weapon handling. The standard controller version remains on
 
 ## Current hand-tracking state
 
-The player has accepted the current right-hand grip and left-hand support behavior in headset testing.
-This **一時完成** checkpoint preserves that installed state, including the support coordinate-space
-correction. It is a baseline for further polish, not an all-weapon compatibility claim.
+ARKit hand/wrist tracking drives the existing arm, hand and weapon bones through custom Metal rendering hooks.
+Joy-Con buttons provide movement, firing and other explicit actions. This is an experimental, controller-assisted
+hand-tracking branch, with weapon-specific compatibility still being tested.
 
-- ARKit wrist tracking moves the hands; Joy-Con buttons provide explicit actions. The weapon stays in the right hand.
-- ZR is the right-hand firing input. On long guns, holding ZL requests left-hand support and ADS; releasing it releases both.
-- X requests magazine ejection. The reload system supports magazine pickup/insertion, manual pistol slide interaction,
-  and automatic chambering for non-pistols through the game equipment/ammunition bridge. Compatibility remains weapon-specific.
-- Rendered hand/weapon corrections use independent, bounded GPU buffers and preserve the game's source palettes.
-- **Remaining polish / known issues:** pistol support hands could sit slightly closer together; on some weapons,
-  the sight or scope can separate from the gun. Both are retained as known issues in this checkpoint.
-- Other weapon-specific reload behavior and physical barrel-directed shot integration still need verification/work.
-- Existing NPU weight-edit experiments are included as offline tools. No edited model is enabled and no FPS gain is established.
+- The weapon stays in the right hand. ZR fires. On long guns, holding ZL requests left-hand support and ADS;
+  releasing it releases both. Reload interactions take priority over support.
+- X requests magazine ejection. The script/equipment bridge supports magazine pickup/insertion, manual pistol
+  slide interaction and automatic chambering for non-pistols. A signed app may embed a matching private reload overlay;
+  the source includes the compiler helper, not the compiled game cache.
+- Hand/weapon corrections use bounded independent GPU buffers and preserve the game's source palettes.
+- The accepted head-turn fix captures camera view and projection together on the owning Metal command buffer,
+  then uses that same snapshot when submitting the image. The user reported the walking head-turn rebound
+  completely resolved in the latest headset test.
+- Ordinary VR peripheral coverage has also been restored, with the user confirming the picture no longer has
+  the reported gaps and the head-turn rebound has not returned. Vehicle/story borders remain separate known issues.
+- **Known issues:** rectangular image borders remain during vehicle use and some story conversations/cutscenes.
+  Individual weapons, support spacing, sight/scope attachment and reload/slide visuals still need polish and verification.
+  Barrel-directed shot integration remains experimental.
 
-Implementation, controls and verification boundaries: [HAND_SESSION.md](HAND_SESSION.md),
-[design notes](docs/DESIGN.md), [NPU experiments](NPU_WEIGHT_EDIT.md).
+## Performance checkpoint
+
+A **60-second M2 test averaged 37.1 new game images per second** (the user identified the session as Phantom Liberty).
+The game submission counter measured 37.0 FPS over its sampling span. This is one session, not a minimum across scenes,
+and it predates the latest camera fix. **45 FPS is the next target, not an achieved result.**
+
+The source now includes frame pacing, bounded image slots, scheduled warp release, demand-driven history copying,
+and the profiling/comparison tools used during development. The tested hand build uses four image slots.
+See [release notes and tested settings](docs/RELEASE_2026_11_08.md) for the opt-in runtime flags and verification scope.
+
+Some testers find the headset view smoother than recordings. System reprojection or other display processing may
+contribute, but the cause and effective display cadence are unconfirmed; they are not added to the measured game FPS.
+NPU/weight-edit/frame-generation work is included as experimental tools; models remain disabled in the measured setup,
+and no NPU FPS gain has been established.
+
+Implementation and controls: [HAND_SESSION.md](HAND_SESSION.md), [design notes](docs/DESIGN.md).
+Camera/FPS evidence: [2026-11-08 release notes](docs/RELEASE_2026_11_08.md).
+Experiments: [frame pipeline](FRAME_PIPELINE.md), [NPU offload](NPU_OFFLOAD_RESULT.md), [weight editing](NPU_WEIGHT_EDIT.md).
 
 ## Integration plan
 
@@ -55,6 +76,9 @@ Without that private catalog the source builds with the existing generic fallbac
 all of the tested installation's weapon-specific contacts. Run `sh tools/check_hand_session.sh` for local checks.
 
 ## Base runtime and setup
+
+The Preview 0.3 notes below describe the original controller preview. The hand-tracking checkpoint and measured
+performance above are newer; historical rates and controls below are not a guarantee for this branch.
 
 Run Mac App Store games (Cyberpunk 2077) in VR on Apple Vision Pro — head look, depth reprojection, Neural Engine
 foveated upscaling. Free, MIT.

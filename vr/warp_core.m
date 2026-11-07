@@ -56,7 +56,7 @@ _Static_assert(offsetof(vxw_gpu_params, vmd) == offsetof(vxw_gpu_params, vig) + 
 // (kbs: output pixels per key block, 2 or more: a block of B (2 x 2) must cover a key block's neighbours, or holes stay
 //  unresolved (a black-edged grid) when the output is more than twice B's density - foveation's logical screen)
 // (flags2: 2 = a detail texture over the centre: dr its rectangle in B's UV (x, y, w, h), vxw_set_detail)
-enum { VXW2_DEPTH_OUT = 1, VXW2_DETAIL = 2, VXW2_HUD_MASK = 4 };
+enum { VXW2_DEPTH_OUT = 1, VXW2_DETAIL = 2, VXW2_HUD_MASK = 4, VXW2_EDGE_FILL = 8 };
 
 static const char *g_vxw_msl =
     "#include <metal_stdlib>\n"
@@ -182,7 +182,13 @@ static const char *g_vxw_msl =
     "        q.x += p.eye * clamp(p.S * (1 - iv / ic), -2 * p.pop * p.S, p.S) * osz.x / sz.x;\n"
     "    }\n"
     "    map.write(float4(q * sz / osz - pc, z, 1), g);\n"     // (the displacement in B's pixels)
-    "    atomic_fetch_max_explicit(mx, uint(min(length(m), 4095.0f) * 16), memory_order_relaxed);\n"
+    // mx is cleared to zero before the map. max(mx, 0) cannot change it;
+    // skipping that update also avoids one contended atomic per stationary block.
+    "    uint motion = uint(min(length(m), 4095.0f) * 16);\n"
+    "#if VXW_MOTION_SKIP_ZERO\n"
+    "    if (motion)\n"
+    "#endif\n"
+    "    atomic_fetch_max_explicit(mx, motion, memory_order_relaxed);\n"
     "    int2 tb = int2(floor(q / float(p.kbs)));\n"
     // (in front: the nearest, by the log of the inverse distance in the key's high bits)
     "    float top = float((1u << (32 - p.bits)) - 1);\n"
@@ -298,6 +304,9 @@ static const char *g_vxw_msl =
     // (VX Mac, h28: where the HUD mask says the HUD is (the regions drawn again near the centre), the frame's own copy
     //  filled from a ring around it, so the text is not seen twice)
     "static float3 vxw_col(texture2d<float> b, texture2d<float> dt, texture2d<float> hm, float2 su, constant W &p) {\n"
+    // Never stretch a dialogue's bright letterbox/edge across the missing view.
+    // The caller chooses the missing-view policy; actual frame pixels are kept.
+    "    if (!(p.flags2 & 8) && (any(su < 0) || any(su > 1))) return float3(0);\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
     "    float3 c = b.sample(s, vxw_mirror(su), level(0)).rgb;\n"
     // (h38: outside the frame the mirror blurred, more the farther out (up to ~4 % of the frame): no sharp mosaic)
@@ -413,6 +422,13 @@ static const char *g_vxw_msl =
     "    float4 v = vxw_dispf(disp, float2(g) + 0.5f, p);\n"
     "    float2 pb = (float2(g) + 0.5f) * float2(p.w, p.h) / float2(p.ow, p.oh);\n"
     "    float2 su = (pb - v.xy) / float2(p.w, p.h);\n"
+#if defined(VXW_BLACK_SKIP_BENCH)
+    "#if VXW_BLACK_SKIP\n"
+    "    if (vxw_visor(float3(1), su, (float2(g) + 0.5f) / float2(p.ow, p.oh), p).x == 0) {\n"
+    "        o.write(float4(0, 0, 0, 1), g); if (p.flags2 & 1) od.write(float4(vxw_out_depth(v.z, p)), g); return;\n"
+    "    }\n"
+    "#endif\n"
+#endif
     "#if VXW_INTERP\n"
     "    o.write(float4(vxw_visor(vxw_vm_fill(b, dp, su, v.z, p, vxw_icol(b, dt, hm, il, su, v.w < 1.5f ? v.w : 0, p)), su, (float2(g) + 0.5f) / float2(p.ow, p.oh), p), 1), g);\n"
     "#else\n"
@@ -439,6 +455,11 @@ static const char *g_vxw_msl =
     "#else\n"
     "    float4 v = vxw_dispf(disp, in.uv * float2(p.ow, p.oh), p);\n"
     "    float2 su = in.uv - v.xy / float2(p.w, p.h);\n"
+#if defined(VXW_BLACK_SKIP_BENCH)
+    "#if VXW_BLACK_SKIP\n"
+    "    if (vxw_visor(float3(1), su, in.uv, p).x == 0) return float4(0, 0, 0, 1);\n"
+    "#endif\n"
+#endif
     "    return float4(vxw_visor(vxw_vm_fill(b, dp, su, v.z, p, vxw_col(b, dt, hm, su, p)), su, in.uv, p), 1);\n"
     "#endif\n"
     "}\n"
@@ -453,6 +474,11 @@ static const char *g_vxw_msl =
     "    uint2 g = min(uint2(in.uv * float2(p.ow, p.oh)), uint2(p.ow, p.oh) - 1);\n"
     "    float4 v = vxw_dispf(disp, in.uv * float2(p.ow, p.oh), p);\n"
     "    float2 su = in.uv - v.xy / float2(p.w, p.h);\n"
+#if defined(VXW_BLACK_SKIP_BENCH)
+    "#if VXW_BLACK_SKIP\n"
+    "    if (vxw_visor(float3(1), su, in.uv, p).x == 0) { FD o; o.c=float4(0, 0, 0, 1); o.d=vxw_out_depth(v.z, p); return o; }\n"
+    "#endif\n"
+#endif
     "#if VXW_INTERP\n"
     "    FD o; o.c = float4(vxw_visor(vxw_vm_fill(b, dp, su, v.z, p, vxw_icol(b, dt, hm, il, su, v.w < 1.5f ? v.w : 0, p)), su, in.uv, p), 1); o.d = vxw_out_depth(v.z, p); return o;\n"
     "#else\n"
@@ -484,6 +510,7 @@ static const char *g_vxw_msl =
     "}\n";
 
 struct vxw_core {
+    int edge_fill;
     __strong id<MTLDevice> dev;
     __strong id<MTLComputePipelineState> map, resolve, gather, conv;
     __strong id<MTLFunction> vs, fs, fsd;
@@ -491,6 +518,10 @@ struct vxw_core {
     MTLPixelFormat draw_fmt[4][2];
     __strong id<MTLDepthStencilState> dss;
     __strong id<MTLLibrary> lib;
+    int motion_skip_zero;
+#if defined(VXW_BLACK_SKIP_BENCH)
+    int black_skip; // The rejected prototype is compiled only by its standalone comparison test.
+#endif
     __strong id<MTLTexture> dummy;     // (the depth out's binding when there is none)
     __strong id<MTLTexture> dummy_rd;  // (the detail's binding when there is none)
     __strong id<MTLTexture> detail; float drect[4];                 // (vxw_set_detail: for the next encodes)
@@ -520,11 +551,26 @@ vxw_core *vxw_create(void *mtl_device) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)mtl_device;
     if (!dev) return NULL;
     NSError *err = nil;
-    id<MTLLibrary> lib = [dev newLibraryWithSource:@(g_vxw_msl) options:nil error:&err];
+    const char *motion = getenv("VXMAC_WARP_MOTION_MAX");
+    int motion_skip_zero = motion && !strcmp(motion, "skip_zero");
+    MTLCompileOptions *options = nil;
+    if (motion_skip_zero) { options = [MTLCompileOptions new]; options.preprocessorMacros = @{ @"VXW_MOTION_SKIP_ZERO": @1 }; }
+#if defined(VXW_BLACK_SKIP_BENCH)
+    const char *skip = getenv("VXMAC_WARP_BLACK_SKIP");
+    int black_skip = skip && !strcmp(skip, "1");
+    if (black_skip) { if (!options) options = [MTLCompileOptions new];
+        options.preprocessorMacros = @{ @"VXW_BLACK_SKIP": @1, @"VXW_MOTION_SKIP_ZERO": @(motion_skip_zero) }; }
+#endif
+    id<MTLLibrary> lib = [dev newLibraryWithSource:@(g_vxw_msl) options:options error:&err];
     if (!lib) { NSLog(@"vxw: shaders: %@", err.localizedDescription); return NULL; }
     vxw_core *c = (vxw_core *)calloc(1, sizeof *c);
     if (!c) return NULL;
     c->dev = dev;
+    const char *edge=getenv("VXMAC_EDGE_FILL"); c->edge_fill=edge ? !strcmp(edge,"1") : -1;
+    c->motion_skip_zero = motion_skip_zero;
+#if defined(VXW_BLACK_SKIP_BENCH)
+    c->black_skip = black_skip;
+#endif
     c->lib = lib;
     c->map = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"vxw_map"] error:&err];
     c->resolve = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"vxw_resolve"] error:&err];
@@ -634,10 +680,11 @@ int vxw_encode_eye(vxw_core *c, void *command_buffer, const vxw_params *p, void 
     NSUInteger plen = ion ? sizeof P : offsetof(vxw_gpu_params, ip);
     memcpy(P.vmd, c->vmd, sizeof P.vmd); memcpy(P.vmr, c->vmr, sizeof P.vmr);
     memcpy(P.hr, c->hud_rects, sizeof P.hr);
+    if (c->edge_fill > 0 || (c->edge_fill < 0 && (p->flags & VXW_EDGE_FILL))) P.flags2 |= VXW2_EDGE_FILL;
     {   // (h57h: the head-locked vignette - margin inside the frame's coverage and feather, degrees; VXMAC_VIGNETTE=0 off)
-        static float m = -1, f = 8; static int on = 1;   // (6 deg inside the frame, 8 deg feather: ~85 % dark at the frame's edge)
+        static float m = -1, f = 8; static int on; // The comfort mask is optional, not a dialogue/vehicle overlay.
         if (m < 0) { const char *e = getenv("VXMAC_VIGNETTE_MARGIN"); m = e && *e ? (float)atof(e) : 6; e = getenv("VXMAC_VIGNETTE_FEATHER"); if (e && *e) f = (float)atof(e);
-                     e = getenv("VXMAC_VIGNETTE"); on = !(e && !strcmp(e, "0")); }
+                     e = getenv("VXMAC_VIGNETTE"); on = e && !strcmp(e, "1"); }
         // (h59: in tangents, worked out here once per encode - the opening's half-tangents and the feather's outer edge
         //  as a ratio; the shader does a length and a smoothstep a pixel, no atan (h57h: two a pixel over 2 x 1888x1792))
         float ax = atanf(p->tan_x), ay = atanf(p->tan_y), d2r = (float)M_PI / 180;
@@ -734,7 +781,11 @@ static int interp_lib(vxw_core *c) {
     if (c->ilib_state) return c->ilib_state > 0;
     c->ilib_state = -1;
     MTLCompileOptions *o = [MTLCompileOptions new];
-    o.preprocessorMacros = @{ @"VXW_INTERP": @1 };
+#if defined(VXW_BLACK_SKIP_BENCH)
+    o.preprocessorMacros = @{ @"VXW_INTERP": @1, @"VXW_BLACK_SKIP": @(c->black_skip), @"VXW_MOTION_SKIP_ZERO": @(c->motion_skip_zero) };
+#else
+    o.preprocessorMacros = @{ @"VXW_INTERP": @1, @"VXW_MOTION_SKIP_ZERO": @(c->motion_skip_zero) };
+#endif
     NSError *err = nil;
     id<MTLLibrary> lib = [c->dev newLibraryWithSource:@(g_vxw_msl) options:o error:&err];
     if (!lib) { NSLog(@"vxw: interp shaders: %@", err.localizedDescription); return 0; }

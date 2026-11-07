@@ -61,19 +61,21 @@ static int has_suffix(const char *path, const char *suffix) {
 // Optional per-user script overlay. The original game data stays untouched; a missing overlay falls back to the game.
 static const char *script_overlay(const char *path, char out[2048]) {
     const char *enabled = getenv("VXMAC_NO_AUTO_RELOAD"), *home = getenv("HOME"), *custom = getenv("VXMAC_SCRIPT_OVERLAY");
-    if (!enabled || strcmp(enabled, "1") || !path || (!home && !custom)) return path;
+    const char *directory=getenv("VXMAC_MANUAL_MAG_DIR");
+    if (!enabled || strcmp(enabled, "1") || !path || (!home && !custom && !directory)) return path;
     static int (*real_access)(const char *, int);
     if (!real_access) real_access = (int (*)(const char *, int))libsys("access");
     if (!real_access) return path;
     const char *manual = getenv("VXMAC_MANUAL_MAG_ACTIVE");
     int script = has_suffix(path, "r6/cache/final.redscripts");
     int k;
-    if (manual && !strcmp(manual, "1") && home) {
+    if (manual && !strcmp(manual, "1") && (home || (directory && directory[0]=='/'))) {
         const char *name = script ? "final.redscripts" :
                            has_suffix(path, "r6/config/inputUserMappings.xml") ? "inputUserMappings.xml" :
                            has_suffix(path, "r6/config/inputContexts.xml") ? "inputContexts.xml" : NULL;
         if (!name) return path;
-        k = snprintf(out, 2048, "%s/Documents/vxhands_manual/%s", home, name);
+        k = directory && directory[0]=='/' ? snprintf(out,2048,"%s/%s",directory,name) :
+            snprintf(out, 2048, "%s/Documents/vxhands_manual/%s", home, name);
     } else {
         if (!script) return path;
         k = custom && custom[0] == '/' ? snprintf(out, 2048, "%s", custom) :

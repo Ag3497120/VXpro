@@ -45,6 +45,16 @@ int main(void) {
     assert(!setenv("VXMAC_MANUAL_MAG_ACTIVE", "1", 1));
     assert(!setenv("VXMAC_WEAPON_BRIDGE", "1", 1));
     expect_file("/game/r6/cache/final.redscripts", "current reload policy");
+    char bundled[1024];snprintf(bundled,sizeof bundled,"%s/bundled",root);assert(!mkdir(bundled,0700));
+    snprintf(path,sizeof path,"%s/final.redscripts",bundled);write_file(path,"matched signed policy");
+    snprintf(path,sizeof path,"%s/inputContexts.xml",bundled);write_file(path,"matched signed contexts");
+    snprintf(path,sizeof path,"%s/inputUserMappings.xml",bundled);write_file(path,"matched signed mappings");
+    assert(!setenv("VXMAC_MANUAL_MAG_DIR",bundled,1));
+    expect_file("/game/r6/cache/final.redscripts","matched signed policy");
+    expect_file("/game/r6/config/inputContexts.xml","matched signed contexts");
+    expect_file("/game/r6/config/inputUserMappings.xml","matched signed mappings");
+    assert(!unsetenv("VXMAC_MANUAL_MAG_DIR"));
+    expect_file("/game/r6/cache/final.redscripts","current reload policy");
     expect_file("/game/r6/config/inputContexts.xml", "current contexts");
     expect_file("/game/r6/config/inputUserMappings.xml", "current mappings");
     assert(!unsetenv("VXMAC_WEAPON_BRIDGE"));

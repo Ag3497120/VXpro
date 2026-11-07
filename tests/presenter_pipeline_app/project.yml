@@ -1,0 +1,38 @@
+name: VXPresenterPipeline
+options:
+  deploymentTarget:
+    visionOS: "26.0"
+settings:
+  base:
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    CLANG_ENABLE_OBJC_ARC: YES
+    GENERATE_INFOPLIST_FILE: YES
+    DEAD_CODE_STRIPPING: YES
+    INFOPLIST_KEY_CFBundleDisplayName: "Frame Pipeline Test"
+    INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+    INFOPLIST_KEY_UILaunchScreen_Generation: YES
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "2"
+targets:
+  VXPresenterPipeline:
+    type: application
+    platform: visionOS
+    sources:
+      - path: ../presenter_pipeline_mac.m
+      - path: ../presenter_pipeline_app.h
+      - path: ../presenter_pipeline_app.swift
+      - path: ../../vr/frame_pipeline.c
+      - path: ../../vr/warp_core.m
+      - path: ../../vr/hand_weapon.c
+      - path: ../../vr/hand_gestures.c
+      - path: ../../app/Sources/weapon_bridge.c
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.VXFramePipeline
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) VXMAC_PRESENTER_APP=1"
+        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/../../tests/presenter_pipeline_app.h"
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreText.framework

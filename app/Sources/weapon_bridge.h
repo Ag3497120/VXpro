@@ -24,6 +24,18 @@ enum { VX_COMMAND_NONE, VX_COMMAND_PENDING, VX_COMMAND_ACCEPTED, VX_COMMAND_REJE
 void vx_weapon_bridge_prepare(const struct mach_header *image);
 void vx_weapon_bridge_poll(void);
 vx_weapon_snapshot vx_weapon_bridge_snapshot(void);
+
+typedef struct {
+    int known, mounted, vehicle_mode, scene_tier;
+    int menu_known, menu_open;
+    unsigned script_revision;
+    int camera_known, vehicle_perspective, vehicle_pitch_ready, vehicle_fov_owned;
+    float native_fov, foot_fov;
+    uint64_t sequence;
+    double received_at, camera_received_at;
+} vx_game_context;
+// Independent of equipment: vehicle triggers must work with no weapon equipped.
+vx_game_context vx_weapon_bridge_context(void);
 // Experimental game-thread mailbox. Acceptance is separate from reload completion:
 // ammunition and chamber readiness still come only from the game's R reports.
 int vx_weapon_bridge_commands_enabled(void);

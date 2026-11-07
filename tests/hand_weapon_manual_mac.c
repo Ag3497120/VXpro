@@ -50,6 +50,9 @@ int main(void) {
     assert(w.state == HW_HOLD_NEW && seen[1] == 1);
     move(off_h, WELL, .1f, .4);
     assert(w.state == HW_IN_NO_ROUND && seen[2] == 1 && seen[4] == 0);
+    w.game_reload_known=1;w.game_reload_phase=5;w.game_ammo=0;
+    buttons(0);hold(.3);
+    assert(w.state==HW_IN_NO_ROUND && seen[4]==0); // do not auto-complete a seated, unchambered magazine
     buttons(0); step();
     float slide[3];
     const float *ik = joints + gun_h * HW_JOINTS + 1 + HW_INDEX_K * 3;

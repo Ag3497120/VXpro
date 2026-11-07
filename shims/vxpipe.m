@@ -2,7 +2,7 @@
 //
 // Every library the game makes (its function names), every render / compute pipeline (vertex / fragment / kernel
 // function names and labels, attachment formats, blending), once each. With VXMAC_PIPE_REFLECT=1 the game's own
-// pipeline calls ask Metal for reflection too (the same compile, the options added): each buffer binding's name,
+// pipeline calls ask Metal for reflection too (2 = compute only; the same compile, the options added): each buffer binding's name,
 // size and struct members (name, offset, type), every distinct struct once. Then, one whole frame every
 // VXMAC_PIPE_EVERY seconds (default 10, at most VXMAC_PIPE_FRAMES = 12 frames): each render pass's attachments
 // (texture id, size, format, label, load / store), the pipelines it used in order, and the textures it bound
@@ -19,12 +19,18 @@
 #include <sys/sysctl.h>
 #include "vxmac.h"
 #include "vxprof.h"
+#include "vxpipe.h"
+#include "frame_camera.h"
 
 static FILE *g_f;
 static __thread void *tl_rec; static int tl_rec_any(void) { return tl_rec != NULL; }
 static void wui_twin(id p, MTLRenderPipelineDescriptor *d, id<MTLFunction> fs);
 static pthread_mutex_t g_fl = PTHREAD_MUTEX_INITIALIZER;
-static int g_reflect;
+static int g_reflect, g_reflect_render;
+static Class g_dump_device;
+static Class g_dump_rc, g_dump_cc;
+static int g_contract;
+static void install_dump_encoders(void);
 static atomic_int g_dump;           // (this frame is dumped)
 static atomic_uint g_frame;
 static unsigned g_frames_left = 60;   // (h51: 60 frames, one every 3 s: ~3 min of play)
@@ -197,6 +203,7 @@ static void bindings_note(unsigned pid, const char *stage, NSArray<id<MTLBinding
             id<MTLTextureBinding> tb = (id<MTLTextureBinding>)b;
             [o appendFormat:@" textype %lu array %lu access %lu", (unsigned long)tb.textureType, (unsigned long)tb.arrayLength, (unsigned long)tb.access];
         }
+        [o appendFormat:@" binding_access %lu", (unsigned long)b.access];
         out("%s", o.UTF8String);
     }
 }
@@ -278,6 +285,7 @@ static void vrik_pipe_note(id p, MTLRenderPipelineDescriptor *d) {
         objc_setAssociatedObject(p, kISD, @[ @(A.bufferIndex), @(A.offset), @(L.stride), @(L.stepFunction), @(L.stepRate), @(A.format), @(it0), @(record_size) ], OBJC_ASSOCIATION_RETAIN);
         return;
     }
+
 }
 static void render_note(id p, MTLRenderPipelineDescriptor *d, MTLRenderPipelineReflection *r, const char *how) {
     if (!p) return;
@@ -294,7 +302,7 @@ static void render_note(id p, MTLRenderPipelineDescriptor *d, MTLRenderPipelineR
     }
     if (d.vertexFunction) { id ld = objc_getAssociatedObject(d.vertexFunction, kLibData), lh = objc_getAssociatedObject(d.vertexFunction, kHash); if (ld) objc_setAssociatedObject(p, kLibData, ld, OBJC_ASSOCIATION_RETAIN); if (lh) objc_setAssociatedObject(p, kHash, lh, OBJC_ASSOCIATION_RETAIN); }
     if (is_ui_vs(d.vertexFunction)) { vxmtl_ui_pipe_add((__bridge void *)p); wui_twin(p, d, d.fragmentFunction); }
-    if (vxprof_on() == 1) { id<MTLFunction> kf = d.fragmentFunction ?: d.vertexFunction; vxprof_pipe_key(p, kf ? objc_getAssociatedObject(kf, kHash) : nil, d.fragmentFunction ? 'f' : 'v'); }
+    if (vxprof_on() == 1) { id<MTLFunction> kf = d.fragmentFunction ?: d.vertexFunction; vxprof_pipe_key(p, kf ? objc_getAssociatedObject(kf, kHash) : nil, d.fragmentFunction ? 'f' : 'v', kf.name); }
     if (!g_f) return;
     unsigned id_ = atomic_fetch_add(&g_pipe_n, 1) + 1;
     objc_setAssociatedObject(p, kPID, @(id_), OBJC_ASSOCIATION_RETAIN);
@@ -325,7 +333,7 @@ static void render_note(id p, MTLRenderPipelineDescriptor *d, MTLRenderPipelineR
 }
 static void compute_note(id p, id<MTLFunction> f, NSString *label, MTLComputePipelineReflection *r, const char *how) {
     if (p) live_tag(p, &g_cp_made, &g_cp_live, NULL, 0);
-    if (p && vxprof_on() == 1) vxprof_pipe_key(p, f ? objc_getAssociatedObject(f, kHash) : nil, 'k');
+    if (p && vxprof_on() == 1) vxprof_pipe_key(p, f ? objc_getAssociatedObject(f, kHash) : nil, 'k', f.name);
     if (!p || !g_f) return;
     unsigned id_ = atomic_fetch_add(&g_pipe_n, 1) + 1;
     objc_setAssociatedObject(p, kPID, @(id_), OBJC_ASSOCIATION_RETAIN);
@@ -544,7 +552,7 @@ static void rp_made(id self, id p, MTLRenderPipelineDescriptor *d, double t0) { 
 }
 __attribute__((ns_returns_retained)) static id h_rp(id self, SEL s, MTLRenderPipelineDescriptor *d0, NSError **e) {
     double t0 = CACurrentMediaTime(); MTLRenderPipelineDescriptor *d = pa_desc(self, d0);
-    if (g_reflect && o_rp_opt) {
+    if (g_reflect_render && o_rp_opt) {
         MTLAutoreleasedRenderPipelineReflection r = nil;
         id p = o_rp_opt(self, @selector(newRenderPipelineStateWithDescriptor:options:reflection:error:), d, kRefl, &r, e);
         rp_made(self, p, d, t0); render_note(p, d0, r, "sync+r"); return p;
@@ -553,7 +561,7 @@ __attribute__((ns_returns_retained)) static id h_rp(id self, SEL s, MTLRenderPip
 }
 __attribute__((ns_returns_retained)) static id h_rp_opt(id self, SEL s, MTLRenderPipelineDescriptor *d0, MTLPipelineOption opt, MTLAutoreleasedRenderPipelineReflection *rr, NSError **e) {
     MTLAutoreleasedRenderPipelineReflection r = nil;
-    if (g_reflect) opt |= kRefl;
+    if (g_reflect_render) opt |= kRefl;
     double t0 = CACurrentMediaTime(); MTLRenderPipelineDescriptor *d = pa_desc(self, d0);
     id p = o_rp_opt(self, s, d, opt, &r, e);
     if (rr) *rr = r;
@@ -562,7 +570,7 @@ __attribute__((ns_returns_retained)) static id h_rp_opt(id self, SEL s, MTLRende
 static void h_rp_cb(id self, SEL s, MTLRenderPipelineDescriptor *d0, MTLNewRenderPipelineStateCompletionHandler h) {
     MTLRenderPipelineDescriptor *d = [d0 copy];   // (the game may reuse its descriptor before the handler runs)
     MTLRenderPipelineDescriptor *du = pa_desc(self, d); double t0 = CACurrentMediaTime();
-    if (g_reflect && o_rp_opt_cb) {
+    if (g_reflect_render && o_rp_opt_cb) {
         o_rp_opt_cb(self, @selector(newRenderPipelineStateWithDescriptor:options:completionHandler:), du, kRefl,
                     ^(id<MTLRenderPipelineState> p, MTLRenderPipelineReflection *r, NSError *e) { rp_made(self, p, du, t0); render_note(p, d, r, "async+r"); h(p, e); });
         return;
@@ -572,7 +580,7 @@ static void h_rp_cb(id self, SEL s, MTLRenderPipelineDescriptor *d0, MTLNewRende
 static void h_rp_opt_cb(id self, SEL s, MTLRenderPipelineDescriptor *d0, MTLPipelineOption opt, MTLNewRenderPipelineStateWithReflectionCompletionHandler h) {
     MTLRenderPipelineDescriptor *d = [d0 copy];
     MTLRenderPipelineDescriptor *du = pa_desc(self, d); double t0 = CACurrentMediaTime();
-    o_rp_opt_cb(self, s, du, opt | (g_reflect ? kRefl : 0), ^(id<MTLRenderPipelineState> p, MTLRenderPipelineReflection *r, NSError *e) { rp_made(self, p, du, t0); render_note(p, d, r, "async-opt"); h(p, r, e); });
+    o_rp_opt_cb(self, s, du, opt | (g_reflect_render ? kRefl : 0), ^(id<MTLRenderPipelineState> p, MTLRenderPipelineReflection *r, NSError *e) { rp_made(self, p, du, t0); render_note(p, d, r, "async-opt"); h(p, r, e); });
 }
 
 typedef id (*cf_imp)(id, SEL, id, NSError **) __attribute__((ns_returns_retained));
@@ -617,23 +625,34 @@ static void h_cd_opt_cb(id self, SEL s, MTLComputePipelineDescriptor *d0, MTLPip
 }
 
 int vxpipe_on(void) { return g_f != NULL; }
-void vxpipe_install_device(Class dc) {
-    static int done; if (done++) return;
+void vxpipe_configure_startup(void) {
+    // Metal can load before Documents/-env arguments exist. Re-read configuration at
+    // host startup, but never truncate an already-open dump or install a hook twice.
+    if (g_f) return;
     const char *path = getenv("VXMAC_PIPE_DUMP");
-    if (path && *path) {
+    if (!path || !*path) return;
     // a relative name goes into the app's Documents (the headset: no writable working directory)
     NSString *ps = @(path);
     if (![ps isAbsolutePath]) ps = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:ps];
     g_f = fopen(ps.fileSystemRepresentation, "w");
-    if (!g_f) vxmac_log("Metal: pipeline dump: cannot open %s", ps.fileSystemRepresentation);
-    }
+    if (!g_f) { vxmac_log("Metal: pipeline dump: cannot open %s", ps.fileSystemRepresentation); return; }
     const char *e;
-    g_reflect = (e = getenv("VXMAC_PIPE_REFLECT")) && atoi(e);
+    e = getenv("VXMAC_PIPE_REFLECT");
+    int mode = e ? atoi(e) : 0;
+    g_reflect = mode != 0;
+    g_reflect_render = mode != 0 && mode != 2;
+    e = getenv("VXMAC_PIPE_CONTRACT"); g_contract = e && !strcmp(e, "1");
     if ((e = getenv("VXMAC_PIPE_EVERY"))) g_every = atof(e);
     if ((e = getenv("VXMAC_PIPE_FRAMES"))) g_frames_left = (unsigned)atoi(e);
-    g_structs = [NSMutableDictionary dictionary];
     g_next_at = CACurrentMediaTime() + g_every;
-    if (!g_f) g_reflect = 0;
+    out("DUMP start reflect=%d render_reflect=%d every=%.1fs frames=%u device=%s contract=%d", mode, g_reflect_render, g_every, g_frames_left, g_dump_device ? class_getName(g_dump_device) : "-", g_contract);
+    install_dump_encoders();
+    vxmac_log("Metal: pipeline dump to %s (reflection %s)", path, g_reflect ? (g_reflect_render ? "all" : "compute only") : "off");
+}
+void vxpipe_install_device(Class dc) {
+    static int done; if (done++) return;
+    g_dump_device = dc;
+    g_structs = [NSMutableDictionary dictionary];
 #define S(sel, h, o) (o = (__typeof__(o))swap(dc, @selector(sel), (IMP)h))
     S(newLibraryWithData:error:, h_lib_data, o_lib_data);
     S(newLibraryWithURL:error:, h_lib_url, o_lib_url);
@@ -648,8 +667,7 @@ void vxpipe_install_device(Class dc) {
     S(newComputePipelineStateWithFunction:options:completionHandler:, h_cf_opt_cb, o_cf_opt_cb);
     S(newComputePipelineStateWithDescriptor:options:completionHandler:, h_cd_opt_cb, o_cd_opt_cb);
 #undef S
-    out("DUMP start reflect=%d every=%.1fs frames=%u device=%s", g_reflect, g_every, g_frames_left, class_getName(dc));
-    if (g_f) vxmac_log("Metal: pipeline dump to %s (reflection %s)", path, g_reflect ? "on" : "off");
+    vxpipe_configure_startup();
 }
 
 // ---- passes (dumped frames only) ----------------------------------------------------------------------------------
@@ -718,7 +736,7 @@ static void pass_begin(id e, NSString *head, int compute) {
 static const char *load_s(MTLLoadAction a) { return a == MTLLoadActionClear ? "clear" : a == MTLLoadActionLoad ? "load" : "dontcare"; }
 static const char *store_s(MTLStoreAction a) { return a == MTLStoreActionStore ? "store" : a == MTLStoreActionDontCare ? "dontcare" : a == MTLStoreActionMultisampleResolve ? "resolve" : "other"; }
 static const void *kEncVM = &kEncVM;
-@interface VXEncVM : NSObject { @public int vp_fg, draw_idx, pose_bound, pose_instance_dynamic, pose_rebase; NSUInteger pose_instance; id<MTLBuffer> original, vb0; NSUInteger offset, vb0_off, vb0_stride; NSData *bytes; id pipe; int had_fg, cam_ok; float cam_m[16], cam_tx, cam_ty; __strong id vbuf[31]; NSUInteger voff[31], vst[31]; NSMutableDictionary *vbytes; }
+@interface VXEncVM : NSObject { @public int vp_fg, draw_idx, pose_bound, pose_instance_dynamic, pose_rebase; NSUInteger pose_instance; id<MTLBuffer> original, vb0; NSUInteger offset, vb0_off, vb0_stride; NSData *bytes; id pipe; __unsafe_unretained id camera_buffer; int had_fg, cam_ok; float cam_m[16], cam_tx, cam_ty; __strong id vbuf[31]; NSUInteger voff[31], vst[31]; NSMutableDictionary *vbytes; }
 @end
 @implementation VXEncVM
 @end
@@ -729,14 +747,14 @@ int vxpipe_viewmodel_active(void) {
 }
 static const void *kCamPass = &kCamPass;
 static _Atomic unsigned g_cframe;
-static void cam_pass_note(id e, MTLRenderPassDescriptor *pd) {   // (h52: the frame's first G-buffer pass: depth + 3 colour targets or more)
+static void cam_pass_note(id e, MTLRenderPassDescriptor *pd,id buffer) {   // (h52: the frame's first G-buffer pass: depth + 3 colour targets or more)
     if (!pd.depthAttachment.texture || !pd.colorAttachments[2].texture || !pd.colorAttachments[1].texture || !pd.colorAttachments[0].texture) return;
-    if (atomic_load(&g_cframe) == atomic_load(&g_frame)) return;
+    if (vx_frame_camera_read(buffer,NULL,NULL,NULL)) return;
     objc_setAssociatedObject(e, kCamPass, @((int)pd.depthAttachment.loadAction + 1), OBJC_ASSOCIATION_RETAIN);
 }
 void vxpipe_enc_clear(id e) { objc_setAssociatedObject(e, kCamPass, nil, OBJC_ASSOCIATION_ASSIGN); objc_setAssociatedObject(e, kEncVM, nil, OBJC_ASSOCIATION_ASSIGN); }   // (h64: vxmtl's enc_clear)
-void vxpipe_render_begin(id e, MTLRenderPassDescriptor *pd) {
-    if (e) { cam_pass_note(e, pd); if (pd.depthAttachment.texture.width >= 1024) objc_setAssociatedObject(e, kEncVM, [VXEncVM new], OBJC_ASSOCIATION_RETAIN); }
+void vxpipe_render_begin(id e, MTLRenderPassDescriptor *pd,id buffer) {
+    if (e) { cam_pass_note(e, pd,buffer); if (pd.depthAttachment.texture.width >= 1024) {VXEncVM *vm=[VXEncVM new];vm->camera_buffer=buffer;objc_setAssociatedObject(e, kEncVM, vm, OBJC_ASSOCIATION_RETAIN);} }
     if (!g_f || !e || !atomic_load(&g_dump)) return;
     NSMutableString *h = [NSMutableString string];
     for (int i = 0; i < 8; i++) {
@@ -770,14 +788,15 @@ static void pass_end(id e) {
     out("%s #%u f%u label=%s%s | pipes%s | reads%s", r.compute ? "CPASS" : "RPASS", r.n, r.frame, s8(lab), r.head.UTF8String,
         r.pipes.length ? r.pipes.UTF8String : " -", r.reads.length ? r.reads.UTF8String : " -");
 }
-static void cam_commit(const float m[16], float tx, float ty);
+static void cam_commit(const float m[16], float tx, float ty,uint64_t sequence);
 void vxpipe_render_end(id e) {
     VXEncVM *vm = e ? objc_getAssociatedObject(e, kEncVM) : nil;
     if (vm && vm->cam_ok && !vm->had_fg) {
+        uint64_t sequence=vx_frame_camera_store(vm->camera_buffer,vm->cam_m,vm->cam_tx,vm->cam_ty);
         unsigned fr = atomic_load(&g_frame);
-        if (atomic_exchange(&g_cframe, fr) != fr) cam_commit(vm->cam_m, vm->cam_tx, vm->cam_ty);
+        if (atomic_exchange(&g_cframe, fr) != fr) cam_commit(vm->cam_m, vm->cam_tx, vm->cam_ty,sequence);
     } else if (vm && vm->cam_ok && atomic_load(&g_frame) - atomic_load(&g_cframe) > 3) {   // (no world-only encoder lately: the view still, not the foreground's projection)
-        atomic_store(&g_cframe, atomic_load(&g_frame)); cam_commit(vm->cam_m, 0, 0);
+        atomic_store(&g_cframe, atomic_load(&g_frame)); cam_commit(vm->cam_m, 0, 0,0);
     } else if (vm && vm->cam_ok) { static atomic_uint n; if (atomic_fetch_add(&n, 1) < 10) vxmac_log("Metal: a foreground encoder's camera skipped (fov %.1f)", 2 * atanf(vm->cam_tx) * 57.2958f); }
     if (g_f) pass_end(e);
 }
@@ -887,6 +906,16 @@ static float g_gcam[16], g_gtan[2]; static uint64_t g_gcam_seq; static unsigned 
 //  at the wrong rate and stretched on each turn. Now the frame's own tangents, every frame (sprint / zoom change them))
 int vxmtl_game_tan(float *tx, float *ty) { pthread_mutex_lock(&g_gcl); int ok = g_gtan[0] > 0; if (ok) { *tx = g_gtan[0]; *ty = g_gtan[1]; } pthread_mutex_unlock(&g_gcl); return ok; }
 uint64_t vxmtl_game_camera(float m[16]) { pthread_mutex_lock(&g_gcl); uint64_t q = g_gcam_seq; if (q) memcpy(m, g_gcam, sizeof g_gcam); pthread_mutex_unlock(&g_gcl); return q; }
+uint64_t vxmtl_game_camera_for_buffer(void *buffer,float m[16],float *tx,float *ty,int *matched) {
+    uint64_t q=vx_frame_camera_read((__bridge id)buffer,m,tx,ty);
+    *matched=q!=0;
+    if(q)return q;
+    // Split command buffers keep the legacy source, read atomically with its
+    // projection. Do not claim a frame match when ownership is unavailable.
+    pthread_mutex_lock(&g_gcl);q=g_gcam_seq;
+    if(q) {memcpy(m,g_gcam,sizeof g_gcam);*tx=g_gtan[0];*ty=g_gtan[1];}
+    pthread_mutex_unlock(&g_gcl);return q;
+}
 static int cam_parse(const uint8_t *tl, size_t n, float m[16], float *otx, float *oty) {
     static int on = -1; if (on < 0) { const char *v = getenv("VXMAC_GAME_CAM"); on = !(v && !strcmp(v, "0")); }
     if (!on || !tl || n < 8) return 0;
@@ -924,8 +953,9 @@ static int cam_parse(const uint8_t *tl, size_t n, float m[16], float *otx, float
     return 1;
 }
 // (the world's camera, committed once a frame: the view always, the tangents when the constants had a projection)
-static void cam_commit(const float m[16], float tx, float ty) {
-    pthread_mutex_lock(&g_gcl); memcpy(g_gcam, m, 64); g_gcam_seq++; uint64_t q = g_gcam_seq; float o = g_gtan[0]; if (tx > 0) { g_gtan[0] = tx; g_gtan[1] = ty; } pthread_mutex_unlock(&g_gcl);
+static void cam_commit(const float m[16], float tx, float ty,uint64_t sequence) {
+    if(!sequence)sequence=vx_frame_camera_next();
+    pthread_mutex_lock(&g_gcl); memcpy(g_gcam, m, 64); g_gcam_seq=sequence; uint64_t q = g_gcam_seq; float o = g_gtan[0]; if (tx > 0) { g_gtan[0] = tx; g_gtan[1] = ty; } pthread_mutex_unlock(&g_gcl);
     if (q == 1) vxmac_log("Metal: the game's camera read from its view constants (forward %.3f %.3f %.3f)", m[8], m[9], m[10]);
     if (tx > 0 && fabsf(o - tx) > 0.01f) vxmac_log("Metal: the game's projection: horizontal %.1f deg, vertical %.1f deg (f%u)", 2 * atanf(tx) * 57.2958f, 2 * atanf(ty) * 57.2958f, atomic_load(&g_frame));
 }
@@ -1234,7 +1264,7 @@ static void tl_note(id e, int stage, id buf, NSUInteger off, NSUInteger idx, con
         else if (buf && !offonly) { id<MTLBuffer> b = buf; if (b.storageMode == MTLStorageModeShared && off + 8 <= b.length) got = cam_parse((const uint8_t *)b.contents + off, b.length - off, m, &tx, &ty); }
         if (got) {
             if (cvm) { memcpy(cvm->cam_m, m, 64); cvm->cam_tx = tx; cvm->cam_ty = ty; cvm->cam_ok = 1; }
-            else if (atomic_exchange(&g_cframe, atomic_load(&g_frame)) != atomic_load(&g_frame)) cam_commit(m, tx, ty);
+            else if (atomic_exchange(&g_cframe, atomic_load(&g_frame)) != atomic_load(&g_frame)) cam_commit(m, tx, ty,0);
         }
     }
     if (stage == 0) {
@@ -1386,13 +1416,61 @@ static void h_ruses(id self, SEL s, const id __unsafe_unretained *t, NSUInteger 
     o_ruses(self, s, t, n, u, st); for (NSUInteger i = 0; t && i < n; i++) rec_read(self, t[i], (u & MTLResourceUsageWrite) ? "(uw)" : "(u)");
 }
 // compute encoder
+static VXPassRec *contract_rec(id e) {
+    if (!g_contract || !atomic_load(&g_dump)) return nil;
+    if (!objc_getAssociatedObject(e, kRec)) pass_begin(e, @"", 1);
+    return rec(e);
+}
+static void contract_texture(id e, id<MTLTexture> t, NSUInteger i) {
+    VXPassRec *r = contract_rec(e);
+    if (r) out("CSET #%u f%u texture %lu t%u", r.n, r.frame, (unsigned long)i, tex_id(t));
+}
+typedef void (*cb_imp)(id, SEL, id, NSUInteger, NSUInteger);
+typedef void (*cbs_imp)(id, SEL, const id __unsafe_unretained *, const NSUInteger *, NSRange);
+typedef void (*cbo_imp)(id, SEL, NSUInteger, NSUInteger);
+typedef void (*cby_imp)(id, SEL, const void *, NSUInteger, NSUInteger);
+typedef void (*cd_imp)(id, SEL, MTLSize, MTLSize);
+typedef void (*cdi_imp)(id, SEL, id, NSUInteger, MTLSize);
+static cb_imp o_ctb; static cbs_imp o_ctbs; static cbo_imp o_ctbo; static cby_imp o_ctby;
+static cd_imp o_cdg, o_cdt; static cdi_imp o_cdi;
+static void contract_buffer(id e, id<MTLBuffer> b, NSUInteger off, NSUInteger i) {
+    VXPassRec *r = contract_rec(e);
+    if (r) out("CSET #%u f%u buffer %lu b%p offset %lu length %lu storage %lu", r.n, r.frame, (unsigned long)i, (__bridge void *)b,
+               (unsigned long)off, (unsigned long)b.length, (unsigned long)b.storageMode);
+}
+static void h_ctb(id e, SEL s, id b, NSUInteger off, NSUInteger i) { o_ctb(e,s,b,off,i); contract_buffer(e,b,off,i); }
+static void h_ctbs(id e, SEL s, const id __unsafe_unretained *b, const NSUInteger *off, NSRange range) {
+    o_ctbs(e,s,b,off,range);
+    for (NSUInteger j=0; j<range.length; j++) contract_buffer(e,b ? b[j] : nil,off ? off[j] : 0,range.location+j);
+}
+static void h_ctbo(id e, SEL s, NSUInteger off, NSUInteger i) {
+    o_ctbo(e,s,off,i); VXPassRec *r=contract_rec(e);
+    if (r) out("CSET #%u f%u offset %lu %lu",r.n,r.frame,(unsigned long)i,(unsigned long)off);
+}
+static void h_ctby(id e, SEL s, const void *b, NSUInteger len, NSUInteger i) {
+    o_ctby(e,s,b,len,i); VXPassRec *r=contract_rec(e);
+    if (r) out("CSET #%u f%u bytes %lu length %lu",r.n,r.frame,(unsigned long)i,(unsigned long)len);
+}
+static void contract_dispatch(id e, const char *kind, MTLSize n, MTLSize tg) {
+    VXPassRec *r=contract_rec(e);
+    if (r) out("CDISPATCH #%u f%u p%u %s %lu,%lu,%lu tg %lu,%lu,%lu",r.n,r.frame,pid_of(r.curpipe),kind,
+               (unsigned long)n.width,(unsigned long)n.height,(unsigned long)n.depth,
+               (unsigned long)tg.width,(unsigned long)tg.height,(unsigned long)tg.depth);
+}
+static void h_cdg(id e, SEL s, MTLSize n, MTLSize tg) { contract_dispatch(e,"groups",n,tg); o_cdg(e,s,n,tg); }
+static void h_cdt(id e, SEL s, MTLSize n, MTLSize tg) { contract_dispatch(e,"threads",n,tg); o_cdt(e,s,n,tg); }
+static void h_cdi(id e, SEL s, id b, NSUInteger off, MTLSize tg) {
+    // Do not read an indirect argument buffer or wait for the GPU just for metadata.
+    contract_dispatch(e,"indirect",MTLSizeMake(0,0,0),tg); o_cdi(e,s,b,off,tg);
+}
 static void h_cps(id self, SEL s, id p) {
     o_cps(self, s, p);
     if (atomic_load(&g_dump) && !objc_getAssociatedObject(self, kRec)) pass_begin(self, @"", 1);
     pipe_add(self, p);
+    VXPassRec *r=contract_rec(self); if (r) r.curpipe=p;
 }
-static void h_ctt(id self, SEL s, id t, NSUInteger i) { o_ctt(self, s, t, i); rec_read(self, t, ""); }
-static void h_ctts(id self, SEL s, const id __unsafe_unretained *t, NSRange r) { o_ctts(self, s, t, r); for (NSUInteger i = 0; t && i < r.length; i++) rec_read(self, t[i], ""); }
+static void h_ctt(id self, SEL s, id t, NSUInteger i) { o_ctt(self, s, t, i); contract_texture(self,t,i); rec_read(self, t, ""); }
+static void h_ctts(id self, SEL s, const id __unsafe_unretained *t, NSRange r) { o_ctts(self, s, t, r); for (NSUInteger i = 0; i < r.length; i++) { contract_texture(self,t ? t[i] : nil,r.location+i); rec_read(self, t ? t[i] : nil, ""); } }
 static void h_cuse(id self, SEL s, id t, MTLResourceUsage u) { o_cuse(self, s, t, u); rec_read(self, t, (u & MTLResourceUsageWrite) ? "(uw)" : "(u)"); }
 static void h_cuses(id self, SEL s, const id __unsafe_unretained *t, NSUInteger n, MTLResourceUsage u) {
     o_cuses(self, s, t, n, u); for (NSUInteger i = 0; t && i < n; i++) rec_read(self, t[i], (u & MTLResourceUsageWrite) ? "(uw)" : "(u)");
@@ -1635,8 +1713,18 @@ void vxpipe_install_encoders(Class rc, Class cc) {
     if (rc) S(rc, setRenderPipelineState:, h_rps, o_rps);   // (h51: always - the UI layers are told by their pipelines)
     if (rc) install_tl(rc);                                   // (h52: always - the game's camera)
     if (rc) install_wui(rc);                                  // (h58: always - the world UI's draws recorded in the UI pass)
+    if (rc) g_dump_rc=rc; if (cc) g_dump_cc=cc;
+    install_dump_encoders();
+#undef S
+}
+static void install_dump_encoders(void) {
+    // These optional hooks may be enabled after the constructor installed the core
+    // camera/hand hooks. Only install the missing dump hooks, never the core twice.
+    static int rc_done, cc_done;
+    Class rc=g_dump_rc, cc=g_dump_cc;
+#define S(c, sel, h, o) (o = (__typeof__(o))swap(c, @selector(sel), (IMP)h))
     if (!g_f) return;
-    if (rc) {
+    if (rc && !rc_done++) {
         S(rc, setFragmentTexture:atIndex:, h_rft, o_rft);
         S(rc, setVertexTexture:atIndex:, h_rvt, o_rvt);
         S(rc, setFragmentTextures:withRange:, h_rfts, o_rfts);
@@ -1644,13 +1732,22 @@ void vxpipe_install_encoders(Class rc, Class cc) {
         S(rc, useResources:count:usage:stages:, h_ruses, o_ruses);
         if (!getenv("VXMAC_UI_DRAWS") || strcmp(getenv("VXMAC_UI_DRAWS"), "0")) install_draws(rc);   // (h58: dump runs only; VXMAC_UI_DRAWS=0 off)
     }
-    if (cc) {
+    if (cc && !cc_done++) {
         S(cc, setComputePipelineState:, h_cps, o_cps);
         S(cc, setTexture:atIndex:, h_ctt, o_ctt);
         S(cc, setTextures:withRange:, h_ctts, o_ctts);
         S(cc, useResource:usage:, h_cuse, o_cuse);
         S(cc, useResources:count:usage:, h_cuses, o_cuses);
         S(cc, endEncoding, h_cend, o_cend);
+        if (g_contract) {
+            S(cc, setBuffer:offset:atIndex:, h_ctb, o_ctb);
+            S(cc, setBuffers:offsets:withRange:, h_ctbs, o_ctbs);
+            S(cc, setBufferOffset:atIndex:, h_ctbo, o_ctbo);
+            S(cc, setBytes:length:atIndex:, h_ctby, o_ctby);
+            S(cc, dispatchThreadgroups:threadsPerThreadgroup:, h_cdg, o_cdg);
+            S(cc, dispatchThreads:threadsPerThreadgroup:, h_cdt, o_cdt);
+            S(cc, dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:, h_cdi, o_cdi);
+        }
     }
 #undef S
     out("DUMP encoders %s %s", rc ? class_getName(rc) : "-", cc ? class_getName(cc) : "-");

@@ -33,3 +33,12 @@ FPS. The actual Metal warp, device memory/latency and visual artifacts are still
 acceptance gates for any future candidate. A targeted weight edit can be useful
 for model repair; these trials do not establish a method for creating missing
 motion features in a collapsed model.
+
+`tools/interp_health.py` now probes the final decoder before further initialization/training.
+Four supplied real frames produced zero final features in both run1 and run4 (3,194,880
+feature values per checkpoint). `train2` refuses an inactive/nonfinite decoder before
+starting its optimizer: clearing only the head cannot restore learning from zero features.
+A fresh zero head with live decoder features remains valid. Tests check this distinction,
+nonfinite features and preservation of mode, hooks and original weights. No model weights
+were changed or activated by this diagnostic. See `NPU_FRAME_PLAN.md` for the synthetic-data
+and low-latency prediction design.

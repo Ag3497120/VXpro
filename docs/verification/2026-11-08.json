@@ -1,0 +1,77 @@
+{
+  "date": "2026-11-08",
+  "fps": {
+    "run_id": "20261107T021201Z-vxmac-fps-705dc8bf",
+    "derived_id": "d1",
+    "result": {
+      "requested_seconds": 60.0,
+      "start_since_start": 102.32300000000001,
+      "end_since_start": 162.323,
+      "accepted_seconds": 60.0,
+      "rate_intervals": 91,
+      "received_game_image_fps": 37.11476499999999,
+      "compositor_updates_hz": 45.000451666666656,
+      "game_submit_fps": 37.01602136181575,
+      "submit_counter_span_seconds": 59.92,
+      "submit_frames": 2218,
+      "window_end_unix_s": 1794017449.979
+    },
+    "scene": "Phantom Liberty, as identified by the user; exact scene not determined by telemetry",
+    "limits": [
+      "game_fps counts completed captured images, not every game render submission",
+      "compositor_hz counts presenter updates, not new game images",
+      "rates are rounded and event timestamps approximate counter sampling times",
+      "passive native observation, not an isolated SteamVR run or playability classification"
+    ],
+    "current_camera_build_remeasured": false
+  },
+  "head_turn": {
+    "run_id": "20261107T192940Z-head-rebound-accepted",
+    "derived_id": "d3",
+    "test": "Walking, sticks untouched, turn head left/right then stop, 2–3 repetitions",
+    "user_report": "完全に治りました",
+    "scope": "user-confirmed walking head-turn rebound only; not all scenes"
+  },
+  "remaining": [
+    "Rectangular image borders during vehicles and some story conversations/cutscenes",
+    "Weapon-specific contacts, sight attachment and reload/slide visuals need further verification"
+  ],
+  "local_checks_before_export": {
+    "run_id": "20261107T192940Z-head-rebound-accepted",
+    "derived_id": "d1",
+    "release_controls": "passed",
+    "visionos_build": "passed",
+    "signature": "passed",
+    "windows_runtime_suite": "passed on retry; initial unrelated fiber_pool migration assertion"
+  },
+  "privacy": "No raw game images, meshes, extracted asset catalog, game script cache, compiled app or model weights are included.",
+  "standalone_export_checks": {
+    "release_controls": "passed",
+    "shims_visionos_and_macos": "passed",
+    "python_source_tests": {
+      "passed": 57,
+      "failures": 0
+    },
+    "frame_pipeline_cpu_metal": "passed",
+    "presenter_pipeline_on_off": "passed",
+    "test_payload_imports": {
+      "nonweak_missing": 0
+    },
+    "visionos_host_with_own_test_payload": "BUILD SUCCEEDED, CODE_SIGNING_ALLOWED=NO; no game launched",
+    "portability": "standalone paths, player-owned signing config and optional unsealed FPS reporter; runtime hand/camera sources match accepted checkpoint",
+    "rechecked_after_normal_vr_followup": [
+      "release_controls",
+      "presenter_pipeline_on_off",
+      "visionos_host_with_own_test_payload"
+    ]
+  },
+  "normal_vr_coverage": {
+    "run_id": "20261107T202438Z-normal-vr-coverage-accepted",
+    "derived_id": "d1",
+    "user_report": "治りました",
+    "test": "ordinary walking: look up/down/left/right; check restored coverage and no head-turn rebound",
+    "policy": "ordinary VR requests existing same-frame peripheral extension; vehicle/story and explicit user override remain separate",
+    "head_rebound_fix": "retained",
+    "new_fps_measurement": false
+  }
+}

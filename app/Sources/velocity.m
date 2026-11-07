@@ -1,4 +1,4 @@
-// The game's own motion vectors (VX Mac; docs/DESIGN.md). The Mac build writes a two-channel float target in its
+// The game's own motion vectors (VX Mac; ../../AVP_MAC.md). The Mac build writes a two-channel float target in its
 // G-buffer pass (RG16Float, colour attachment 3 at the render size, h24: 853x480 with 1280x720 out). Each frame the
 // newest one is copied when its pass ends (the game's own command buffer; the target may be an aliased heap resource,
 // so it is copied at once) and its mean over the centre measured. Before the presenter uses it, it is verified:
@@ -8,7 +8,8 @@
 //   - on frames where the picture did not move, the target's mean must stay near zero.
 // Only with |correlation| >= 0.7 over at least 30 moving frames, and the static mean under 10 % of the moving one, is it
 // handed to the presenter as its motion vectors (vxmac_vel_take). VXMAC_VEL=0: off; VXMAC_VEL_INDEX (default 3) and
-// VXMAC_VEL_FORMAT (default 65, RG16Float) choose the target.
+// VXMAC_VEL_FORMAT (default 65, RG16Float) choose the target. With VXMAC_VEL unset or auto, capture only when a
+// consumer needs it (capture, interpolation, or velocity prediction). VXMAC_VEL=1 also enables diagnostic checking.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
@@ -21,6 +22,7 @@ enum { kVSlots = 3 };
 static int g_on = -1, g_index = 3; static unsigned long g_format = 65;
 static id<MTLTexture> g_copy[kVSlots]; static id<MTLBuffer> g_mean[kVSlots]; static int g_slot;
 static id<MTLComputePipelineState> g_mean_pso;
+static int g_mean_prefetch; // Experimental opt-in; preserve the baseline until an M2 comparison passes.
 static pthread_mutex_t g_l = PTHREAD_MUTEX_INITIALIZER;
 static id<MTLTexture> g_latest; static id<MTLBuffer> g_latest_mean; static uint64_t g_seq, g_taken;
 // (the verification's sums)
@@ -29,9 +31,19 @@ static int g_ok; static float g_kx, g_ky, g_corr;
 
 static int vel_on(void) {
     if (g_on < 0) {
-        const char *e = getenv("VXMAC_VEL"); g_on = !(e && !strcmp(e, "0"));
+        const char *e = getenv("VXMAC_VEL");
+        int explicit = e && strcmp(e, "auto");
+        const char *capture = getenv("VXMAC_CAPTURE"), *interp = getenv("VXMAC_INTERP"), *predict = getenv("VXMAC_VEL_PREDICT");
+        int cap = capture ? atoi(capture) : 0;
+        int consumers = ((cap == 1 || cap == 2) ? 1 : 0) |
+                        ((interp && (!strcmp(interp, "1") || !strcmp(interp, "vel"))) ? 2 : 0) |
+                        ((predict && !strcmp(predict, "1")) ? 4 : 0);
+        g_on = explicit ? strcmp(e, "0") != 0 : consumers != 0;
         e = getenv("VXMAC_VEL_INDEX"); if (e && *e) g_index = atoi(e);
         e = getenv("VXMAC_VEL_FORMAT"); if (e && *e) g_format = strtoul(e, NULL, 10);
+        char fields[100];
+        snprintf(fields, sizeof fields, "\"enabled\":%d,\"explicit\":%d,\"consumers\":%d", g_on, explicit, consumers);
+        vxmac_jlog("vel_policy", fields);
     }
     return g_on;
 }
@@ -57,9 +69,28 @@ void vxmac_vel_target(void *cbp, void *texp, int index) {
             "  if (i > 0) return; float sx = 0, sy = 0, sa = 0; uint w = v.get_width(), h = v.get_height(), n = 0;\n"
             "  for (uint y = h / 4; y < h * 3 / 4; y += 6) for (uint x = w / 4; x < w * 3 / 4; x += 6) { float2 m = v.read(uint2(x, y)).xy; if (all(isfinite(m))) { sx += m.x; sy += m.y; sa += abs(m.x) + abs(m.y); n++; } }\n"
             "  o[0] = n ? sx / n : 0; o[1] = n ? sy / n : 0; o[2] = n ? sa / n : 0; }\n";
+        const char *prefetch = getenv("VXMAC_VEL_MEAN_PREFETCH");
+        g_mean_prefetch = prefetch && !strcmp(prefetch, "1");
+        if (g_mean_prefetch) src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void vm_prefetch(texture2d<float> v [[texture(0)]], device float *o [[buffer(0)]], uint i [[thread_index_in_threadgroup]]) {\n"
+            "  threadgroup float2 values[256]; float sx=0, sy=0, sa=0; uint n=0;\n"
+            "  uint w=v.get_width(), h=v.get_height(), x0=w/4, y0=h/4;\n"
+            "  uint nx=(w*3/4-x0+5)/6, ny=(h*3/4-y0+5)/6, total=nx*ny;\n"
+            "  for (uint base=0; base<total; base+=256) {\n"
+            "    uint j=base+i; if (j<total) values[i]=v.read(uint2(x0+(j%nx)*6,y0+(j/nx)*6)).xy;\n"
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            "    if (i==0) for (uint k=0; k<min(256u,total-base); k++) {\n"
+            "      float2 m=values[k]; if (all(isfinite(m))) { sx+=m.x; sy+=m.y; sa+=abs(m.x)+abs(m.y); n++; }\n"
+            "    }\n"
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            "  }\n"
+            "  if (i==0) { o[0]=n?sx/n:0; o[1]=n?sy/n:0; o[2]=n?sa/n:0; }\n"
+            "}\n";
+        // Reads are parallel; lane 0 still sums the identical samples in the original row/column order.
+        // Reordering the floating-point reduction could change the motion validation and camera response.
         NSError *err = nil;
         id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
-        g_mean_pso = lib ? [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"vm"] error:&err] : nil;
+        g_mean_pso = lib ? [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:g_mean_prefetch ? @"vm_prefetch" : @"vm"] error:&err] : nil;
         if (!g_mean_pso) { g_on = 0; vxmac_jlog("vel_off", "\"why\":\"pipeline\""); return; }
         char f[160]; snprintf(f, sizeof f, "\"w\":%lu,\"h\":%lu,\"format\":%lu,\"index\":%d", (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, index);
         vxmac_jlog("vel_found", f);
@@ -77,7 +108,8 @@ void vxmac_vel_target(void *cbp, void *texp, int index) {
     [b endEncoding];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e setComputePipelineState:g_mean_pso]; [e setTexture:g_copy[s] atIndex:0]; [e setBuffer:g_mean[s] offset:0 atIndex:0];
-    [e dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    if (g_mean_prefetch) [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    else [e dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     [e endEncoding];
     pthread_mutex_lock(&g_l); g_latest = g_copy[s]; g_latest_mean = g_mean[s]; g_seq++; pthread_mutex_unlock(&g_l);
 }

@@ -17,6 +17,8 @@
 #include <TargetConditionals.h>
 #include "vxmac.h"
 #include "vxprof.h"
+#include "vxframe_pace.h"
+#include <time.h>
 
 // ---- device observers --------------------------------------------------------------------------------------------
 #if TARGET_OS_VISION   // (macOS has its own)
@@ -159,6 +161,43 @@ static void gpu_account(id<MTLCommandBuffer> c) {
 //  Waits counted in stats: pace_waits, pace_ms)
 static double g_gpu_cap = -1; static int g_warp_hold = -1; static _Atomic int g_warps_in_flight;
 static _Atomic unsigned long g_pace_waits, g_pace_us;
+static _Atomic unsigned long g_pace_cap_us, g_pace_warp_us;
+static _Atomic unsigned long g_pace_frame_us, g_pace_frame_waits;
+static int g_frame_pacing;
+static double g_frame_max_hz;
+static vxfp_clock g_frame_clock;
+static pthread_mutex_t g_frame_pace_lock = PTHREAD_MUTEX_INITIALIZER;
+static void pace_init(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *mode = getenv("VXMAC_PACING");
+        g_frame_pacing = mode && !strcmp(mode,"frame");
+        const char *cap = getenv("VXMAC_GPU_CAP"), *hold = getenv("VXMAC_WARP_HOLD");
+        g_gpu_cap = g_frame_pacing ? 0 : cap && *cap ? atof(cap) : 0.70;
+        g_frame_max_hz = g_frame_pacing ? vxfp_clock_limit(getenv("VXMAC_GAME_MAX_FPS")) : 0;
+        g_warp_hold = !(hold && !strcmp(hold,"0"));
+        vxmac_log("Metal: pacing %s, frame maximum %.1f FPS, legacy GPU share %.2f, warp permit %d",
+                  g_frame_pacing ? "frame" : "legacy",g_frame_max_hz,g_gpu_cap,g_warp_hold);
+    });
+}
+static void frame_limit_wait(void) {
+    pace_init();
+    if (!g_frame_pacing || g_frame_max_hz <= 0) return;
+    double start = CACurrentMediaTime();
+    pthread_mutex_lock(&g_frame_pace_lock);
+    double deadline = vxfp_clock_reserve(&g_frame_clock,start,g_frame_max_hz);
+    pthread_mutex_unlock(&g_frame_pace_lock);
+    double now = start;
+    if (deadline <= now) return;
+    do {
+        double remaining = deadline-now;
+        struct timespec wait = { (time_t)remaining, (long)((remaining-floor(remaining))*1e9) };
+        nanosleep(&wait,NULL);
+        now = CACurrentMediaTime();
+    } while (now < deadline);
+    unsigned long us = (unsigned long)((now-start)*1e6);
+    g_pace_frame_us += us; g_pace_frame_waits++; g_pace_us += us; g_pace_waits++;
+}
 // (h60f: the cap follows the compositor's misses - VXMacImmersive.swift reports each 5 s window's missed deadlines: over
 //  3 -> the cap 0.05 lower (to 0.55 at least), six clean windows in a row -> 0.05 back up to its start; logged)
 // (h64: at half rate - VXMAC_GPU_CAP_HALF=<cap> (off when unset; e.g. 0.85): once the compositor has presented every
@@ -196,16 +235,35 @@ void vxmtl_pacing_report(int missed) {
 }
 void vxmtl_warp_begin(void) { atomic_fetch_add(&g_warps_in_flight, 1); }
 void vxmtl_warp_end(void) { if (atomic_fetch_sub(&g_warps_in_flight, 1) <= 0) atomic_store(&g_warps_in_flight, 0); }
+#include "vxwarp_gate.h"
+static int warp_release_scheduled(void) {
+    static int scheduled;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *mode = getenv("VXMAC_WARP_RELEASE");
+        scheduled = mode && !strcmp(mode, "scheduled");
+        vxmac_log("Metal: warp submission permit released when %s", scheduled ? "scheduled (trial)" : "completed");
+    });
+    return scheduled;
+}
+void vxmtl_warp_track(void *command_buffer) {
+    vxmtl_warp_begin();
+    vxwg_track(command_buffer, warp_release_scheduled(), ^{ vxmtl_warp_end(); });
+}
 static void pace(void) {
-    if (g_gpu_cap < 0) { const char *e = getenv("VXMAC_GPU_CAP"); g_gpu_cap = e && *e ? atof(e) : 0.70; const char *h = getenv("VXMAC_WARP_HOLD"); g_warp_hold = !(h && !strcmp(h, "0"));
-        vxmac_log("Metal: the game's commits paced: GPU share under %.2f, held while a warp runs: %d", g_gpu_cap, g_warp_hold); }
+    pace_init();
     double t0 = CACurrentMediaTime(), now = t0;
     while (now - t0 < 0.012) {
-        int wait = 0;
-        if (g_warp_hold && atomic_load(&g_warps_in_flight) > 0 && now - t0 < 0.008) wait = 1;
+        int wait = 0, warp_wait = 0;
+        if (g_warp_hold && atomic_load(&g_warps_in_flight) > 0 && now - t0 < 0.008) wait = warp_wait = 1;
         if (!wait && g_gpu_cap > 0) { pthread_mutex_lock(&g_gpu_lock); double b = win_busy(now); pthread_mutex_unlock(&g_gpu_lock); wait = b > g_gpu_cap; }
         if (!wait) break;
+        double before_sleep = now;
         usleep(1000); now = CACurrentMediaTime();
+        // Attribute actual time to the condition that selected this sleep, rather than assuming 1 ms elapsed.
+        // These are thread wait totals, not GPU execution time or a directly recoverable FPS budget.
+        unsigned long elapsed_us = (unsigned long)((now - before_sleep) * 1e6);
+        if (warp_wait) g_pace_warp_us += elapsed_us; else g_pace_cap_us += elapsed_us;
     }
     if (now > t0 + 0.0005) { g_pace_waits++; g_pace_us += (unsigned long)((now - t0) * 1e6); }
 }
@@ -350,7 +408,7 @@ static void targets_note(id enc, id cb, MTLRenderPassDescriptor *pd) {
 }
 static void ui_end(id enc, id cbo);   // (h51, below)
 void vxpipe_install_device(Class dc); void vxpipe_install_encoders(Class rc, Class cc); int vxpipe_on(void);   // (vxpipe.m)
-void vxpipe_frame(void); void vxpipe_render_begin(id e, MTLRenderPassDescriptor *pd); void vxpipe_render_end(id e);
+void vxpipe_frame(void); void vxpipe_render_begin(id e, MTLRenderPassDescriptor *pd,id buffer); void vxpipe_render_end(id e);
 static void h_end(id self, SEL s) {
     if (vxprof_enabled) vxprof_end(self);   // (VXMAC_PASS_PROFILE's serial windows: the fence, before the pass ends)
     o_end(self, s);
@@ -687,7 +745,7 @@ static id h_rce(id self, SEL s, MTLRenderPassDescriptor *pd) {
     if (ppx) vxprof_render_enc(e, ppx);
     if (e && g_pass_hook) { color_note(pd); drawable_pass_note(pd); cam_watch(e, pd); ui_note(e, pd); if (objc_getAssociatedObject(e, kUI)) { objc_setAssociatedObject(e, kUIcb, self, OBJC_ASSOCIATION_ASSIGN); ui_hook_end(e); } }
     if (e) targets_note(e, self, pd);
-    if (e) vxpipe_render_begin(e, pd);
+    if (e) vxpipe_render_begin(e, pd,self);
     if (e && g_pass_hook && pd.depthAttachment.texture) pass_note(pd.depthAttachment.texture);
     if (e && g_pass_hook && pd.depthAttachment.texture) {
         static dispatch_once_t once;
@@ -742,6 +800,9 @@ static id h_next(id self, SEL s) {
             if (!permit) g_inflight_timeouts++;   // (a drawable never presented: go on without a permit)
         }
     }
+    // One wait before the next drawable, never repeated across the command
+    // buffers building that image. Completion permits still protect live buffers.
+    if (g_hook) frame_limit_wait();
     if (g_hook && l.framebufferOnly) o_set_fbo(self, @selector(setFramebufferOnly:), NO);
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -1014,13 +1075,17 @@ static void macos_only_methods(void) {
 }
 
 void vxmtl_stats(char *out, unsigned size) {
+    pace_init();
     double now = CACurrentMediaTime(), busy_pct = 0; unsigned long cbs;
     pthread_mutex_lock(&g_gpu_lock);
     if (g_gpu_since > 0 && now > g_gpu_since) busy_pct = 100.0 * g_gpu_busy / (now - g_gpu_since);
     cbs = g_gpu_cbs; g_gpu_busy = 0; g_gpu_cbs = 0; g_gpu_since = now;
     pthread_mutex_unlock(&g_gpu_lock);
-    char head[220]; snprintf(head, sizeof head, "\"game_gpu_busy_pct\":%.0f,\"game_cbs\":%lu,\"pace_waits\":%lu,\"pace_ms\":%.0f,\"gpu_cap\":%.2f,\"gpu_cap_half\":%d,", busy_pct, cbs,
-                             atomic_exchange(&g_pace_waits, 0), atomic_exchange(&g_pace_us, 0) / 1e3, g_gpu_cap, g_half_on);
+    char head[512]; snprintf(head, sizeof head, "\"game_gpu_busy_pct\":%.0f,\"game_cbs\":%lu,\"pace_waits\":%lu,\"pace_ms\":%.0f,\"pace_cap_ms\":%.0f,\"pace_warp_ms\":%.0f,\"gpu_cap\":%.2f,\"gpu_cap_half\":%d,\"warp_release\":\"%s\",\"pacing\":\"%s\",\"frame_max_fps\":%.1f,\"pace_frame_ms\":%.0f,\"pace_frame_waits\":%lu,", busy_pct, cbs,
+                             atomic_exchange(&g_pace_waits, 0), atomic_exchange(&g_pace_us, 0) / 1e3,
+                             atomic_exchange(&g_pace_cap_us, 0) / 1e3, atomic_exchange(&g_pace_warp_us, 0) / 1e3, g_gpu_cap, g_half_on,
+                             warp_release_scheduled() ? "scheduled" : "completed",g_frame_pacing ? "frame" : "legacy",g_frame_max_hz,
+                             atomic_exchange(&g_pace_frame_us,0)/1e3,atomic_exchange(&g_pace_frame_waits,0));
     size_t hl = strlen(head); if (hl < size) { memcpy(out, head, hl + 1); out += hl; size -= (unsigned)hl; }
     { void vxpipe_ui_stats(char *, unsigned); char w[200]; vxpipe_ui_stats(w, sizeof w); size_t wl = strlen(w); if (wl + 1 < size) { memcpy(out, w, wl); out[wl] = ','; out += wl + 1; size -= (unsigned)(wl + 1); } }
     { char pp[200]; vxprof_stats(pp, sizeof pp); size_t pl = strlen(pp); if (pl && pl + 1 < size) { memcpy(out, pp, pl); out[pl] = ','; out += pl + 1; size -= (unsigned)(pl + 1); } }
