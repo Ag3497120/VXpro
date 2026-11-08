@@ -2906,6 +2906,7 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
     double pt = g_present_time;
     vx_room_view room_view=g_room_view;
     int anchored_camera=g_vehicle || g_scripted_scene;
+    int extend_view=g_vehicle || !g_scripted_scene;
     float eye_offset[3];
     int eye_valid = eye >= 0 && eye < 2 && g_frame_eye_valid;
     if (eye_valid) memcpy(eye_offset, g_frame_eye_offsets[eye], sizeof eye_offset);
@@ -2934,9 +2935,9 @@ static int draw_eye_inner(void *cbp, int eye, const float view_from_origin[16], 
     vxw_params p = { 0 };
     p.w = S->w; p.h = S->h;
     p.flags = VXW_POSE | S->flags;
-    // Keep ordinary VR continuous at the source rectangle without changing its camera.
-    // Restricted vehicle/story views retain their separate missing-view policy.
-    if (!anchored_camera) p.flags |= VXW_EDGE_FILL;
+    // Driving uses the same continuous periphery as walking. Keep the native
+    // vehicle camera and anchored motion; only its hard source border changes.
+    if (extend_view) p.flags |= VXW_EDGE_FILL;
     p.tan_x = S->tan_x; p.tan_y = S->tan_y; p.z_a = S->z_a; p.z_b = S->z_b;
     // (VX Mac, h26: the gate was 55 ms / 100 ms: at the game's 28-31 fps the shown frame is 83-96 ms old, so eyes went
     //  between the depth warp and the far-plane one as the age crossed 100 ms (20 % of eyes) - the same scale jump as the

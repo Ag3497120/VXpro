@@ -36,7 +36,7 @@ IMAGES = [
     ('Contents/MacOS/Cyberpunk2077', 'Cyberpunk2077.dylib', ['--system-shim', '--pool-patch', '--as-dylib', '@rpath/Cyberpunk2077.dylib']),
     ('Contents/Frameworks/libGameServicesAppStore.dylib', 'libGameServicesAppStore.dylib', ['--system-shim']),
     ('Contents/Frameworks/libBink2MacArm64.dylib', 'libBink2MacArm64.dylib', []),
-    ('Contents/Frameworks/libREDGalaxy64.dylib', 'libREDGalaxy64.dylib', []),
+    ('Contents/Frameworks/libREDGalaxy64.dylib', 'libREDGalaxy64.dylib', ['--system-shim']),
 ]
 sys.path.insert(0, TOOLS)
 

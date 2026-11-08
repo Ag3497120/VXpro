@@ -13,6 +13,7 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CoreGraphics.h>
+#include <dlfcn.h>
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <pthread.h>
@@ -330,7 +331,11 @@ VX_CATCHALL
 VX_CATCHALL
 + (NSWorkspace *)sharedWorkspace { static NSWorkspace *w; static dispatch_once_t o; dispatch_once(&o, ^{ w = [NSWorkspace new]; }); return w; }
 - (NSNotificationCenter *)notificationCenter { if (!_nc) _nc = [NSNotificationCenter new]; return _nc; }
-- (BOOL)openURL:(NSURL *)u { vxmac_log("AppKit: openURL %s (not opened)", u.absoluteString.UTF8String); return NO; }
+- (BOOL)openURL:(NSURL *)u {
+    int (*open)(const char *)=dlsym(RTLD_DEFAULT,"vxmac_open_external_url");
+    BOOL accepted=open && open(u.absoluteString.UTF8String);
+    vxmac_log("AppKit: browser request accepted=%d",accepted);return accepted;
+}
 - (id)frontmostApplication { return nil; }
 - (NSArray *)runningApplications { return @[]; }
 - (BOOL)accessibilityDisplayShouldReduceMotion { return NO; }

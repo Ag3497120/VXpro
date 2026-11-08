@@ -37,6 +37,7 @@ int _NSGetExecutablePath(char *buf, uint32_t *size) {
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "network_ca_path.h"
 static struct { DIR *d; char *path; } g_dirs[64];
 static pthread_mutex_t g_dirs_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *libsys(const char *name) { return dlsym(dlopen("/usr/lib/libSystem.B.dylib", RTLD_NOLOAD | RTLD_LAZY), name); }
@@ -44,6 +45,7 @@ static void *libsys(const char *name) { return dlsym(dlopen("/usr/lib/libSystem.
 static void overlay_open_notice(const char *overlay) {
     const char *name = strrchr(overlay, '/');
     if (!name) return;
+    if (!strcmp(name,"/cert.pem")) return;
     static unsigned logged;
     if (!strcmp(name, "/final.redscripts")) {
         void (*poll)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "vx_weapon_bridge_poll");
@@ -85,6 +87,10 @@ static const char *script_overlay(const char *path, char out[2048]) {
     if (real_access(out, R_OK)) return path;
     return out;
 }
+static const char *read_overlay(const char *path,char out[2048]) {
+    const char *ca=vx_network_ca_path(path,1,getenv("VXMAC_NETWORK"),getenv("HOME"),out,2048);
+    return ca!=path ? ca:script_overlay(path,out);
+}
 
 int open(const char *path, int flags, ...) {
     static int (*real_open)(const char *, int, ...);
@@ -92,7 +98,7 @@ int open(const char *path, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap); }
     char overlay[2048];
-    if ((flags & O_ACCMODE) == O_RDONLY && !(flags & (O_CREAT | O_TRUNC))) path = script_overlay(path, overlay);
+    if ((flags & O_ACCMODE) == O_RDONLY && !(flags & (O_CREAT | O_TRUNC))) path = read_overlay(path, overlay);
     int fd = (flags & O_CREAT) ? real_open(path, flags, mode) : real_open(path, flags);
     if (fd >= 0 && path == overlay) overlay_open_notice(path);
     return fd;
@@ -101,7 +107,7 @@ FILE *fopen(const char *path, const char *mode) {
     static FILE *(*real_fopen)(const char *, const char *);
     if (!real_fopen) real_fopen = (FILE *(*)(const char *, const char *))libsys("fopen");
     char overlay[2048];
-    if (mode && mode[0] == 'r' && !strchr(mode, '+')) path = script_overlay(path, overlay);
+    if (mode && mode[0] == 'r' && !strchr(mode, '+')) path = read_overlay(path, overlay);
     FILE *file = real_fopen(path, mode);
     if (file && path == overlay) overlay_open_notice(path);
     return file;
@@ -109,17 +115,17 @@ FILE *fopen(const char *path, const char *mode) {
 int stat(const char *path, struct stat *st) {
     static int (*real_stat)(const char *, struct stat *);
     if (!real_stat) real_stat = (int (*)(const char *, struct stat *))libsys("stat");
-    char overlay[2048]; return real_stat(script_overlay(path, overlay), st);
+    char overlay[2048]; return real_stat(read_overlay(path, overlay), st);
 }
 int lstat(const char *path, struct stat *st) {
     static int (*real_lstat)(const char *, struct stat *);
     if (!real_lstat) real_lstat = (int (*)(const char *, struct stat *))libsys("lstat");
-    char overlay[2048]; return real_lstat(script_overlay(path, overlay), st);
+    char overlay[2048]; return real_lstat(read_overlay(path, overlay), st);
 }
 int access(const char *path, int amode) {
     static int (*real_access)(const char *, int);
     if (!real_access) real_access = (int (*)(const char *, int))libsys("access");
-    char overlay[2048]; return real_access(script_overlay(path, overlay), amode);
+    char overlay[2048]; return real_access((amode&~R_OK) ? path:read_overlay(path, overlay), amode);
 }
 DIR *opendir(const char *path) {
     static DIR *(*real)(const char *);

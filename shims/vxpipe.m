@@ -795,8 +795,6 @@ void vxpipe_render_end(id e) {
         uint64_t sequence=vx_frame_camera_store(vm->camera_buffer,vm->cam_m,vm->cam_tx,vm->cam_ty);
         unsigned fr = atomic_load(&g_frame);
         if (atomic_exchange(&g_cframe, fr) != fr) cam_commit(vm->cam_m, vm->cam_tx, vm->cam_ty,sequence);
-    } else if (vm && vm->cam_ok && atomic_load(&g_frame) - atomic_load(&g_cframe) > 3) {   // (no world-only encoder lately: the view still, not the foreground's projection)
-        atomic_store(&g_cframe, atomic_load(&g_frame)); cam_commit(vm->cam_m, 0, 0,0);
     } else if (vm && vm->cam_ok) { static atomic_uint n; if (atomic_fetch_add(&n, 1) < 10) vxmac_log("Metal: a foreground encoder's camera skipped (fov %.1f)", 2 * atanf(vm->cam_tx) * 57.2958f); }
     if (g_f) pass_end(e);
 }
@@ -936,10 +934,7 @@ static int cam_parse(const uint8_t *tl, size_t n, float m[16], float *otx, float
             float proj[16]; memcpy(proj, c + 128, sizeof proj);
             static atomic_uint matrices_logged; unsigned mi = atomic_fetch_add(&matrices_logged, 1);
             if (mi < 10) vxmac_log("Metal: camera projection P #%u: [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f]", mi + 1, proj[0], proj[1], proj[2], proj[3], proj[4], proj[5], proj[6], proj[7], proj[8], proj[9], proj[10], proj[11], proj[12], proj[13], proj[14], proj[15]);
-            float p0 = proj[0], p5 = proj[5];
-            if (p0 > 0.2f && p0 < 5 && p5 > 0.2f && p5 < 8) {
-                *otx = 1 / p0; *oty = 1 / p5;
-            }
+            (void)vx_frame_camera_projection(proj,otx,oty);
         }
     }
     pthread_mutex_unlock(&g_brl);
@@ -949,11 +944,13 @@ static int cam_parse(const uint8_t *tl, size_t n, float m[16], float *otx, float
         if (ok && fabsf(m[4]*m[8] + m[5]*m[9] + m[6]*m[10]) > 0.02f) ok = 0;
         if (ok && fabsf(m[15] - 1) > 1e-3f) ok = 0;
     }
-    if (!ok) { if (g_gcam_bad++ < 10) vxmac_log("Metal: the game's camera: no rotation at the known place this frame (%lu)", g_gcam_bad); return 0; }
+    if (!ok || !(*otx>0) || !(*oty>0)) { if (g_gcam_bad++ < 10) vxmac_log("Metal: the game's camera: no view with its own perspective projection (%lu)", g_gcam_bad); return 0; }
     return 1;
 }
-// (the world's camera, committed once a frame: the view always, the tangents when the constants had a projection)
+// Publish a view and its own lens together. Never attach the previous world's
+// lens to a shadow or foreground view when no world-only pass was captured.
 static void cam_commit(const float m[16], float tx, float ty,uint64_t sequence) {
+    if (!(tx>0) || !(ty>0)) return;
     if(!sequence)sequence=vx_frame_camera_next();
     pthread_mutex_lock(&g_gcl); memcpy(g_gcam, m, 64); g_gcam_seq=sequence; uint64_t q = g_gcam_seq; float o = g_gtan[0]; if (tx > 0) { g_gtan[0] = tx; g_gtan[1] = ty; } pthread_mutex_unlock(&g_gcl);
     if (q == 1) vxmac_log("Metal: the game's camera read from its view constants (forward %.3f %.3f %.3f)", m[8], m[9], m[10]);

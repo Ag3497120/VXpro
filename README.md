@@ -1,6 +1,6 @@
 # VXpro — hand-tracking branch
 
-**Hand-tracking, performance and camera checkpoint · 2026-11-08.** This branch develops tracked hands and
+**Hand-tracking, performance and camera checkpoint · 2026-11-09.** This branch develops tracked hands and
 Joy-Con-assisted weapon handling. The standard controller version remains on
 [`main`](https://github.com/Ag3497120/VXpro/tree/main).
 
@@ -22,8 +22,13 @@ hand-tracking branch, with weapon-specific compatibility still being tested.
   then uses that same snapshot when submitting the image. The user reported the walking head-turn rebound
   completely resolved in the latest headset test.
 - Ordinary VR peripheral coverage has also been restored, with the user confirming the picture no longer has
-  the reported gaps and the head-turn rebound has not returned. Vehicle/story borders remain separate known issues.
-- **Known issues:** rectangular image borders remain during vehicle use and some story conversations/cutscenes.
+  the reported gaps and the head-turn rebound has not returned. The November 9 vehicle follow-up is described below.
+- The November 9 follow-up rejects invalid world-camera samples, and the user reports VR-only blackouts gone.
+  Vehicle peripheral coverage and steering handling were improved; VR vertical look now uses the head only,
+  with accelerator/brake/steering input paths retained. The user reported improvement after the installed update.
+- Opt-in direct CDPR sign-in and cloud-save download/load have been confirmed on the headset. Startup account
+  restoration is included; upload roundtrip and broader save compatibility still need verification.
+- **Known issues:** rectangular image borders may remain in story/constrained camera views; all vehicle scenes are unverified.
   Individual weapons, support spacing, sight/scope attachment and reload/slide visuals still need polish and verification.
   Barrel-directed shot integration remains experimental.
 
@@ -43,7 +48,9 @@ NPU/weight-edit/frame-generation work is included as experimental tools; models 
 and no NPU FPS gain has been established.
 
 Implementation and controls: [HAND_SESSION.md](HAND_SESSION.md), [design notes](docs/DESIGN.md).
-Camera/FPS evidence: [2026-11-08 release notes](docs/RELEASE_2026_11_08.md).
+Current fixes, settings and limits: [2026-11-09 checkpoint](docs/RELEASE_2026_11_09.md).
+Historical FPS evidence: [2026-11-08 release notes](docs/RELEASE_2026_11_08.md).
+Optional direct account/cloud setup: [DIRECT_CLOUD.md](DIRECT_CLOUD.md).
 Experiments: [frame pipeline](FRAME_PIPELINE.md), [NPU offload](NPU_OFFLOAD_RESULT.md), [weight editing](NPU_WEIGHT_EDIT.md).
 
 ## Integration plan

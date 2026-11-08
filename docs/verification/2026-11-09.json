@@ -1,0 +1,23 @@
+{
+  "checkpoint_date": "2026-11-09",
+  "branch": "hand-tracking",
+  "user_report": "Vehicle behavior improved; publish this state",
+  "acceptance_run": "20261108T224811Z-vehicle-head-pitch-user-accepted/d1",
+  "installed_run": "20261108T223658Z-vehicle-head-pitch-installed/d1",
+  "blackout_acceptance_run": "20261108T220343Z-vr-blackout-user-accepted/d1",
+  "graphics": "1280x720 native, scaling/DRS/frame generation off",
+  "startup_flags": "../configs/hand-tracking-2026-11-09.args.txt",
+  "new_fps_measured": false,
+  "all_vehicle_story_scenes_verified": false,
+  "private_raw_evidence_included": false,
+  "source_sha256": {
+    "app/Sources/host.m": "aa5629976656e12f5547bacdd2641879957f6311cb5b060b1fe6f0ed47eb60a9",
+    "vr/xros_vr.m": "d9dd58831f28b55c2360380c388628f27db10507e0a1429aa4993ab23205481f",
+    "vr/view_stability.h": "16ee9c371a57a68bc2fb109261a19c1a808f4ec81a42b3b75af7427ccc1e9a92",
+    "shims/vxpipe.m": "480952781d804b43c8249492eea095306b4ce131f7abed6c19cc35d4788509ad",
+    "shims/frame_camera.h": "5a0c55d0dee61d0e2751d689a7e05a2b0e3a70f3c6cb577abfe40ee9fbac7cd8",
+    "shims/vxcurl.m": "8ea79c9bc6031d372e67a64c14490b7ad1ddcfe9f16d414fccb879873af9962f",
+    "shims/vxsec.c": "e73928f6f0554b0f9d900e9431b244240ae07e5e16c83721b08dd25ead54e2bb",
+    "shims/vxsystem.c": "f5a0089eacdb971f462fa6b853011e34c98b29187f514f2b7a312f1dafa2fce0"
+  }
+}

@@ -29,17 +29,17 @@ $(OUT)/libvxcg.dylib: vxcg.c $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxcg.c -o $@ -Wl,-reexport_framework,CoreGraphics -framework CoreFoundation $(OUT)/libvxkit.dylib
 $(OUT)/libvxiokit.dylib: vxiokit.c | $(OUT)
 	$(CC) $(CFLAGS) $(DY) vxiokit.c -o $@ -Wl,-reexport_framework,IOKit -framework CoreFoundation
-$(OUT)/libvxsec.dylib: vxsec.c | $(OUT)
-	$(CC) $(CFLAGS) $(DY) vxsec.c -o $@ -Wl,-reexport_framework,Security -framework CoreFoundation
+$(OUT)/libvxsec.dylib: vxsec.c vxmac.h $(OUT)/libvxkit.dylib | $(OUT)
+	$(CC) $(CFLAGS) $(DY) vxsec.c -o $@ -Wl,-reexport_framework,Security -framework CoreFoundation $(OUT)/libvxkit.dylib
 $(OUT)/libvxgk.dylib: vxgk.m | $(OUT)
 	$(CC) $(CFLAGS) $(DY) vxgk.m -o $@ -Wl,-reexport_framework,GameKit -framework Foundation
-$(OUT)/libvxcurl.dylib: vxcurl.c $(OUT)/libvxkit.dylib
-	$(CC) $(CFLAGS) $(DY) vxcurl.c -o $@ $(OUT)/libvxkit.dylib
+$(OUT)/libvxcurl.dylib: vxcurl.m vxcurl.h $(OUT)/libvxkit.dylib
+	$(CC) $(CFLAGS) $(DY) vxcurl.m -o $@ -framework Foundation $(OUT)/libvxkit.dylib
 $(OUT)/libvxmtl.dylib: vxmtl.m vxframe_pace.c vxframe_pace.h vxwarp_gate.m vxwarp_gate.h vxpipe.m vxpipe.h frame_camera.h vrik.inc vrik_assets.inc vrik_capture.inc vrik_table.h $(wildcard ../build/hand-session-v2/weapon_asset_catalog.h) vxprof.m vxprof.h $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxmtl.m vxframe_pace.c vxwarp_gate.m vxpipe.m vxprof.m -o $@ -Wl,-reexport_framework,Metal -framework Foundation -framework QuartzCore $(OUT)/libvxkit.dylib
 $(OUT)/libvxmtlfx.dylib: vxmtlfx.m $(OUT)/libvxkit.dylib
 	$(CC) $(CFLAGS) $(DY) vxmtlfx.m -o $@ $(FXLINK) -framework Foundation -framework Metal -framework QuartzCore $(OUT)/libvxkit.dylib
-$(OUT)/libvxsystem.dylib: vxsystem.c vxmtrace.c | $(OUT)
+$(OUT)/libvxsystem.dylib: vxsystem.c vxmtrace.c network_ca_path.h | $(OUT)
 	$(CC) $(CFLAGS) $(DY) vxsystem.c vxmtrace.c -o $@ -Wl,-reexport-lSystem
 
 # (Mac tests of the Metal / MetalFX parts with DYLD_INSERT_LIBRARIES: they need vxmac_log, from a small log unit)

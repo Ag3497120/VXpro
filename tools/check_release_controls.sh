@@ -8,6 +8,8 @@ out=${VXMAC_CHECK_DIR:-build/release-controls-v1}
 mkdir -p "$out"
 xcrun clang -O2 -Wall -Wextra -Werror -fobjc-arc -fblocks -framework Foundation -framework Metal tests/frame_camera_mac.m -o "$out/frame_camera_mac"
 "$out/frame_camera_mac"
+xcrun clang -O2 -fobjc-arc -fblocks -framework Foundation -framework Metal -framework QuartzCore tests/world_camera_source_mac.m -o "$out/world_camera_source_mac"
+"$out/world_camera_source_mac"
 xcrun clang -O2 -Wall -Wextra -Werror tests/view_stability_test.c -o "$out/view_stability_test"
 "$out/view_stability_test"
 xcrun clang -O2 -Wall -Wextra -Werror tests/room_contact_test.c -o "$out/room_contact_test"

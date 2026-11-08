@@ -67,6 +67,25 @@ int main(void) {
     }
     assert(vx_view_heading_offset(17.f,-179.f,1./30,1,1,.6f)==-179.f);
     assert(fabsf(vx_view_wrap(vx_view_heading_offset(179.f,-179.f,1./30,0,0,.6f)-179.f))<.2f);
+    // A 70-degree native vehicle turn with a stationary head belongs to the
+    // controller/world, not the source image's position in the eye. The old
+    // right-stick-only signal leaves a 70-degree source/eye mismatch here.
+    float driving=17.f,legacy=17.f;
+    for(int frame=1;frame<=180;frame++) {
+        float native=17.f+70.f*(float)frame/180.f;
+        int turn=vx_view_turn_input(0,0,.8f,1);
+        driving=vx_view_heading_offset(driving,native,1./30,turn,1,.6f);
+        legacy=vx_view_heading_offset(legacy,native,1./30,0,1,.6f);
+        assert(fabsf(vx_view_wrap(native-driving))<1e-5f);
+    }
+    assert(fabsf(vx_view_wrap(87.f-legacy))>69.f);
+    // Walking/strafe alone still cannot move the room zero during head turns.
+    for(int frame=0;frame<100;frame++) {
+        int turn=vx_view_turn_input(0,0,.8f,0);assert(!turn);
+        assert(vx_view_heading_offset(17.f,30.f+sinf(frame*.1f),1./30,turn,1,.6f)==17.f);
+    }
+    assert(vx_view_turn_input(.8f,0,0,0) && vx_view_turn_input(0,-.8f,0,0));
+    assert(!vx_view_turn_input(.1f,-.1f,.1f,1));
     vx_view_context s={0};
     assert(!vx_view_context_update(&s,1,0,0,1) && s.known && !s.scene);
     assert(vx_view_context_update(&s,2,0,0,3) && s.scene);
@@ -101,5 +120,5 @@ int main(void) {
         vx_view_roll(m,-t);
         for(int i=0;i<12;i++)assert(fabsf(m[i]-before[i])<1e-5f);
     }
-    puts("view stability: scoped scene/menu guards, stale heartbeats, physical versus stick heading, 24 delayed camera response trials, 315 native-camera world-point projections: ok");
+    puts("view stability: scoped scene/menu guards, stale heartbeats, physical versus stick/vehicle steering heading, 24 delayed camera response trials, 315 native-camera world-point projections: ok");
 }

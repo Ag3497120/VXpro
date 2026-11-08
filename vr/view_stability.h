@@ -22,6 +22,9 @@ static inline int vx_view_predict_translation(int walking,int constrained) { ret
 static inline int vx_view_vehicle_look(int known,int perspective,int pitch_ready,int mode,int scene,int menu) {
     return known && perspective==0 && pitch_ready && (mode==1 || mode==3) && !scene && !menu;
 }
+static inline int vx_view_turn_input(float right_x,float right_y,float left_x,int vehicle) {
+    return fabsf(right_x)>.15f || fabsf(right_y)>.15f || (vehicle && fabsf(left_x)>.15f);
+}
 static inline float vx_view_heading_offset(float offset,float target,double dt,int stick,int free_look,float tau) {
     if(stick) return target;
     // The captured camera already contains the head input. Moving this room

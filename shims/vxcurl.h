@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: MIT
+// The public libcurl ABI used by the owned Mac game. No libcurl implementation
+// code is included; the transport is Foundation on both macOS and visionOS.
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+typedef struct curl_slist { char *data; struct curl_slist *next; } curl_slist;
+typedef struct { int msg; void *easy_handle; union { void *whatever; int result; } data; } vx_curl_msg;
+enum {
+    VX_CURL_OK=0, VX_CURL_UNSUPPORTED_PROTOCOL=1, VX_CURL_FAILED_INIT=2,
+    VX_CURL_URL_MALFORMAT=3, VX_CURL_RESOLVE=6, VX_CURL_CONNECT=7,
+    VX_CURL_HTTP_ERROR=22, VX_CURL_WRITE_ERROR=23, VX_CURL_READ_ERROR=26,
+    VX_CURL_OUT_OF_MEMORY=27, VX_CURL_TIMEOUT=28, VX_CURL_SSL_ERROR=35,
+    VX_CURL_ABORTED=42, VX_CURL_BAD_ARGUMENT=43, VX_CURL_TOO_MANY_REDIRECTS=47,
+    VX_CURL_UNKNOWN_OPTION=48, VX_CURL_CERTIFICATE_ERROR=60,
+    VX_CURL_FILESIZE_EXCEEDED=63
+};
+enum {
+    VX_CURLOPT_WRITEDATA=10001, VX_CURLOPT_URL=10002, VX_CURLOPT_READDATA=10009,
+    VX_CURLOPT_ERRORBUFFER=10010, VX_CURLOPT_WRITEFUNCTION=20011, VX_CURLOPT_READFUNCTION=20012,
+    VX_CURLOPT_TIMEOUT=13, VX_CURLOPT_INFILESIZE=14, VX_CURLOPT_POSTFIELDS=10015,
+    VX_CURLOPT_REFERER=10016, VX_CURLOPT_USERAGENT=10018, VX_CURLOPT_HTTPHEADER=10023,
+    VX_CURLOPT_HEADERDATA=10029, VX_CURLOPT_CUSTOMREQUEST=10036, VX_CURLOPT_VERBOSE=41,
+    VX_CURLOPT_HEADER=42, VX_CURLOPT_NOPROGRESS=43, VX_CURLOPT_NOBODY=44,
+    VX_CURLOPT_FAILONERROR=45, VX_CURLOPT_UPLOAD=46, VX_CURLOPT_POST=47,
+    VX_CURLOPT_FOLLOWLOCATION=52, VX_CURLOPT_POSTFIELDSIZE=60, VX_CURLOPT_SSL_VERIFYPEER=64,
+    VX_CURLOPT_MAXREDIRS=68, VX_CURLOPT_CONNECTTIMEOUT=78, VX_CURLOPT_HEADERFUNCTION=20079,
+    VX_CURLOPT_HTTPGET=80, VX_CURLOPT_SSL_VERIFYHOST=81, VX_CURLOPT_HTTP_VERSION=84,
+    VX_CURLOPT_NOSIGNAL=99, VX_CURLOPT_ACCEPT_ENCODING=10102, VX_CURLOPT_PRIVATE=10103,
+    VX_CURLOPT_INFILESIZE_LARGE=30115, VX_CURLOPT_POSTFIELDSIZE_LARGE=30120,
+    VX_CURLOPT_TIMEOUT_MS=155, VX_CURLOPT_CONNECTTIMEOUT_MS=156,
+    VX_CURLOPT_COPYPOSTFIELDS=10165, VX_CURLOPT_XFERINFODATA=10057,
+    VX_CURLOPT_XFERINFOFUNCTION=20219
+};
+enum {
+    VX_CURLINFO_EFFECTIVE_URL=0x100001, VX_CURLINFO_RESPONSE_CODE=0x200002,
+    VX_CURLINFO_TOTAL_TIME=0x300003, VX_CURLINFO_NAMELOOKUP_TIME=0x300004,
+    VX_CURLINFO_CONNECT_TIME=0x300005, VX_CURLINFO_PRETRANSFER_TIME=0x300006,
+    VX_CURLINFO_SIZE_UPLOAD=0x300007, VX_CURLINFO_SIZE_DOWNLOAD=0x300008,
+    VX_CURLINFO_STARTTRANSFER_TIME=0x300011, VX_CURLINFO_CONTENT_TYPE=0x100012,
+    VX_CURLINFO_PRIVATE=0x100015, VX_CURLINFO_REDIRECT_COUNT=0x200014,
+    VX_CURLINFO_APPCONNECT_TIME=0x300021
+};
+int curl_global_init_mem(long,void *,void *,void *,void *,void *);
+int curl_global_init(long);
+void curl_global_cleanup(void);
+void *curl_easy_init(void);
+void curl_easy_cleanup(void *);
+int curl_easy_setopt(void *,int,...);
+int curl_easy_perform(void *);
+int curl_easy_getinfo(void *,int,...);
+const char *curl_easy_strerror(int);
+void *curl_multi_init(void);
+int curl_multi_cleanup(void *);
+int curl_multi_add_handle(void *,void *);
+int curl_multi_remove_handle(void *,void *);
+int curl_multi_perform(void *,int *);
+void *curl_multi_info_read(void *,int *);
+curl_slist *curl_slist_append(curl_slist *,const char *);
+void curl_slist_free_all(curl_slist *);

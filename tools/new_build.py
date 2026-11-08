@@ -12,7 +12,7 @@ os.makedirs(out, exist_ok=True)
 sh = lambda *c: subprocess.run(c, text=True, capture_output=True)
 IM = [('MacOS/Cyberpunk2077', 'Cyberpunk2077.dylib', ['--system-shim', '--pool-patch', '--as-dylib', '@rpath/Cyberpunk2077.dylib']),
       ('Frameworks/libGameServicesAppStore.dylib', 'libGameServicesAppStore.dylib', ['--system-shim']),
-      ('Frameworks/libBink2MacArm64.dylib', 'libBink2MacArm64.dylib', []), ('Frameworks/libREDGalaxy64.dylib', 'libREDGalaxy64.dylib', [])]
+      ('Frameworks/libBink2MacArm64.dylib', 'libBink2MacArm64.dylib', []), ('Frameworks/libREDGalaxy64.dylib', 'libREDGalaxy64.dylib', ['--system-shim'])]
 info = plistlib.load(open(os.path.join(app, 'Contents/Info.plist'), 'rb'))
 print('== version', info.get('CFBundleShortVersionString'), info.get('CFBundleVersion'), 'min macOS', info.get('LSMinimumSystemVersion'))
 print('== frameworks folder:', sorted(os.listdir(os.path.join(app, 'Contents/Frameworks'))))

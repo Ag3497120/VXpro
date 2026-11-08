@@ -1,6 +1,6 @@
 // VX Mac Host: the macOS program's start and its surroundings on visionOS (../../AVP_MAC.md).
 //
-//   xcrun devicectl device process launch --device <id> marimokodai.VXMacHost [-image vxmac_test|Cyberpunk2077]
+//   xcrun devicectl device process launch --device <id> <your-bundle-id> [-image vxmac_test|Cyberpunk2077]
 //        [-present vr|flat] [-data <dir in Documents>] [-gcmouse 0|1] [-- program arguments]
 //
 // The program is one of the images embedded in Frameworks (prepared with tools/macho_prepare.py --as-dylib: the
@@ -34,6 +34,8 @@
 #include "vxpipe.h"
 #include "interp_frame.h"
 #include "weapon_bridge.h"
+#include "auth_browser.h"
+#include "view_stability.h"
 
 extern void (*vx_host_jlog)(const char *event, const char *fields);   // (../../vr/vxmac_vr_glue.m)
 extern int vx_xros_display_w, vx_xros_display_h;
@@ -81,16 +83,36 @@ int vxmac_vr_space_open(void) { return g_space_open; }
 //  left running behind). In the background the program's commits wait (no GPU work), its NSApplication is inactive)
 #include <stdatomic.h>
 static _Atomic int g_quit_asked; static _Atomic unsigned long g_bg_gen;
+static _Atomic double g_auth_browser_until;
+static _Atomic int g_host_active=1;
+int vxmac_open_external_url(const char *text) {
+    const char *enabled=getenv("VXMAC_NETWORK");
+    NSURL *url=text?[NSURL URLWithString:@(text)]:nil;
+    if(!enabled || strcmp(enabled,"1") || !vx_auth_browser_allowed(url))return 0;
+    // Keep the paused game available while the user signs in with Safari.
+    // GPU submission is still suspended by the normal background path.
+    atomic_store(&g_auth_browser_until,NSProcessInfo.processInfo.systemUptime+600);
+    dispatch_async(dispatch_get_main_queue(),^{
+        [UIApplication.sharedApplication openURL:url options:@{} completionHandler:^(BOOL success){
+            jlog("auth_browser","\"opened\":%d",success);
+            if(!success)atomic_store(&g_auth_browser_until,0);
+        }];
+    });
+    return 1;
+}
 void vxmac_request_quit(const char *why) {
     if (atomic_exchange(&g_quit_asked, 1)) return;
     jlog("quit_requested", "\"why\":\"%s\"", why ? why : "?");
     vxkit_request_quit();
 }
 void vxmac_set_foreground(int fg) {
+    atomic_store(&g_host_active,fg!=0);
     vxkit_set_active(fg); vxmtl_set_foreground(fg);
+    if(fg)atomic_store(&g_auth_browser_until,0);
     unsigned long gen = atomic_fetch_add(&g_bg_gen, 1) + 1;
     if (!fg) {
         const char *e = getenv("VXMAC_BG_QUIT_S"); double s = e && *e ? atof(e) : 10;
+        s=vx_auth_background_delay(s,NSProcessInfo.processInfo.systemUptime,atomic_load(&g_auth_browser_until));
         if (s > 0) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(s * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             if (atomic_load(&g_bg_gen) == gen) vxmac_request_quit("background");
         });
@@ -225,9 +247,13 @@ static float best_shift(const float *a, const float *b, int n, int range) {
     return (float)best;
 }
 static int stick_active(void) {
+    int vehicle=vx_xros_vr_vehicle_active();
     for (GCController *c in GCController.controllers) {
         GCExtendedGamepad *g = c.extendedGamepad;
-        if (g && (fabsf(g.rightThumbstick.xAxis.value) > 0.15f || fabsf(g.rightThumbstick.yAxis.value) > 0.15f)) return 1;
+        // Steering turns the native vehicle camera too. Treat its left-stick
+        // turn as controller motion, while walking keeps its fixed room zero.
+        if (g && vx_view_turn_input(g.rightThumbstick.xAxis.value,g.rightThumbstick.yAxis.value,
+                                   g.leftThumbstick.xAxis.value,vehicle)) return 1;
     }
     return 0;
 }
@@ -440,13 +466,16 @@ static void watch_mouse(GCMouse *m) {
 // assumed the head's pitch, and later head turns warped wrongly, h23. GameController's own objects, in this process:
 // -[GCControllerAxisInput value] for the right sticks' y axes, and the handlers set on right sticks get y = 0.
 // VXMAC_STICK_PITCH=1: the stick's pitch kept.
+// Vehicles use the same head-only vertical look: stick pitch would rotate the
+// captured frame away from the headset. Steering, left-stick motion and
+// triggers remain native.
 int vx_xros_vr_driving(void);
 int vx_xros_vr_vehicle_active(void);
 static NSHashTable *g_right_y, *g_right_pads, *g_vr_btns, *g_vr_axes, *g_vr_pads, *g_joy_triggers;
 static _Atomic unsigned long g_stick_y_zeroed;   // (reads of the right stick's y answered 0, for the stats)
 static int stick_pitch_blocked(void) {
     static int keep = -1; if (keep < 0) { const char *e = getenv("VXMAC_STICK_PITCH"); keep = e && !strcmp(e, "1"); }
-    return !keep && vx_xros_vr_driving() && !vx_xros_vr_vehicle_active();
+    return !keep && vx_xros_vr_driving();
 }
 static void note_controller(GCController *c) {
     GCExtendedGamepad *g = c.extendedGamepad;
@@ -692,6 +721,9 @@ static void program_poll(void) {
     vx_weapon_bridge_poll();
     void vx_xros_vr_input_poll(void);
     vx_xros_vr_input_poll();
+    if(atomic_load(&g_host_active) && !atomic_load(&g_quit_asked)) {
+        void vxmac_account_restore_poll(void);vxmac_account_restore_poll();
+    }
 }
 
 static void *program_main(void *arg) {
@@ -719,6 +751,7 @@ static void *program_main(void *arg) {
     if (!mh) { jlog("program_error", "\"what\":\"loaded image not found\""); return NULL; }
     atomic_store(&g_input_game_image, mh);
     vx_weapon_bridge_prepare(mh);
+    void vxmac_network_probe_start(void);vxmac_network_probe_start();
     vxaudio_hook_image(mh);   // (h66: its HAL imports through libvxkit's counters - done at load already; idempotent)
     entry_fn entry = (entry_fn)((const char *)mh + [img[@"entry_offset"] unsignedLongLongValue]);
     // (h61b: which prepared image this bundle carries - ddgame61 was built from 2.3.2's prepared/ (entry 206152) against

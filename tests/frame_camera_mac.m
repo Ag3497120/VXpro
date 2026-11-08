@@ -9,6 +9,9 @@ static void camera(float m[16],float degrees) {
     m[0]=cosf(a);m[1]=-sinf(a);m[4]=sinf(a);m[5]=cosf(a);m[10]=m[15]=1;
 }
 int main(void) {@autoreleasepool {
+    float projection[16]={.7f,0,0,0,0,1.2f,0,0,0,0,0,.02f,0,0,1,0},px,py;
+    assert(vx_frame_camera_projection(projection,&px,&py) && fabsf(px-1/.7f)<1e-6f);
+    projection[15]=1;assert(!vx_frame_camera_projection(projection,&px,&py));
     id<MTLDevice> device=MTLCreateSystemDefaultDevice();assert(device);
     id<MTLCommandQueue> queue=[device newCommandQueue];assert(queue);
     id a=[queue commandBuffer],b=[queue commandBuffer],c=[queue commandBuffer];
