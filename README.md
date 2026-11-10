@@ -1,16 +1,24 @@
-# VXpro — hand-tracking branch
+# VXpro
 
-**Hand-tracking, performance and camera checkpoint · 2026-11-09.** This branch develops tracked hands and
-Joy-Con-assisted weapon handling. The standard controller version remains on
-[`main`](https://github.com/Ag3497120/VXpro/tree/main).
+**Controller / hand-tracking integration · 2026-11-10.** `main` now includes the accumulated hand-tracking,
+performance, camera and direct cloud-save changes. Switch between standard controller weapon handling and
+Joy-Con-assisted tracked hands during play; both modes keep VR head tracking. This remains an experimental preview.
 
 [English](README.md) · [日本語](README_ja.md)
+
+**Community:** [Join the VeRantyx / VXpro Discord](https://discord.gg/h2znwYJt3) for setup help, bug reports and development discussions.
 
 ## Current hand-tracking state
 
 ARKit hand/wrist tracking drives the existing arm, hand and weapon bones through custom Metal rendering hooks.
 Joy-Con buttons provide movement, firing and other explicit actions. This is an experimental, controller-assisted
-hand-tracking branch, with weapon-specific compatibility still being tested.
+hand-tracking implementation, with weapon-specific compatibility still being tested.
+
+- **Live mode switch:** hold Joy-Con **+ and − together for one second**, then release both before switching again.
+  Single presses keep their menu behavior. Switching releases synthetic held inputs and restores native weapon
+  rendering/reload handling in controller mode. The player confirmed that the physical mode switch works.
+- **Menu presentation:** the quick menu uses one presentation plane during transitions, as do load/save screens.
+- **Tracked melee:** swinging an equipped melee weapon sends an attack. Grip placement is still incomplete on some weapons.
 
 - The weapon stays in the right hand. ZR fires. On long guns, holding ZL requests left-hand support and ADS;
   releasing it releases both. Reload interactions take priority over support.
@@ -30,7 +38,8 @@ hand-tracking branch, with weapon-specific compatibility still being tested.
   restoration is included; upload roundtrip and broader save compatibility still need verification.
 - **Known issues:** rectangular image borders may remain in story/constrained camera views; all vehicle scenes are unverified.
   Individual weapons, support spacing, sight/scope attachment and reload/slide visuals still need polish and verification.
-  Barrel-directed shot integration remains experimental.
+  Detached sleeves, some melee grips and scope lenses remain reported issues. The extra handgun fingers were reported
+  resolved in the latest test; the other visual issues are not claimed fixed. Barrel-directed shot integration remains experimental.
 
 ## Performance checkpoint
 
@@ -49,25 +58,68 @@ and no NPU FPS gain has been established.
 
 Implementation and controls: [HAND_SESSION.md](HAND_SESSION.md), [design notes](docs/DESIGN.md).
 Current fixes, settings and limits: [2026-11-09 checkpoint](docs/RELEASE_2026_11_09.md).
+Latest integration and verification: [2026-11-10 update](docs/RELEASE_2026_11_10.md).
 Historical FPS evidence: [2026-11-08 release notes](docs/RELEASE_2026_11_08.md).
 Optional direct account/cloud setup: [DIRECT_CLOUD.md](DIRECT_CLOUD.md).
 Experiments: [frame pipeline](FRAME_PIPELINE.md), [NPU offload](NPU_OFFLOAD_RESULT.md), [weight editing](NPU_WEIGHT_EDIT.md).
 
-## Integration plan
+## Graphics recovery: blurred picture or smeared head turns
 
-Stabilize this branch before integrating it into `main`. Integration must include an in-game,
-immediate switch between standard controller play and tracked-hand play, without restarting the
-app or reloading a save. Both modes keep VR head tracking.
+Check the game's **Video / Graphics settings** if the picture becomes blurred, head turns leave a strong smear,
+or performance changes after adjusting graphics options. Replacing or rolling back the app does not necessarily
+restore the settings saved inside its container.
 
-Only one mode owns gameplay input at a time. Switching must release the previous mode's trigger,
-ADS and grip inputs, preserve the equipped weapon and real ammunition/reload state, and change
-hand/weapon rendering with the same mode update. Verify switches during firing, support, reload,
-tracking loss, menus and weapon changes before integration. This switch is planned, not implemented.
+The November 8 audit found the following differences. Restoring the low-effects profile without changing the app
+was followed by the user's confirmation that picture quality and head motion had returned to the previous state.
 
-## Use this branch
+| Setting | Observed during the regression | Recovery baseline |
+| --- | --- | --- |
+| Output resolution | 1280×720 | **1280×720 native** |
+| Resolution scaling / dynamic resolution / frame generation | Off at the audited launch | **All Off** |
+| Motion Blur | High | **Off** |
+| Film Grain / Chromatic Aberration / Depth of Field | On | **All Off** |
+| Texture Quality | High | Low |
+| Screen Space Reflections | Ultra | Off |
+| Ambient Occlusion / Contact Shadows | High / On | Off / Off |
+| Shadow Mesh / Cascaded Shadows / Distant Shadows | High | Low |
+| Local Shadows | High | Off |
+| Volumetric Fog / Volumetric Clouds | Ultra / Ultra | Low / Off |
+| Subsurface Scattering / Maximum Dynamic Decals / Level of Detail | High / Ultra / High | Low / Low / Low |
+| Color Precision / Anisotropic Filtering | High / 16× | Medium / 4× |
+| Mirror Quality / Crowd Density / Facial Tangent Updates | High / High / On | Low / Low / Off |
+| Field of View | 110 | Keep 110 |
+
+**MetalFX is not established as the sole cause.** At that audited launch, `ResolutionScaling` was `Off` and no
+temporal-scaler encodes were recorded, even though the saved MetalFX quality option said `Quality`. The restored
+file says `Performance`, but that sub-option is inactive while scaling is off; enabling MetalFX Performance is
+**not** the recovery instruction. A separate earlier capture had 1280×720 output with an **853×480 internal surface**,
+so the output-resolution label alone does not establish native rendering.
+
+Use the in-game menus to apply this baseline. For an external edit, save and quit the game first, back up your own
+`Library/Application Support/CD Projekt Red/Cyberpunk 2077/UserSettings.json` from the host's app container,
+and change only graphics/crowd options. Preserve other settings, saves and account data. Restart and check the
+settings again; do not delete VX Mac Host to reset graphics.
+
+This is a **recovery baseline, not a complete snapshot of the historical 37.1 FPS test or a promised frame rate**.
+VR-only blackouts remained after the settings recovery and were addressed separately by the camera fix described
+in the [November 9 checkpoint](docs/RELEASE_2026_11_09.md). Vehicle/story borders also need separate diagnosis.
+Development evidence: `20261108T125547Z-graphics-settings-audit-restore/o1,o2,o3,o5` and
+`20261108T214855Z-graphics-restored-vr-camera-preflight/d1`; raw logs and personal settings are not distributed.
+
+## Switching controls during play
+
+Hold **+ and − together for one second**. No app restart or save reload is required. Release both buttons to
+rearm the shortcut. Release firing/support buttons too when changing modes: the new owner waits for neutral inputs.
+To start with native controller weapons, launch with `--env VXMAC_CONTROL_MODE=controller`.
+
+One mode owns gameplay input at a time. Switching preserves the equipped weapon and actual ammunition; it does not
+grant ammunition or reload a save. Local tests cover held-input release, script acknowledgement, native binding
+restoration and repeated switches. Broader weapon/reload/vehicle combinations still need testing.
+
+## Get the current version
 
 ```sh
-git clone --branch hand-tracking https://github.com/Ag3497120/VXpro.git
+git clone https://github.com/Ag3497120/VXpro.git
 cd VXpro
 ```
 
@@ -84,7 +136,7 @@ all of the tested installation's weapon-specific contacts. Run `sh tools/check_h
 
 ## Base runtime and setup
 
-The Preview 0.3 notes below describe the original controller preview. The hand-tracking checkpoint and measured
+The Preview 0.3 notes below describe the original controller preview. The integrated controls and measured
 performance above are newer; historical rates and controls below are not a guarantee for this branch.
 
 Run Mac App Store games (Cyberpunk 2077) in VR on Apple Vision Pro — head look, depth reprojection, Neural Engine
@@ -175,11 +227,14 @@ its own path (as Cmd+Q on a Mac) and the app closes. See "Controls in the headse
 - **Bottom border**: the game's frame covers less than the eye's view; the rest (mostly below) is filled with a dimmed,
   older panorama of the scene (`VXMAC_VR_CACHE`), not the live game.
 - **Memory**: about 6.5 GB of the ~8.2 GB the app may use; higher settings can end the app.
-- **Tested builds** 2.5.0 and 2.3.2 (checked by hash); offline only (no Game Center, iCloud saves or GOG); no mods, ray
-  tracing or HDR; development signing has to be renewed when your profile expires.
+- **Tested builds** 2.5.0 and 2.3.2 (checked by hash). The original preview was offline-only. The current version adds
+  opt-in direct CDPR cloud-save support as described above; Game Center/iCloud synchronization is not established.
+  Ray tracing/HDR remain unsupported. Development signing expires with your profile.
 - The Neural Engine features are built in but **off by default**: `VXMAC_FSR=1` (foveated super-resolution),
   `VXMAC_FOVEATE=1` (compositor foveation). Others: `VXMAC_VEL`, `VXMAC_NPU`, `VXMAC_VR_CACHE`, `VXMAC_VR_VIGNETTE`,
   `VXMAC_VR_ZOOM`, `VXMAC_STICK_PITCH` (see the guide's "Options").
+- **Eye-tracked foveated rendering is not enabled.** The display-side experiment did not improve FPS with the current
+  pipeline. Game-side foveation remains future optimization work; no ETFR or NPU performance gain is claimed.
 
 ## Safety
 

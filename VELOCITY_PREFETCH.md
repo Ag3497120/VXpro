@@ -56,7 +56,7 @@ Mac実行、visionOS向けのソースコンパイル、ゲーム比較用アプ
 ## M2での検査とゲーム試験
 
 同じ70ケースと速度比較をする専用の「Motion Mean Test」
-（marimokodai.VXMotionMeanBench）を用意した。
+（com.example.VXMotionMeanBench）を用意した。
 tests/velocity_mean_app/project.ymlから生成・ビルドする。
 起動すると自動で検査し、Documentsのvelocity_mean.jsonに結果を保存する。
 開始時に古い結果を置き換え、途中で失敗しても古い成功結果として扱わない。

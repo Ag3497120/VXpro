@@ -73,6 +73,12 @@ def vector(values):
 def build(paths, output):
     entries = {}
     ambiguous = set()
+    table=(Path(__file__).resolve().parents[1]/'shims/vrik_table.h').read_text()
+    rig_names=re.findall(r'"([^"]*)"',re.search(r'vrik_names\[.*?\] = \{(.*?)\};',table).group(1))
+    offsets=list(map(int,re.search(r'vrik_list_off.*?= \{(.*?)\};',table).group(1).split(',')))
+    flat=list(map(int,re.search(r'vrik_list\[.*?\] = \{(.*?)\};',table).group(1).split(',')))
+    lists={tuple(rig_names[n] for n in flat[offsets[i]:offsets[i+1]]):i for i in range(len(offsets)-1)}
+    body_tables={}
     for asset_id, path in enumerate(sorted(paths), 1):
         try:
             mesh = inspect(path)
@@ -82,7 +88,7 @@ def build(paths, output):
         except (KeyError, IndexError, ValueError, struct.error):
             continue
         names = mesh["bones"]
-        if not names or len(names) > 64:
+        if len(names) > 128:
             continue
         lower = [n.lower() for n in names]
         def bone(*choices):
@@ -95,6 +101,16 @@ def build(paths, output):
         hinge = bone("magazine_open")
         support = bone("left_grip", "front_left_handle", "foreend", "handle")
         tags = " ".join(reader.names).lower()
+        # Some appearance variants retain a _setup suffix for the same named
+        # joints. Resolve only aliases present in the local canonical rig.
+        canonical = [n[:-6] if n.endswith('_setup') and n[:-6] in rig_names else n for n in names]
+        body=any(n in ('LeftHand','RightHand','LeftForeArm','RightForeArm','LeftHandIndex3','RightHandIndex3') for n in canonical)
+        if body and not all(n in rig_names for n in names):
+            continue
+        melee=bool(re.search(r'(?:^|_)w_(?:club|knife|katana|machete|hammer|bat|axe|sword|chainsword|fist)(?:_|\b)',tags))
+        attachment=any(n in ('scope','pos_scope','lens','glass','sight','reticle') for n in lower)
+        if not names and not melee:
+            continue
         pistol = "w_handgun" in tags
         revolver = "w_revolver" in tags
         ammo = [bool(re.fullmatch(r"(?:mag(?:azine)?(?:_std[r]?)?|bullet|shell|ammo)(?:_\d+)?", n)) or
@@ -104,19 +120,25 @@ def build(paths, output):
             ammo = [False] * len(names)
             cylinder = root
         mask = sum(1 << i for i, flag in enumerate(ammo) if flag)
-        whole_ammo = all(ammo)
+        whole_ammo = bool(ammo) and all(ammo)
         kind = (1 if trigger >= 0 else 0) | (2 if whole_ammo else 0) | (4 if revolver else 0) | (8 if pistol else 0)
+        if body:
+            kind=128;mask=0
+        elif melee:
+            kind|=64
+        elif attachment and not kind:
+            kind=32
         if not kind and cylinder < 0 and not mask:
             continue
         points = [j["at"] for j in mesh["joints"]]
         def point(index):
-            return points[index] if index >= 0 else [0, 0, 0]
+            return points[index] if 0 <= index < len(points) else [0, 0, 0]
         center = [header.get("quantizationOffset", {}).get(k, 0) for k in "XYZ"]
         if mask and not whole_ammo:
             center = [sum(points[i][axis] for i, flag in enumerate(ammo) if flag) / sum(ammo)
                       for axis in range(3)]
         supported = point(support)
-        if support < 0 and trigger >= 0 and not pistol and not revolver:
+        if not body and support < 0 and trigger >= 0 and not pistol and not revolver:
             number_ = struct.unpack("<I", resource["renderBuffer"])[0] & 0x7fffffff
             surface = foregrip(reader, header, number_, point(trigger))
             if surface is not None:
@@ -126,33 +148,51 @@ def build(paths, output):
         # individual bind pivots stay separate in the skinning matrices.
         if whole_ammo and any(n.startswith("bullet_") or n == "reload_magazine_bullets" for n in lower):
             center = [0, 0, 0]
+        body_list=lists.get(tuple(canonical),len(offsets)-1) if body else -1
+        body_name='NULL'
+        if body:
+            body_name=f'vrik_body_{asset_id}'
+            body_tables[body_name]=[rig_names.index(n) for n in canonical]
         values = [asset_id, len(names), root, trigger, slide, cylinder, hinge, support, kind,
                   f"UINT64_C(0x{mask:x})", vector(point(root)), vector(point(trigger)),
                   vector(point(slide)), vector(point(cylinder)), vector(point(hinge)),
-                  vector(supported), vector(center)]
+                  vector(supported), vector(center),body_list,body_name]
         for draw in mesh["draws"]:
             # Coincident LOD aliases are harmless only if they describe the
             # same skinning layout and interaction roles.
             key = draw["count"], draw["fnv64"]
-            signature = tuple(str(v) for v in values[1:])
+            signature = tuple(str(v) for v in values[1:-1])+(tuple(body_tables[body_name]) if body else (),)
+            if body:
+                # Body contacts are resolved from this consumer's matrices.
+                # Cosmetic bind-position differences do not change its named
+                # skin layout and must not create indistinguishable variants.
+                signature = ("body", tuple(body_tables[body_name]))
             if whole_ammo and all(n.startswith("bullet_") or n == "reload_magazine_bullets" for n in lower):
                 signature = ("cartridges", len(names), mask)
             if key in ambiguous:
                 continue
-            if key in entries and entries[key][0] != signature:
+            variants = entries.setdefault(key, [])
+            if any(old_signature == signature for old_signature, _ in variants):
+                continue
+            # Clothing can reuse identical triangles with distinct 12/16-bone
+            # skins. Preserve those alternatives; the renderer must select one
+            # using this frame's named source joints, never its arena length.
+            if variants and not (body and all(old_values[8] == 128 for _, old_values in variants)):
                 del entries[key]
                 ambiguous.add(key)
                 continue
-            entries[key] = signature, values
-    lines = ["// Private numeric asset metadata; generated from locally owned files.",
-             "static const vrik_asset_profile vrik_assets[] = {"]
-    for (count, fingerprint), (_, values) in sorted(entries.items()):
-        lines.append("    {UINT64_C(0x" + fingerprint + ")," + str(count) + "," +
-                     ",".join(str(value) for value in values) + "},")
+            variants.append((signature, values))
+    lines = ["// Private numeric asset metadata; generated from locally owned files."]
+    lines += [f'static const uint16_t {name}[] = {{'+','.join(map(str,bones))+'};' for name,bones in body_tables.items()]
+    lines += ["static const vrik_asset_profile vrik_assets[] = {"]
+    for (count, fingerprint), variants in sorted(entries.items()):
+        for _, values in variants:
+            lines.append("    {UINT64_C(0x" + fingerprint + ")," + str(count) + "," +
+                         ",".join(str(value) for value in values) + "},")
     lines += ["};", "#define VRIK_ASSET_COUNT (sizeof vrik_assets / sizeof vrik_assets[0])", ""]
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(lines))
-    print(f"{len(entries)} draw identities; {len(ambiguous)} ambiguous identities refused; no geometry exported")
+    print(f"{len(entries)} draw identities; {sum(len(v) for v in entries.values())} skin alternatives; {len(ambiguous)} ambiguous identities refused; no geometry exported")
 
 
 if __name__ == "__main__":

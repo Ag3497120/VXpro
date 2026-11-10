@@ -28,6 +28,7 @@ vx_weapon_snapshot vx_weapon_bridge_snapshot(void);
 typedef struct {
     int known, mounted, vehicle_mode, scene_tier;
     int menu_known, menu_open;
+    int control_known, control_tracking;
     unsigned script_revision;
     int camera_known, vehicle_perspective, vehicle_pitch_ready, vehicle_fov_owned;
     float native_fov, foot_fov;
@@ -40,6 +41,9 @@ vx_game_context vx_weapon_bridge_context(void);
 // ammunition and chamber readiness still come only from the game's R reports.
 int vx_weapon_bridge_commands_enabled(void);
 int vx_weapon_bridge_commands_ready(void);
+// Runtime ownership only; does not change equipment or ammunition.
+void vx_weapon_bridge_set_tracking(int enabled);
+int vx_weapon_bridge_tracking(void);
 uint64_t vx_weapon_bridge_command(int kind);
 
 typedef struct {

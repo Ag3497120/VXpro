@@ -23,7 +23,7 @@ enum {
     STRING_INIT = 0x2cd2c, STRING_FREE = 0x291cc, STRING_ASSIGN = 0x2aaf4,
     REPORT_DEFAULT = 0x74f86a3,
     POLL_GUARD = 0x889d930, POLL_FUNCTION = 0x889f4d8, POLL_INDEX = 0xf0,
-    POLL_HANDLER = 0x16771b4, POLL_LITERAL = 0x56584832
+    POLL_HANDLER = 0x16771b4, POLL_LITERAL = 0x56584832, MODE_LITERAL = 0x56584d32
 };
 
 typedef void (*script_opcode)(void *, void *, void *, const void *);
@@ -40,6 +40,7 @@ _Static_assert(sizeof(vm_string) == 32 && __builtin_offsetof(vm_string, size_fla
 static _Atomic(const unsigned char *) game_base;
 static atomic_bool attached;
 static atomic_bool commands_enabled, poll_attached;
+static atomic_bool tracking_enabled = 1;
 static pthread_mutex_t snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
 static vx_weapon_snapshot equipped;
 static vx_game_context game_context;
@@ -102,6 +103,15 @@ vx_weapon_hand_frame vx_weapon_bridge_hands(void) {
 }
 
 int vx_weapon_bridge_commands_enabled(void) { return atomic_load(&commands_enabled); }
+int vx_weapon_bridge_tracking(void) { return atomic_load(&tracking_enabled); }
+void vx_weapon_bridge_set_tracking(int enabled) {
+    pthread_mutex_lock(&snapshot_lock);
+    atomic_store(&tracking_enabled,enabled!=0);
+    if(!enabled && pending.serial) { pending.serial=0;equipped.command_status=VX_COMMAND_REJECTED; }
+    pthread_mutex_unlock(&snapshot_lock);
+    if(!enabled) { pthread_mutex_lock(&hands_lock);hand_frame.valid=0;pthread_mutex_unlock(&hands_lock); }
+}
+
 
 static int commands_ready_locked(double now) {
     return atomic_load(&attached) && atomic_load(&poll_attached) &&
@@ -134,7 +144,7 @@ static void expire_command_locked(double now) {
 }
 
 uint64_t vx_weapon_bridge_command(int kind) {
-    if (!vx_weapon_bridge_commands_enabled() || kind < VX_WEAPON_EJECT || kind > VX_WEAPON_CHAMBER) return 0;
+    if (!vx_weapon_bridge_tracking() || !vx_weapon_bridge_commands_enabled() || kind < VX_WEAPON_EJECT || kind > VX_WEAPON_CHAMBER) return 0;
     pthread_mutex_lock(&snapshot_lock);
     double now = bridge_now();
     expire_command_locked(now);
@@ -259,6 +269,12 @@ static void read_report(const char *message, size_t length) {
         pthread_mutex_lock(&snapshot_lock);game_context.script_revision=(unsigned)revision;pthread_mutex_unlock(&snapshot_lock);
         return;
     }
+    if(kind=='D') {
+        uint64_t mode;
+        if(text[6]!='|' || strchr(cursor,'|') || !next_uint(&cursor,&mode) || *cursor || mode>1)return;
+        pthread_mutex_lock(&snapshot_lock);game_context.control_known=1;game_context.control_tracking=(int)mode;pthread_mutex_unlock(&snapshot_lock);
+        return;
+    }
     if (kind == 'M') {
         uint64_t open;
         if (text[6] != '|' || strchr(cursor,'|') || !next_uint(&cursor,&open) || *cursor || open>1) return;
@@ -367,14 +383,16 @@ static void poll_handler(void *object, void *frame, void *result, const void *ty
     const unsigned char **pc = (const unsigned char **)stack;
     uint32_t literal = 0;
     if (**pc == 0x06) memcpy(&literal, *pc + 1, sizeof literal);
-    if (literal != POLL_LITERAL || (*pc)[5] != 0x26) {
+    if ((literal != POLL_LITERAL && literal != MODE_LITERAL) || (*pc)[5] != 0x26) {
         original_poll(object, frame, result, type);
         return;
     }
     memset(stack + 0x30, 0, 16);
     stack[0x62]++;
     *pc += 6;
-    char packet[128]; command_packet(packet, sizeof packet);
+    char packet[128];
+    if(literal==MODE_LITERAL) snprintf(packet,sizeof packet,"%d",vx_weapon_bridge_tracking());
+    else command_packet(packet, sizeof packet);
     if (result) {
         vm_string value;
         string_init(&value, packet);

@@ -128,6 +128,26 @@ __attribute__((ns_returns_retained)) static id h_lib_data(id self, SEL s, id d, 
         __block uint64_t h = 0xcbf29ce484222325ULL;
         dispatch_data_apply((dispatch_data_t)d, ^bool(dispatch_data_t r, size_t off, const void *b, size_t n) { h = fnv(b, n, h); return true; });
         objc_setAssociatedObject(l, kHash, [NSString stringWithFormat:@"%016llx", (unsigned long long)h], OBJC_ASSOCIATION_RETAIN);
+        // Save just the missing contracts observed in the player's recordings.
+        // Retaining every game library for later pipeline inspection previously
+        // exhausted the headset's memory, so copy these few at creation only.
+        const char *capture=getenv("VXMAC_VRIK_CAPTURE");
+        if(capture && !strcmp(capture,"1") && (h==UINT64_C(0x1de951b843f562a9) ||
+           h==UINT64_C(0x67f2959ad8d545c4) || h==UINT64_C(0x91e8d4f9b84276dd) ||
+           h==UINT64_C(0xae33a8cf934a8776) || h==UINT64_C(0xc4992d8906495af2) ||
+           h==UINT64_C(0x1005b5b247c5ca54))) {
+            const void *bytes=NULL;size_t size=0;dispatch_data_t map=dispatch_data_create_map((dispatch_data_t)d,&bytes,&size);
+            if(map && size && size<=2*1024*1024) {
+                NSData *saved=[NSData dataWithBytes:bytes length:size];
+                NSString *hash=[NSString stringWithFormat:@"%016llx",(unsigned long long)h];
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{@autoreleasepool{
+                    NSString *docs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
+                    NSString *dir=[docs stringByAppendingPathComponent:@"vxvs_routes"];
+                    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                    [saved writeToFile:[dir stringByAppendingPathComponent:[hash stringByAppendingString:@".metallib"]] atomically:YES];
+                }});
+            }
+        }
         void vxpipe_lib_seen(uint64_t); vxpipe_lib_seen(h);   // (h64: a library made again from the same bytes)
     }
     lib_note(l, "data"); return l;
@@ -234,9 +254,28 @@ static int is_ui_vs(id<MTLFunction> f) {   // (h51: the game's UI vertex shaders
 //  attribute instance_skinning_data0 (from the shaders' AIR); where that attribute comes from is kept with the pipeline)
 static const void *kISD = &kISD;
 static const void *kSkinSpan = &kSkinSpan;
+static const void *kSkinByteInputs = &kSkinByteInputs;
 static const void *kInstanceRebase = &kInstanceRebase;
+static const void *kRigidInstance = &kRigidInstance;
 static void vrik_pipe_note(id p, MTLRenderPipelineDescriptor *d) {
     id<MTLFunction> f = d.vertexFunction; if (!f || !d.vertexDescriptor) return;
+    // Glass/reticle passes can omit skinning while still using the weapon's
+    // instance transform. Keep their reflected layout independently of ISD.
+    for(MTLVertexAttribute *a in f.vertexAttributes) {
+        if(!a.active || ![a.name isEqualToString:@"instance_transform0"])continue;
+        MTLVertexAttributeDescriptor *A=d.vertexDescriptor.attributes[a.attributeIndex];
+        MTLVertexBufferLayoutDescriptor *L=d.vertexDescriptor.layouts[A.bufferIndex];
+        int rows=1;NSUInteger extent=A.offset+16;
+        for(MTLVertexAttribute *b in f.vertexAttributes)if(b.active) {
+            MTLVertexAttributeDescriptor *B=d.vertexDescriptor.attributes[b.attributeIndex];
+            if(B.bufferIndex==A.bufferIndex)extent=MAX(extent,B.offset+16);
+            if([b.name isEqualToString:@"instance_transform1"] && B.bufferIndex==A.bufferIndex && B.offset==A.offset+16)rows|=2;
+            if([b.name isEqualToString:@"instance_transform2"] && B.bufferIndex==A.bufferIndex && B.offset==A.offset+32)rows|=4;
+        }
+        if(rows==7 && A.format==MTLVertexFormatFloat4)
+            objc_setAssociatedObject(p,kRigidInstance,@[@(A.bufferIndex),@(A.offset),@(L.stride),@(L.stepFunction),@(L.stepRate),@(extent)],OBJC_ASSOCIATION_RETAIN);
+        break;
+    }
     // The saved AIR for these libraries uses blendindices * skin.y plus
     // skin.x/current or skin.z/history. Bound the copy from the real vertex
     // format, never from the size of the game's 64 MB allocation arena.
@@ -246,8 +285,11 @@ static void vrik_pipe_note(id p, MTLRenderPipelineDescriptor *d) {
         @"d3bcb6137ac8450d",@"08d373dc6993b965",@"13c28302862f084d",@"18c14458f235f75e",
         @"60580b19da79bd40",@"d84e7ce97c759ded",@"c247858edee1ee4b",@"716953424d52fabd",
         @"42bb830ec774f0a8",@"bc3ecaeb59a7586d",@"bbeacd2e43a30c66",@"a9263ad2ea54c8bd",
-        @"c303351032556f38",@"d3f3e26df4fc32b2",@"9baf4cb3c1c9702c",@"99e000df370eb065",@"a74841c7f953769d"]]; });
-    int indices = 0, bounded = [verified containsObject:objc_getAssociatedObject(f, kHash)];
+        @"c303351032556f38",@"d3f3e26df4fc32b2",@"9baf4cb3c1c9702c",@"99e000df370eb065",@"a74841c7f953769d",
+        // Device contracts: instance_id is unused; current/history matrices
+        // use the reflected byte joint indices and instance skinning offsets.
+        @"1de951b843f562a9",@"67f2959ad8d545c4",@"91e8d4f9b84276dd",@"ae33a8cf934a8776",@"c4992d8906495af2"]]; });
+    int indices = 0, byte_inputs=1, bounded = [verified containsObject:objc_getAssociatedObject(f, kHash)];
     unsigned formats[2] = {0};
     for (MTLVertexAttribute *a in f.vertexAttributes) {
         if (!a.active || ![a.name hasPrefix:@"blendindices"]) continue;
@@ -255,9 +297,14 @@ static void vrik_pipe_note(id p, MTLRenderPipelineDescriptor *d) {
         MTLVertexFormat format = d.vertexDescriptor.attributes[a.attributeIndex].format;
         if (indices <= 2) formats[indices - 1] = (unsigned)format;
         if (format != MTLVertexFormatUChar && format != MTLVertexFormatUChar2 &&
-            format != MTLVertexFormatUChar3 && format != MTLVertexFormatUChar4) bounded = 0;
+            format != MTLVertexFormatUChar3 && format != MTLVertexFormatUChar4) bounded = byte_inputs = 0;
     }
     if (bounded && indices) objc_setAssociatedObject(p, kSkinSpan, @256, OBJC_ASSOCIATION_RETAIN);
+    // A known mesh can also use a material variant with the same byte-sized
+    // joint inputs. This permits a bounded palette copy, but never licenses
+    // dropping baseInstance: that optimization still needs the saved contract.
+    if(byte_inputs && indices>0 && indices<=2)
+        objc_setAssociatedObject(p,kSkinByteInputs,@256,OBJC_ASSOCIATION_RETAIN);
     static atomic_uint reports;
     if (indices && atomic_fetch_add(&reports, 1) < 48)
         vxmac_log("VRIK compact shader %s index_inputs=%d formats=%u/%u bounded=%d", [objc_getAssociatedObject(f, kHash) UTF8String] ?: "unknown", indices, formats[0], formats[1], bounded);

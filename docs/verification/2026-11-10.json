@@ -1,0 +1,23 @@
+{
+  "date": "2026-11-10",
+  "source_evidence": "20261110T044838Z-vxpro-main-publication",
+  "scope": "source publication; no new headset run or FPS measurement",
+  "checks": {
+    "live-controls": "passed",
+    "release-controls": "passed",
+    "cloud": "passed",
+    "shims-build": "passed",
+    "host-build": "passed",
+    "asset-tests": "passed",
+    "skin-tests": "passed",
+    "runtime-check-retry": "passed"
+  },
+  "runtime_first_attempt": "fiber_pool migration assertion failed; full retry passed",
+  "player_reports": {
+    "mode_switch": "works",
+    "swing_attack": "works",
+    "extra_handgun_fingers": "resolved in latest report",
+    "sleeve_melee_scope": "remaining issues"
+  },
+  "private_artifacts_distributed": false
+}

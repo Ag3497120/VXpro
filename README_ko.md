@@ -1,5 +1,7 @@
 # VXpro
 
+**2026-11-10 업데이트:** `main`에 핸드 트래킹과 컨트롤러 전환, 성능·카메라·클라우드 저장 업데이트를 통합했습니다. Joy-Con의 **+와 −를 동시에 1초간 길게 누르면** 전환됩니다. 최신 상태와 남은 문제는 [English](README.md) 또는 [日本語](README_ja.md)를 확인하세요.
+
 [English](README.md) · [日本語](README_ja.md) · [简体中文](README_zh-Hans.md) · [繁體中文](README_zh-Hant.md) · [한국어](README_ko.md)
 
 Apple Vision Pro에서 Mac App Store 게임(Cyberpunk 2077)을 VR로 실행합니다: 머리 방향 시점, 깊이 재투영, 뉴럴 엔진 포비티드 업스케일링. 무료, MIT 라이선스.

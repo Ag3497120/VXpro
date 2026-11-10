@@ -62,6 +62,7 @@
 #include "npu_interp.h"
 #include "hand_gestures.h"
 #include "hand_weapon.h"
+#include "hand_melee.h"
 #include "frame_pipeline.h"
 #include "room_view.h"
 #include "view_stability.h"
@@ -76,6 +77,26 @@ int vx_xros_vr_bare_enabled(void) {
     const char *value = getenv("VXMAC_FULL_HAND");
     return value && !strcmp(value, "1");
 }
+
+static _Atomic int g_tracking_mode=1, g_tracking_request=1, g_control_neutral;
+static _Atomic unsigned g_control_generation=1;
+static unsigned g_control_release_mask;
+static void control_config(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once,^{
+        const char *mode=getenv("VXMAC_CONTROL_MODE");
+        if(mode && !strcmp(mode,"controller")) {g_tracking_mode=g_tracking_request=0;vx_weapon_bridge_set_tracking(0);}
+    });
+}
+int vx_xros_vr_tracking_enabled(void) { control_config();return atomic_load(&g_tracking_mode); }
+int vx_xros_vr_control_neutral_required(void) {
+    vx_game_context context=vx_weapon_bridge_context();
+    int waiting=context.script_revision>=6 && !context.menu_open &&
+        (!context.control_known || context.control_tracking!=atomic_load(&g_tracking_mode));
+    return atomic_load(&g_control_neutral) || waiting;
+}
+void vx_xros_vr_set_tracking(int enabled) { control_config();atomic_store(&g_tracking_request,enabled!=0); }
+void vx_xros_vr_toggle_tracking(void) { control_config();atomic_fetch_xor(&g_tracking_request,1); }
 
 static int g_on;
 void vx_xros_vr_enable(int on) {
@@ -169,7 +190,7 @@ typedef struct {
     uint64_t serial;
     uint64_t pseq;                   // (VX Mac: the present's number, vx_xros_vr_next_seq: the SR detail made from it)
     __strong id<MTLTexture> hud, hud_view; int has_hud;   // (VX Mac, h33: the frame's HUD layer, libvxmtl's UI pass)
-    int writing, readers;
+    int writing, readers, menu;
     float cam_rows[9], cam_vel[3]; int cam_ok;   // (VX Mac, h60: the game camera's axes (rows: right, up, forward; Z up) and velocity at this frame)
 } vr_slot;
 static vr_slot g_slot[VXFP_SLOTS];
@@ -207,8 +228,12 @@ static int g_label_big;                                  // (VX Mac, h47: the wa
 static const char *ui_str(int i);                        // (VX Mac, h47: the labels' languages, below)
 static int ui_lang(void);
 static int g_label_extra;                                // (VX Mac, h54: the manual toggle's label when it also changed the automatic screen)
-static int vr_now(void) { return g_force == 1 || (!g_force && C.vr && (C.engage == 2 || g_engaged)); }   // (the game's camera driven now)
-static int screen_now(void) { return g_force == 2 || (!vr_now() && (C.screen || C.vr)); }               // (the world-locked screen shown now)
+// Menu ownership follows both the live input context and the completed image.
+// Closing a menu must not warp its last in-flight image back into the world.
+static _Atomic int g_menu_live, g_frame_menu, g_menu_present;
+static int menu_now(void) { return g_menu_present; }
+static int vr_now(void) { return !menu_now() && (g_force == 1 || (!g_force && C.vr && (C.engage == 2 || g_engaged))); }
+static int screen_now(void) { return g_force == 2 || (!vr_now() && (C.screen || C.vr || g_force == 1)); }
 static double g_fade_at;                                  // (VX Mac: a change between the panel and the head-driven view fades in from black)
 static double g_rot_sum; static float g_rot_max; static unsigned g_rot_n;
 static double g_roll_sum; static float g_roll_max; static unsigned g_roll_n;   // (VX Mac, h43: the eye's roll against the frame)   // (VX Mac, h33: the warp's applied rotation)
@@ -460,6 +485,12 @@ static int g_vehicle, g_scripted_scene, g_context_known;
 static int g_vehicle_view_ready;
 static vx_view_context g_view_context;
 static int g_menu_known, g_menu_open, g_play_world_seen;
+static int menu_context(vx_game_context context) {
+    if (context.menu_known) return context.menu_open;
+    // An associated cursor in a vehicle or conversation is not a menu.
+    int vxmtl_ui_menu(void);
+    return vxmtl_ui_menu() && !g_vehicle && !g_scripted_scene;
+}
 static _Atomic int g_scene_world;
 static double g_native_camera_at;
 static double g_camera_stick_until;
@@ -1630,6 +1661,8 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
         int is3d = C.engage == 1 ? S->has_depth : (S->has_proj && S->has_mv);
         vx_game_context player_context=vx_weapon_bridge_context();
         pthread_mutex_lock(&g_lock);
+        S->menu=menu_context(player_context);
+        g_menu_live=S->menu;
         int scene_world=vx_view_scene_world(is3d,g_play_world_seen,player_context.known,&g_view_context,g_menu_known,g_menu_open);
         pthread_mutex_unlock(&g_lock);
         g_scene_world=scene_world;
@@ -1643,13 +1676,17 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
         //  free-look gameplay; menus, character creation, loading and cutscenes keep it off: the panel there. A new
         //  mouse-look period clears the image check's backoff)
         {
-            static int was_look, seen3d; static double look_since;
+            static int was_look, seen3d, menu_return; static double look_since;
             if (is3d) seen3d = 1;   // (the raw signal, before this gate)
             int look = vx_game_mouse_look();
+            if (S->menu && g_engaged) menu_return=1;
+            if (!g_engaged) menu_return=0;
+            int resume=menu_return && look && !S->menu;
+            if (resume) menu_return=0;
             // (a mouse-look period counts from when it began after the game had drawn 3D at least once: the game turns it
             //  on at 3 s during the logos and keeps it on into the main menu (h18), and for ~2 s while a save loads;
             //  then on for 3 s before the head takes the camera)
-            if (look && !was_look) { g_nocontrol_until = 0; g_nocontrol_for = 20; g_cal_fail = 0; look_since = seen3d ? now : 0; }
+            if (look && (!was_look || resume)) { g_nocontrol_until = 0; g_nocontrol_for = 20; g_cal_fail = 0; look_since = seen3d ? now - (resume ? 3.0 : 0.0) : 0; }
             was_look = look;
             if ((!look || !look_since || now - look_since < 3.0) && !scene_world) is3d = 0;
             g_look_hold = look && look_since && now - look_since >= 3.0;
@@ -1662,10 +1699,13 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
         //  within 3 s of the last one)
         static double last_change;
         if (is3d) { if (!g_3d_since || now - g_3d_last > 2.0) g_3d_since = now; g_3d_last = now; }
+        // Explicit menus suspend the established VR session, preserving it for
+        // a return to gameplay without another auto-engage delay.
+        if (S->menu) g_3d_last=now;
         // (VX Mac, h27: gameplay dropped to the panel for a moment - 2 s without the scene's depth (loading, a brief
         //  gap). While the game's mouse look is on, vr mode holds for 8 s without depth; menus (look off) go at once)
         double hold = g_look_hold && g_follow_ema > 0.4f ? 8.0 : 2.0;   // (h29: and while the picture turns with the head - a loading screen does not)
-        int want = is3d ? (g_engaged || now - g_3d_since >= C.engage_s) : g_engaged && now - g_3d_last <= hold;
+        int want = S->menu ? g_engaged : is3d ? (g_engaged || now - g_3d_since >= C.engage_s) : g_engaged && now - g_3d_last <= hold;
         if (g_force == 1 && want && g_engaged) g_force = 0;   // (h47: the forced vr mode ends once the automatic choice is vr too)
         if (C.vr && C.engage != 2 && want != g_engaged && now - last_change >= 3.0) {
             g_engaged = want; g_engage_changes++; last_change = now;
@@ -1776,19 +1816,6 @@ int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
     }
     vx_game_context context = vx_weapon_bridge_context();
     vx_input_chords_poll();
-    {   // (the mode shown changed: vr's zero at the head as it is now; the screen placed again ahead of it)
-        pthread_mutex_lock(&g_lock);
-        int eff = vr_now() ? 2 : screen_now() ? 1 : 0, was = g_eff;
-        if (eff != g_eff) { g_eff = eff; if (eff == 2) { g_vr_ref = 0; g_wc_clear = 1; g_show_mode = 1; } if (eff == 1 && was >= 0) g_recenter = 1; if (was >= 0) g_fade_at = CACurrentMediaTime(); }
-        pthread_mutex_unlock(&g_lock);
-        if (was >= 0 && eff != was && g_force) { char t[64]; snprintf(t, sizeof t, "%s%s", eff == 2 ? "VR" : eff == 1 ? "Screen" : "Head", g_force ? " (manual)" : " (auto)"); show_label(t); }
-        if (eff == 2 && eff != was) {
-            const char *e = getenv("VXMAC_GESTURES");
-            const char *a = getenv("VXMAC_ARMS");
-            if (!(e && !strcmp(e, "0")) && !(a && !strcmp(a, "0"))) show_label("VXHands ON (Hand + Arm + Joy-Con)");
-        }
-    }
-    if (screen_now() && (!g_screen_valid || g_recenter) && (m[12] != 0 || m[13] != 0 || m[14] != 0)) { g_recenter = 0; place_screen(m); }
     vx_xros_pace_tick();
     pthread_mutex_lock(&g_lock);
     int old_vehicle=g_vehicle, old_scene=g_scripted_scene;
@@ -1796,6 +1823,7 @@ int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
     g_context_known=g_view_context.known;
     if (g_context_known) { g_vehicle=g_view_context.vehicle; g_scripted_scene=g_view_context.scene; }
     g_menu_known=context.menu_known; g_menu_open=context.menu_open;
+    g_menu_live=menu_context(context);
     int view_ready=vx_view_vehicle_look(context.camera_known,context.vehicle_perspective,context.vehicle_pitch_ready,
                                       context.vehicle_mode,g_scripted_scene,g_menu_open);
     if(view_ready!=g_vehicle_view_ready) {
@@ -1811,17 +1839,6 @@ int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
         g_muzzle.steering=0; memset(g_cam_vel,0,sizeof g_cam_vel);
         if (vx_host_jlog) { char f[128]; snprintf(f,sizeof f,"\"known\":%d,\"vehicle\":%d,\"scene\":%d,\"sequence\":%llu",context.known,g_vehicle,g_scripted_scene,(unsigned long long)context.sequence); vx_host_jlog("game_context",f); }
     }
-    vx_room_view_update(&g_room_view,m,1,g_recenter || !g_vr_ref || context_changed,vr_now() ? (g_vehicle ? 2 : g_scripted_scene ? 3 : 1) : 0);
-    memcpy(g_head, m, sizeof g_head);
-    g_frame_eye_valid = 0;
-    g_head_valid = 1;
-    if (g_poll_in < 0) { const char *e = getenv("VXMAC_POLL_INPUT"); g_poll_in = e && !strcmp(e, "1"); }   // (h40: off by default - the compositor-paced path was the known-good one; =1 on)
-    {   // (h38: the compositor's send only when the poll path is off - or silent for 100 ms: a game blocked waiting for
-        //  events never drains, and the head must still turn its camera)
-        double t = CACurrentMediaTime();
-        if (vr_now()) vr_mouse(m, t, !g_poll_in || t - g_last_poll > 0.1);
-    }
-    for (int k = 0; k < VXFP_SLOTS; k++) if (!g_slot[k].writing && !g_slot[k].head_valid) { memcpy(g_slot[k].head, m, sizeof g_head); g_slot[k].head_valid = 1; }
     g_present_time = presentation_time;
     g_frames++;
     int have;
@@ -1836,8 +1853,38 @@ int vx_xros_vr_begin_frame(const float m_in[16], double presentation_time) {
     }
     if (have) g_slot[g_held].readers++;              // (until this frame's command buffer completes: vx_xros_vr_end_frame)
     g_frame_slot = have ? g_held : -1;
+    g_frame_menu=have && g_slot[g_held].menu;
+    g_menu_present=g_menu_live || g_frame_menu;
+    // Select the image before selecting its presentation and input coordinates.
+    int eff = vr_now() ? 2 : screen_now() ? 1 : 0, was = g_eff;
+    if (eff != was) {
+        g_eff=eff;
+        if (eff==2) { g_vr_ref=0; g_wc_clear=1; g_show_mode=1; }
+        if (eff==1 && was>=0) g_recenter=1;
+        if (was>=0) g_fade_at=CACurrentMediaTime();
+        if (vx_host_jlog) { char f[160];snprintf(f,sizeof f,"\"mode\":%d,\"menu_live\":%d,\"menu_frame\":%d,\"pseq\":%llu",eff,(int)g_menu_live,(int)g_frame_menu,have?(unsigned long long)g_slot[g_held].pseq:0);vx_host_jlog("presentation_mode",f); }
+    }
+    if (screen_now() && (!g_screen_valid || g_recenter) && (m[12] != 0 || m[13] != 0 || m[14] != 0)) { g_recenter=0;place_screen(m); }
+    vx_room_view_update(&g_room_view,m,1,g_recenter || !g_vr_ref || context_changed,vr_now() ? (g_vehicle ? 2 : g_scripted_scene ? 3 : 1) : 0);
+    memcpy(g_head, m, sizeof g_head);
+    g_frame_eye_valid = 0;
+    g_head_valid = 1;
+    if (g_poll_in < 0) { const char *e = getenv("VXMAC_POLL_INPUT"); g_poll_in = e && !strcmp(e, "1"); }   // (h40: off by default - the compositor-paced path was the known-good one; =1 on)
+    {   // (h38: the compositor's send only when the poll path is off - or silent for 100 ms: a game blocked waiting for
+        //  events never drains, and the head must still turn its camera)
+        double t = CACurrentMediaTime();
+        if (vr_now()) vr_mouse(m, t, !g_poll_in || t - g_last_poll > 0.1);
+    }
+    for (int k = 0; k < VXFP_SLOTS; k++) if (!g_slot[k].writing && !g_slot[k].head_valid) { memcpy(g_slot[k].head, m, sizeof g_head); g_slot[k].head_valid = 1; }
     if (have) g_age_ms += (presentation_time - g_slot[g_held].content_time) * 1e3; else g_noframe++;
     pthread_mutex_unlock(&g_lock);
+    if (was>=0 && eff!=was && g_force && !menu_now()) {
+        char t[64];snprintf(t,sizeof t,"%s (manual)",eff==2?"VR":eff==1?"Screen":"Head");show_label(t);
+    }
+    if (eff==2 && eff!=was) {
+        const char *e=getenv("VXMAC_GESTURES"), *a=getenv("VXMAC_ARMS");
+        if (!(e && !strcmp(e,"0")) && !(a && !strcmp(a,"0"))) show_label("VXHands ON (Hand + Arm + Joy-Con)");
+    }
     return have;
 }
 
@@ -1853,11 +1900,11 @@ static void mul4(const float *a, const float *b, float *o) {     // (column-majo
 static NSString *const kScreenSrc = @
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
-    "struct SP { float4x4 screen_from_eye; float4 tan; float2 half_size; float near_m; float pad; float4 cursor; };\n"
+    "struct SP { float4x4 screen_from_eye; float4 tan; float2 half_size; float near_m; float use_hud; float4 cursor; };\n"
     "struct VO { float4 pos [[position]]; float2 uv; };\n"
     "vertex VO vs(uint i [[vertex_id]]) { float2 p = float2((i << 1) & 2, i & 2); VO o; o.pos = float4(p * 2 - 1, 0, 1); o.uv = float2(p.x, 1 - p.y); return o; }\n"
     "struct FO { float4 c [[color(0)]]; float d [[depth(any)]]; };\n"
-    "fragment FO fs(VO in [[stage_in]], constant SP &p [[buffer(0)]], texture2d<float> img [[texture(0)]]) {\n"
+    "fragment FO fs(VO in [[stage_in]], constant SP &p [[buffer(0)]], texture2d<float> img [[texture(0)]], texture2d<float> hud [[texture(1)]]) {\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
     "    float3 dir = float3(mix(-p.tan.x, p.tan.y, in.uv.x), mix(p.tan.z, -p.tan.w, in.uv.y), -1);\n"
     "    float3 o = (p.screen_from_eye * float4(0, 0, 0, 1)).xyz, d = (p.screen_from_eye * float4(dir, 0)).xyz;\n"
@@ -1874,6 +1921,12 @@ static NSString *const kScreenSrc = @
     //  bilinear sample of a frame larger than its place on the eye)
     "    float2 du = dfdx(uv) * 0.25, dv = dfdy(uv) * 0.25;\n"
     "    r.c = float4((img.sample(s, uv + du + dv).rgb + img.sample(s, uv - du + dv).rgb + img.sample(s, uv + du - dv).rgb + img.sample(s, uv - du - dv).rgb) * 0.25, 1);\n"
+    // A transition frame may already have its UI extracted by the producer.
+    // Reassemble that image's UI on this plane, never a second floating panel.
+    "    if (p.use_hud > 0) {\n"
+    "        float4 ui = (hud.sample(s, uv + du + dv) + hud.sample(s, uv - du + dv) + hud.sample(s, uv + du - dv) + hud.sample(s, uv - du - dv)) * 0.25;\n"
+    "        r.c.rgb = ui.rgb + r.c.rgb * (1 - saturate(ui.a));\n"
+    "    }\n"
     "    if (p.cursor.z > 0) {\n"
     "        float2 dd = (uv - p.cursor.xy) * float2(p.half_size.x / p.half_size.y, 1);\n"
     "        float rr = length(dd), rad = p.cursor.w > 0 ? 0.008 : 0.011;\n"
@@ -1904,7 +1957,7 @@ static int draw_screen(id<MTLCommandBuffer> cb, vr_slot *S, const float *view_fr
         g_screen_cf = out.pixelFormat; g_screen_df = od ? od.pixelFormat : MTLPixelFormatInvalid;
         vx_log("VR: screen pipeline for colour %lu depth %lu", (unsigned long)g_screen_cf, (unsigned long)g_screen_df);
     }
-    struct { float m[16]; float tan[4]; float half_size[2]; float near_m, pad; float cursor[4]; } P;
+    struct { float m[16]; float tan[4]; float half_size[2]; float near_m, use_hud; float cursor[4]; } P;
     float eye_from_world[16], world_from_eye[16], screen_inv[16];
     memcpy(eye_from_world, view_from_origin, sizeof eye_from_world);
     inv_rigid(eye_from_world, world_from_eye);
@@ -1913,7 +1966,7 @@ static int draw_screen(id<MTLCommandBuffer> cb, vr_slot *S, const float *view_fr
     memcpy(P.tan, tan, sizeof P.tan);
     P.half_size[0] = C.screen_m * tanf(C.screen_deg * 0.5f * (float)M_PI / 180);
     P.half_size[1] = P.half_size[0] * (float)S->h / (float)(S->w ? S->w : 1);
-    P.near_m = near_m; P.pad = 0;
+    P.near_m = near_m; P.use_hud = S->has_hud && S->hud_view ? 1 : 0;
     pthread_mutex_lock(&g_lock); memcpy(P.cursor, g_cursor_dot, sizeof P.cursor); pthread_mutex_unlock(&g_lock);
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor new];
     pass.colorAttachments[0].texture = out; pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -1924,6 +1977,7 @@ static int draw_screen(id<MTLCommandBuffer> cb, vr_slot *S, const float *view_fr
     if (od) [e setDepthStencilState:g_screen_ds];
     [e setFragmentBytes:&P length:sizeof P atIndex:0];
     [e setFragmentTexture:S->view atIndex:0];
+    [e setFragmentTexture:P.use_hud ? S->hud_view : S->view atIndex:1];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
     pthread_mutex_lock(&g_lock); g_draws++; pthread_mutex_unlock(&g_lock);
@@ -2433,16 +2487,12 @@ static id<MTLTexture> hud_mask_now(void) { return nil; }
 //  28), sampled once (no warp), premultiplied over the eye - the game's own HUD, shapes and tilt as designed)
 static id<MTLRenderPipelineState> g_hl_pso; static MTLPixelFormat g_hl_cf;
 static int draw_hud_layer(id<MTLCommandBuffer> cb, void *outp, int eye, const float tan[4]) {
-    if (g_eff != 2) return 0;
+    if (g_eff != 2 || menu_now()) return 0;
     pthread_mutex_lock(&g_lock); int s = g_frame_slot; pthread_mutex_unlock(&g_lock);
     if (s < 0) return 0;
     vr_slot *S = &g_slot[s];
-    // (h43: a menu / guide over the scene (the UI covers over 30 %): the whole frame, scene and UI, as the centred
-    //  head-locked panel (+-30 deg), opaque - world-size its edge popups fell out of view)
-    int vxmtl_ui_menu(void);
-    int menu = vxmtl_ui_menu() && S->view && g_force != 1 && !g_scene_world;
     id<MTLTexture> hv = S->has_hud && S->hud_view ? S->hud_view : (g_hud_keep_view && CACurrentMediaTime() - g_hud_keep_t < 0.3 ? g_hud_keep_view : nil);
-    if (!menu && !hv) return 0;
+    if (!hv) return 0;
     id<MTLTexture> out = (__bridge id<MTLTexture>)outp;
     if (!g_hl_pso || g_hl_cf != out.pixelFormat) {
         NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -2454,7 +2504,6 @@ static int draw_hud_layer(id<MTLCommandBuffer> cb, void *outp, int eye, const fl
             "  constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
             "  if (l.ex.z > l.ex.x && all(i.uv >= l.ex.xy) && all(i.uv <= l.ex.zw)) discard_fragment();\n"
             "  if (l.ex2.z > l.ex2.x && all(i.uv >= l.ex2.xy) && all(i.uv <= l.ex2.zw)) discard_fragment();\n"
-            "  if (l.opaque == 2) return float4(0, 0, 0, 0.92);\n"   // (h46: the menu's backdrop)
             "  int opaque = l.opaque;\n"
             "  float2 du = dfdx(i.uv) * 0.25, dv = dfdy(i.uv) * 0.25;\n"
             "  float4 c = (t.sample(s, i.uv + du + dv) + t.sample(s, i.uv - du + dv) + t.sample(s, i.uv + du - dv) + t.sample(s, i.uv - du - dv)) * 0.25;\n"
@@ -2476,8 +2525,8 @@ static int draw_hud_layer(id<MTLCommandBuffer> cb, void *outp, int eye, const fl
         if (!g_hl_pso) { vx_log("VR: the HUD layer's pipeline: %s", err.localizedDescription.UTF8String); return 0; }
     }
     static float deg = -1; if (deg < 0) { const char *e = getenv("VXMAC_HUD_DEG"); deg = e && *e ? (float)atof(e) : 28; }
-    id<MTLTexture> src = menu ? S->view : hv;
-    float hw = tanf((menu ? 30.f : deg) * (float)M_PI / 180), hh = hw * (float)src.height / (float)src.width;
+    id<MTLTexture> src = hv;
+    float hw = tanf(deg * (float)M_PI / 180), hh = hw * (float)src.height / (float)src.width;
     float shift = (eye == 0 ? 1 : -1) * 0.032f / 1.5f;
     float l = -hw + shift, rt = hw + shift, t = hh, bt = -hh;
     float r[4] = { (l + tan[0]) / (tan[0] + tan[1]) * 2 - 1, (t + tan[3]) / (tan[2] + tan[3]) * 2 - 1,
@@ -2488,32 +2537,22 @@ static int draw_hud_layer(id<MTLCommandBuffer> cb, void *outp, int eye, const fl
     id<MTLRenderCommandEncoder> e = eye_encoder(cb, pass);
     [e setRenderPipelineState:g_hl_pso];
     [e setVertexBytes:r length:sizeof r atIndex:0];
-    if (menu) {   // (h46: a dark backdrop over the eye first - the world-placed frame behind the menu panel never shows doubled)
-        float full[4] = { -1, 1, 1, -1 };
-        struct { int opaque; int pad[3]; float ex[4]; float uvr[4]; float ex2[4]; } B = { 2, { 0 }, { 0, 0, 0, 0 }, { 0, 0, 1, 1 }, { 0, 0, 0, 0 } };
-        [e setVertexBytes:full length:sizeof full atIndex:0];
-        [e setVertexBytes:&B length:sizeof B atIndex:1];
-        [e setFragmentBytes:&B length:sizeof B atIndex:0];
-        [e setFragmentTexture:src atIndex:0];
-        [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-        [e setVertexBytes:r length:sizeof r atIndex:0];
-    }
     [e setFragmentTexture:src atIndex:0];
     // (h45: the subtitles' band (u 0.15-0.85, v 0.78-0.97) left out of the layer and drawn on its own, 0.8x, from 8 to
     //  ~14 deg below the centre - they sat low; VXMAC_SUB=0: as part of the layer)
     static int sub = -1; if (sub < 0) { const char *ev = getenv("VXMAC_SUB"); sub = !(ev && !strcmp(ev, "0")); }
-    struct { int opaque; int pad[3]; float ex[4]; float uvr[4]; float ex2[4]; } L = { menu, { 0 }, { 0, 0, 0, 0 }, { 0, 0, 1, 1 }, { 0, 0, 0, 0 } };
-    if (sub && !menu) { L.ex[0] = 0.15f; L.ex[1] = 0.78f; L.ex[2] = 0.85f; L.ex[3] = 0.97f; }
+    struct { int opaque; int pad[3]; float ex[4]; float uvr[4]; float ex2[4]; } L = { 0, { 0 }, { 0, 0, 0, 0 }, { 0, 0, 1, 1 }, { 0, 0, 0, 0 } };
+    if (sub) { L.ex[0] = 0.15f; L.ex[1] = 0.78f; L.ex[2] = 0.85f; L.ex[3] = 0.97f; }
     // (h64: mode 7 - the crosshair (the HUD's centre, VXMAC_AIM_XHAIR half-width in UV, default 0.05) cut from the
     //  head-locked layer and drawn where the frame's centre is in this eye, at the layer's own scale: the gun's aim)
     static float xh = -1; if (xh < 0) { const char *ev = getenv("VXMAC_AIM_XHAIR"); xh = ev && *ev ? (float)atof(ev) : 0.05f; if (xh > 0.3f) xh = 0.3f; }
-    int xhair = !menu && eye >= 0 && eye < 2 && g_xh_ok[eye] && xh > 0;
+    int xhair = eye >= 0 && eye < 2 && g_xh_ok[eye] && xh > 0;
     float xv = xh * (float)src.width / (float)src.height;
     if (xhair) { L.ex2[0] = 0.5f - xh; L.ex2[1] = 0.5f - xv; L.ex2[2] = 0.5f + xh; L.ex2[3] = 0.5f + xv; }
     [e setVertexBytes:&L length:sizeof L atIndex:1];
     [e setFragmentBytes:&L length:sizeof L atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-    if (sub && !menu) {
+    if (sub) {
         float bw = 0.70f * 2 * hw * 0.8f, bh = 0.19f * 2 * hh * 0.8f;   // (the band's size in tangents, 0.8x)
         float top = -tanf(8 * (float)M_PI / 180), cx2 = shift;
         float r2[4] = { (cx2 - bw / 2 + tan[0]) / (tan[0] + tan[1]) * 2 - 1, (top + tan[3]) / (tan[2] + tan[3]) * 2 - 1,
@@ -2536,7 +2575,6 @@ static int draw_hud_layer(id<MTLCommandBuffer> cb, void *outp, int eye, const fl
     }
     [e endEncoding];
     static int told; if (!told++) vx_log("VR: the game's HUD layer shown as a head-locked panel, +-%.0f degrees wide", deg);
-    static int was_menu = -1; if (menu != was_menu) { was_menu = menu; vx_log("VR: %s", menu ? "a menu / guide over the scene: the whole frame as the centred panel" : "the HUD layer again"); }
     return 1;
 }
 static void draw_hud(id<MTLCommandBuffer> cb, void *outp, int eye, const float tan[4]) {
@@ -2779,7 +2817,7 @@ static void draw_mag(id<MTLCommandBuffer> cb, void *outp, const float vfo[16], c
     pthread_mutex_unlock(&g_lock);
     static int game_hands = -1; if (game_hands < 0) { const char *e = getenv("VXMAC_FLAT_VM"); game_hands = e && !strcmp(e, "1"); }
     static int v_hands = -1; if (v_hands < 0) { const char *e = getenv("VXMAC_V_HANDS"); v_hands = e && !strcmp(e, "1"); }
-    if (g_eff != 2 || (!D.on && !(v_hands && (D.skel[0] > .5f || D.skel[67] > .5f))) || (!game_hands && !v_hands && !D.ring && !D.mag)) return;
+    if (!vx_xros_vr_tracking_enabled() || g_eff != 2 || (!D.on && !(v_hands && (D.skel[0] > .5f || D.skel[67] > .5f))) || (!game_hands && !v_hands && !D.ring && !D.mag)) return;
     id<MTLTexture> out = (__bridge id<MTLTexture>)outp;
     if (game_hands && warp_M) draw_game_viewmodel(cb, out, S, &D, warp_M, tan, eye);
     static int mag_box = -1; if (mag_box < 0) {
@@ -3266,6 +3304,41 @@ void vx_xros_hand_pointer(double x, double y);           // (src/xros_ui.m: the 
 void vx_xros_hand_button(int which, int down);           // (0 left, 1 right: as a mouse's)
 void vx_xros_hand_wheel(int delta);                      // (raw wheel input and WM_MOUSEWHEEL)
 void vx_xros_hand_key(int hid_usage, int down);
+static _Atomic unsigned long long g_synthetic_keys[4];
+static _Atomic unsigned g_synthetic_buttons;
+static pthread_mutex_t g_hand_output_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_hand_state_lock=PTHREAD_MUTEX_INITIALIZER;
+static void tracked_key(int key,int down) {
+    pthread_mutex_lock(&g_hand_output_lock);
+    if(down && (!vx_xros_vr_tracking_enabled() || vx_xros_vr_control_neutral_required())) {pthread_mutex_unlock(&g_hand_output_lock);return;}
+    if(key>=0 && key<256) {
+        unsigned long long bit=1ull<<(key%64);
+        if(down)atomic_fetch_or(&g_synthetic_keys[key/64],bit);else atomic_fetch_and(&g_synthetic_keys[key/64],~bit);
+    }
+    vx_xros_hand_key(key,down);
+    pthread_mutex_unlock(&g_hand_output_lock);
+}
+static void tracked_button(int button,int down) {
+    pthread_mutex_lock(&g_hand_output_lock);
+    if(down && (!vx_xros_vr_tracking_enabled() || vx_xros_vr_control_neutral_required())) {pthread_mutex_unlock(&g_hand_output_lock);return;}
+    if(button>=0 && button<8) {
+        unsigned bit=1u<<button;
+        if(down)atomic_fetch_or(&g_synthetic_buttons,bit);else atomic_fetch_and(&g_synthetic_buttons,~bit);
+    }
+    vx_xros_hand_button(button,down);
+    pthread_mutex_unlock(&g_hand_output_lock);
+}
+static void release_hand_inputs(void) {
+    for(int group=0;group<4;group++) {
+        unsigned long long held=atomic_exchange(&g_synthetic_keys[group],0);
+        for(int bit=0;bit<64;bit++)if(held&(1ull<<bit))vx_xros_hand_key(group*64+bit,0);
+    }
+    unsigned held=atomic_exchange(&g_synthetic_buttons,0);
+    for(int bit=0;bit<8;bit++)if(held&(1u<<bit))vx_xros_hand_button(bit,0);
+}
+#define vx_xros_hand_key tracked_key
+#define vx_xros_hand_button tracked_button
+
 enum { BARE_FIRE = 16, BARE_AIM = 32 };
 static unsigned g_bare_held;
 static int g_bare_key;
@@ -3387,25 +3460,31 @@ void vx_xros_vr_wrist_poses(const float wrists[20]) {
 }
 static unsigned g_controller_buttons;
 static double g_controller_time;
-static unsigned g_joy_fire_mask;
+static unsigned g_joy_fire_mask, g_firing_trigger, g_trigger_release_required;
 static double g_joy_fire_ready_at;
+static double g_melee_until,g_melee_sample_at;
+static int g_melee_down;
 static unsigned g_weapon_cycles;
 void vx_xros_vr_cycle_weapon_type(void) {
     pthread_mutex_lock(&g_lock); g_weapon_cycles++; pthread_mutex_unlock(&g_lock);
 }
 void vx_xros_vr_hand_arms(const float arms[14]) { memcpy(g_arms, arms, sizeof g_arms); }
 void vx_xros_vr_controller_state(unsigned btns, double now) {
-    static unsigned firing_trigger, release_required;
     pthread_mutex_lock(&g_lock);
     g_controller_buttons = btns;
     g_controller_time = now;
     // Both edges come from the controller poll, including release if hand frames stop arriving.
-    unsigned allowed = vr_now() && now - g_joy_fire_ready_at <= .25 ? g_joy_fire_mask : 0;
-    release_required &= btns;
-    release_required |= firing_trigger & btns & ~allowed;
-    unsigned trigger = btns & allowed & ~release_required;
-    if (!!trigger != !!firing_trigger) vx_xros_hand_button(0, trigger != 0);
-    firing_trigger = trigger;
+    g_control_release_mask &= btns;
+    atomic_store(&g_control_neutral,g_control_release_mask!=0);
+    unsigned allowed = vx_xros_vr_tracking_enabled() && !vx_xros_vr_control_neutral_required() && vr_now() && now - g_joy_fire_ready_at <= .25 ? g_joy_fire_mask : 0;
+    g_trigger_release_required &= btns;
+    g_trigger_release_required |= g_firing_trigger & btns & ~allowed;
+    unsigned trigger = btns & allowed & ~g_trigger_release_required;
+    int melee=vx_xros_vr_tracking_enabled() && !vx_xros_vr_control_neutral_required() && vr_now() &&
+              now-g_melee_sample_at<=.20 && now<g_melee_until;
+    if ((!!trigger || melee) != (!!g_firing_trigger || g_melee_down)) vx_xros_hand_button(0, trigger!=0 || melee);
+    g_firing_trigger = trigger;
+    g_melee_down=melee;
     pthread_mutex_unlock(&g_lock);
 }
 unsigned vx_xros_vr_controller_buttons(double now) {
@@ -3451,6 +3530,7 @@ int vx_xros_vr_manual_mag_frame(double *started, unsigned *ejection) {
 }
 
 int vx_xros_vr_render_hands(float out[2][12], int ok[2], float head[16], unsigned *epoch, unsigned *wrists) {
+    if(!vx_xros_vr_tracking_enabled()) { memset(out,0,24*sizeof(float));ok[0]=ok[1]=0;*wrists=0;*epoch=g_control_generation;memcpy(head,g_head,sizeof g_head);return 0; }
     pthread_mutex_lock(&g_ik_lock);
     const float *H = g_ik_head;
     double t = g_ik_time, now = CACurrentMediaTime();
@@ -3533,6 +3613,7 @@ int vx_xros_vr_render_hands(float out[2][12], int ok[2], float head[16], unsigne
 }
 
 int vx_xros_vr_hand_curls(float out[2][6], float weap_out[8]) {
+    if(!vx_xros_vr_tracking_enabled()) { memset(out,0,12*sizeof(float));if(weap_out)memset(weap_out,0,8*sizeof(float));return 0; }
     static float sm_curls[2][6] = { { 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.0f }, { 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.0f } };
     float S[134], J[2 * HW_JOINTS]; double t, now = CACurrentMediaTime();
     unsigned btns = vx_xros_vr_controller_buttons(now);
@@ -3620,22 +3701,25 @@ int vx_xros_vr_hand_curls(float out[2][6], float weap_out[8]) {
 }
 
 void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
-    if (vx_weapon_bridge_commands_enabled())
+    pthread_mutex_lock(&g_hand_state_lock);
+    if (vx_xros_vr_tracking_enabled() && vx_weapon_bridge_commands_enabled())
         vx_weapon_bridge_publish_hands(head, g_raw_wrists, vx_xros_vr_controller_buttons(now), now);
     config();
     pthread_mutex_lock(&g_ik_lock); memcpy(g_ik_head, head, sizeof g_ik_head); memcpy(g_ik_joints, g_joints, sizeof g_ik_joints); memcpy(g_ik_skel, g_skel, sizeof g_ik_skel); memcpy(g_ik_wrists, g_wrists, sizeof g_ik_wrists); g_ik_time = CACurrentMediaTime(); pthread_mutex_unlock(&g_ik_lock);
-    if (!C.hand) { pthread_mutex_lock(&g_lock); g_vm_active = 0; memset(g_vm_delta, 0, sizeof g_vm_delta); memset(g_vm_rot, 0, sizeof g_vm_rot); pthread_mutex_unlock(&g_lock); return; }
+    if (!C.hand) { pthread_mutex_lock(&g_lock); g_vm_active = 0; memset(g_vm_delta, 0, sizeof g_vm_delta); memset(g_vm_rot, 0, sizeof g_vm_rot); pthread_mutex_unlock(&g_lock); pthread_mutex_unlock(&g_hand_state_lock);return; }
     if (g_hand_stats_reset) { g_hand_stats_reset = 0; g_clicks = g_rclicks = g_drags = g_scroll_notches = g_escs = 0; g_tracked_frames[0] = g_tracked_frames[1] = 0; g_hand_frames = 0; }
     g_hand_frames++;
     for (int b = 0; b < 2; b++) if (g_up_at[b] > 0 && now >= g_up_at[b]) { g_up_at[b] = 0; vx_xros_hand_button(b, 0); }
     int tr[2] = { hands[0] > 0.5f, hands[10] > 0.5f };
     int prim = tr[1] ? 1 : tr[0] ? 0 : -1, sec = prim < 0 ? -1 : 1 - prim;
     int bare = vx_xros_vr_bare_enabled();
+    static unsigned seen_mode;unsigned mode_generation=atomic_load(&g_control_generation);
+    int mode_changed=seen_mode!=mode_generation;seen_mode=mode_generation;
     static int joy_hold = -1;
     if (joy_hold < 0) { const char *e = getenv("VXMAC_JOY_HOLD"); joy_hold = bare || (e && !strcmp(e, "1")); }
     int wrist_primary = joy_hold && !bare;
     for (int h = 0; h < 2; h++) if (wrist_primary ? g_wrists[10 * h] > .5f : tr[h]) g_tracked_frames[h]++;
-    int vr = vr_now(), scr = !vr && screen_now();
+    int vr = vr_now() && vx_xros_vr_tracking_enabled() && !vx_xros_vr_control_neutral_required(), scr = !vr_now() && screen_now();
     // the pointer: the ray through the primary hand's anchor
     int hit = 0; float u = 0, v = 0;
     if (prim >= 0 && scr) {
@@ -3774,6 +3858,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         // (h70: the magazine by hand - hand_weapon.h; VXMAC_MAG=1. It takes the place of the reload gesture above.)
         static int mag = -1, mag_labels; static hand_weapon hw; static int mact[HW_EV_N]; static double mup_at[HW_EV_N];
         static FILE *prec; static double prec_until = -1;
+        if(mode_changed) {memset(&hw,0,sizeof hw);memset(mup_at,0,sizeof mup_at);mag=-1;}
         if (mag < 0) {
             const char *e = getenv("VXMAC_MAG"); mag = e && !strcmp(e, "1");
             e = getenv("VXMAC_HAND_MODE");
@@ -3821,6 +3906,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         if (now - controller_time > .25) controller = 0;
         static hand_weapon_controller joy_weapon;
         static bare_hands full_hands;
+        if(mode_changed) {memset(&joy_weapon,0,sizeof joy_weapon);memset(&full_hands,0,sizeof full_hands);}
         bare_hand_input hand_input = { .action = -1, .hover = -1 };
         vx_game_context context=vx_weapon_bridge_context();
         int native_context=vx_xros_vr_vehicle_active() || (context.known && context.scene_tier>=2 && context.scene_tier<=5);
@@ -3842,6 +3928,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             hw.manual_slide_ready = hw.slide_hold = 0;
         }
         vx_weapon_snapshot equipment = vx_weapon_bridge_snapshot();
+        int melee_weapon=equipment.known && equipment.entity && !equipment.ranged;
         static uint64_t equipment_generation, reload_report;
         static int previous_reload_phase;
         int changed_weapon = equipment.known && equipment.generation != equipment_generation;
@@ -3910,7 +3997,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             hw.manual_prev = controller;
             hw.manual_slide_ready = hw.slide_hold = 0;
         }
-        if (mag && game_input) {
+        if (mag && game_input && !melee_weapon) {
             hw.manual_support = joy_hold && joy_weapon.support;
             if (hw.manual_mag) {
                 static int (*reload_targets)(int, float[3], float[6], int *, int *);
@@ -3976,6 +4063,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         //  The keys: weapon 1 (1), weapon 2 (2), holster (B), aim held (the right button), trigger held (the left);
         //  VXMAC_ARMS_KEYS="hip=1e,back=1f,holster=05,aim=m1,trigger=m0")
         static int arms = -1, trig_on, akey[5], aim_down, trig_down; static double aup_at[3];
+        if(mode_changed) {aim_down=trig_down=0;memset(aup_at,0,sizeof aup_at);}
         if (arms < 0) {
             const char *e = getenv("VXMAC_ARMS"); arms = e && !strcmp(e, "1");
             e = getenv("VXMAC_TRIGGER"); trig_on = e && !strcmp(e, "1");
@@ -4059,15 +4147,22 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         static int (*supported_grip)(void);
         if ((joy_actions & HW_JOY_AIM) && !supported_grip)
             supported_grip = dlsym(RTLD_DEFAULT, "vxpipe_supported_grip");
-        int want_aim = joy_hold ? ((joy_actions & HW_JOY_AIM) && (button_support || (supported_grip && supported_grip()))) :
-                                  (arms && hand_ads && vr && hw.ads && !hand_weapon_is_hybrid(&hw, now));
+        int want_aim = !melee_weapon && (joy_hold ? ((joy_actions & HW_JOY_AIM) && (button_support || (supported_grip && supported_grip()))) :
+                                  (arms && hand_ads && vr && hw.ads && !hand_weapon_is_hybrid(&hw, now)));
         int want_trig = !joy_hold && arms && trig_on && gameplay && hw.trigger && !hand_weapon_is_hybrid(&hw, now);
         if (!bare && want_aim != aim_down) { aim_down = want_aim; AKEY(akey[3], aim_down); }
         if (want_trig != trig_down) { trig_down = want_trig; AKEY(akey[4], trig_down); }
+        static hand_melee melee;
+        hand_pose swinging;hand_pose_from_wrist(g_wrists+10,&swinging);
+        int melee_active=joy_hold && gameplay && melee_weapon && swinging.ok && !mode_changed;
+        int stroke=hand_melee_update(&melee,equipment.generation,melee_active,swinging.palm,head+12,now);
         pthread_mutex_lock(&g_lock);
+        g_melee_sample_at=CACurrentMediaTime();
+        if(!melee_active)g_melee_until=0;
+        else if(stroke) {g_melee_until=g_melee_sample_at+.08;vx_log("VR: tracked melee stroke (native attack)");}
         g_joy_fire_ready_at = CACurrentMediaTime();
         g_joy_fire_mask = 0;
-        if (!gameplay || cycles || bare || g_warp_mode == 5 || !muzzle_aim_enabled() ||
+        if (!gameplay || melee_weapon || cycles || bare || g_warp_mode == 5 || !muzzle_aim_enabled() ||
             (!have_bore && !(controller & HW_BTN_R_TRIG) && now - bore_at > .70)) g_muzzle.seen = 0;
         else if (have_bore) g_muzzle.seen = 1;
         g_muzzle.track = g_muzzle.seen && have_bore && g_wrists[10] > .5f &&
@@ -4088,9 +4183,9 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         // An inserted magazine can already be usable on a long gun whose mesh
         // is unknown to the renderer. The game checks its real chamber state.
         if (!bare && joy_hold && gameplay && joy_weapon.initialized &&
-            !joy_weapon.consume && (!hw.manual_mag || hand_weapon_has_magazine(&hw)) &&
+            !joy_weapon.consume && (melee_weapon || ((!hw.manual_mag || hand_weapon_has_magazine(&hw)) &&
             (!direct_commands || equipment.command_status != VX_COMMAND_PENDING) &&
-            (!actual_reload || equipment.reload_phase == 0)) {
+            (!actual_reload || equipment.reload_phase == 0)))) {
             g_joy_fire_mask = HW_BTN_R_TRIG;
         }
         pthread_mutex_unlock(&g_lock);
@@ -4165,11 +4260,11 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
         }
         pthread_mutex_lock(&g_ik_lock);
         g_ik_slide_pull = g_mag_draw.pull;
-        g_ik_slide_active = hw.manual_mag && game_input && hw.slide_hold && !hw.rack_suspended &&
+        g_ik_slide_active = !melee_weapon && hw.manual_mag && game_input && hw.slide_hold && !hw.rack_suspended &&
                             !!(controller & HW_BTN_L_TRIG);
         memcpy(g_ik_slide_contact, hw.slide_contact, sizeof hw.slide_contact);
         memcpy(g_ik_slide_contact + 3, hw.slide_axis, sizeof hw.slide_axis);
-        g_ik_mag_state = hw.manual_mag && game_input ? hw.state : -1;
+        g_ik_mag_state = !melee_weapon && hw.manual_mag && game_input ? hw.state : -1;
         g_ik_mag_started = hw.state == HW_EMPTY ? hw.manual_ejected_at : hw.state_at;
         g_ik_mag_ejection = hw.manual_ejections;
         g_ik_weap[0] = g_mag_draw.pull;
@@ -4299,6 +4394,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             static int enabled = -1; static float applied_y, applied_p;
             if (enabled < 0) { const char *e = getenv("VXMAC_HAND_AIM"); enabled = e && !strcmp(e, "1"); }
             float target_y=0, target_p=0;
+            if(mode_changed)applied_y=applied_p=0;
             if (enabled && vr && gun->ok && gun->from_arm != 2 && rest_ok) {
                 target_y=fmaxf(-14.f,fminf(14.f,-(lp[0]-rest_lp[0])*55.f));
                 target_p=fmaxf(-10.f,fminf(10.f,(lp[1]-rest_lp[1])*50.f));
@@ -4345,10 +4441,12 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
             }
         }
         static int climb_up, climb_down;
+        if(mode_changed)climb_up=climb_down=0;
         int climb = on && vr && hg.climbing ? (hg.climb_dir > 0 ? 1 : -1) : 0;
         if ((climb > 0) != climb_up) { climb_up = climb > 0; vx_xros_hand_key(0x1a, climb_up); }
         if ((climb < 0) != climb_down) { climb_down = climb < 0; vx_xros_hand_key(0x16, climb_down); }
         static int scan_down;
+        if(mode_changed)scan_down=0;
         int want_scan = on && vr && (hg.scan_latched || hg.scan_button_latched);
         if (want_scan != scan_down) {
             scan_down = want_scan;
@@ -4386,6 +4484,7 @@ void vx_xros_vr_hands(const float head[16], const float hands[20], double now) {
     snprintf(g_hand_stats, sizeof g_hand_stats, "\"hands\":{\"frames\":%u,\"left_tracked\":%u,\"right_tracked\":%u,\"pointer_on\":%d,"
              "\"pointer\":[%.3f,%.3f],\"clicks\":%u,\"right_clicks\":%u,\"drags\":%u,\"wheel_notches\":%u,\"esc\":%u%s}",
              g_hand_frames, g_tracked_frames[0], g_tracked_frames[1], on, g_cur_u, g_cur_v, g_clicks, g_rclicks, g_drags, g_scroll_notches, g_escs, g_gesture_stats);
+    pthread_mutex_unlock(&g_hand_state_lock);
 }
 
 void vx_xros_vr_stats(char *out, unsigned size) {
@@ -4529,7 +4628,39 @@ void vx_xros_vr_cycle_warp_mode(void) {
 
 // (VX Mac, h38: the game is about to drain its events (libvxkit's poll hook, the game's thread): the head's delta since
 //  the last one, from the newest head pose (the compositor's, for its display time), as one mouse event first in line)
+static void control_apply(void) {
+    control_config();
+    int mode=atomic_load(&g_tracking_request);
+    if(mode==atomic_load(&g_tracking_mode))return;
+    pthread_mutex_lock(&g_hand_state_lock);
+    pthread_mutex_lock(&g_lock);
+    pthread_mutex_lock(&g_hand_output_lock);
+    atomic_store(&g_tracking_mode,mode);
+    release_hand_inputs();
+    pthread_mutex_unlock(&g_hand_output_lock);
+    g_firing_trigger=g_joy_fire_mask=0;g_joy_fire_ready_at=0;
+    g_melee_down=0;g_melee_until=g_melee_sample_at=0;
+    g_trigger_release_required=g_controller_buttons&(HW_BTN_L_TRIG|HW_BTN_R_TRIG);
+    g_control_release_mask=g_controller_buttons&0xffu;
+    g_control_neutral=g_control_release_mask!=0;
+    g_muzzle.steering=g_muzzle.track=g_muzzle.seen=0;
+    g_hand_aim_y=g_hand_aim_p=0;g_vm_active=0;
+    memset(g_vm_delta,0,sizeof g_vm_delta);memset(g_vm_rot,0,sizeof g_vm_rot);
+    g_bare_held=0;g_bare_menu=0;g_bare_key=0;
+    memset(g_hg,0,sizeof g_hg);memset(g_up_at,0,sizeof g_up_at);
+    pthread_mutex_lock(&g_ik_lock);
+    g_ik_time=0;g_ik_weapon_owner=0;g_ik_weapon_epoch++;
+    g_ik_mag_state=-1;g_ik_slide_active=0;memset(g_ik_seen,0,sizeof g_ik_seen);memset(g_ik_weap,0,sizeof g_ik_weap);
+    pthread_mutex_unlock(&g_ik_lock);
+    vx_weapon_bridge_set_tracking(mode);
+    atomic_store(&g_tracking_mode,mode);atomic_fetch_add(&g_control_generation,1);
+    pthread_mutex_unlock(&g_lock);
+    pthread_mutex_unlock(&g_hand_state_lock);
+    if(vx_host_jlog) {char f[80];snprintf(f,sizeof f,"\"tracked\":%d,\"generation\":%u",mode,(unsigned)g_control_generation);vx_host_jlog("control_mode",f);}
+    show_label(mode ? "Hand tracking" : "Controller");
+}
 void vx_xros_vr_input_poll(void) {
+    control_apply();
     int bare = vx_xros_vr_bare_enabled();
     if (!bare && g_poll_in != 1) return;
     pthread_mutex_lock(&g_lock);

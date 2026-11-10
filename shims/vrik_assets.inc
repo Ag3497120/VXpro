@@ -4,9 +4,11 @@ typedef struct {
     uint32_t count;
     uint16_t asset, bones;
     int8_t root, trigger, slide, cylinder, hinge, support;
-    uint8_t kind; // receiver, loose ammo, revolver, handgun
+    uint8_t kind; // receiver, loose ammo, revolver, handgun, surface, attachment, melee, body
     uint64_t ammo;
     float root_at[3], trigger_at[3], slide_at[3], cylinder_at[3], hinge_at[3], support_at[3], ammo_at[3];
+    int16_t body_list;
+    const uint16_t *body_names;
 } vrik_asset_profile;
 
 #if !defined(VRIK_ASSET_NO_LOCAL) && __has_include("../build/hand-session-v2/weapon_asset_catalog.h")

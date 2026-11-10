@@ -36,6 +36,7 @@
 #include "weapon_bridge.h"
 #include "auth_browser.h"
 #include "view_stability.h"
+#include "control_chord.h"
 
 extern void (*vx_host_jlog)(const char *event, const char *fields);   // (../../vr/vxmac_vr_glue.m)
 extern int vx_xros_display_w, vx_xros_display_h;
@@ -471,7 +472,53 @@ static void watch_mouse(GCMouse *m) {
 // triggers remain native.
 int vx_xros_vr_driving(void);
 int vx_xros_vr_vehicle_active(void);
-static NSHashTable *g_right_y, *g_right_pads, *g_vr_btns, *g_vr_axes, *g_vr_pads, *g_joy_triggers;
+static NSHashTable *g_right_y, *g_right_pads, *g_vr_btns, *g_vr_axes, *g_vr_pads, *g_joy_triggers, *g_mode_buttons;
+#include "vxmodeinput.h"
+@interface VXMenuInput : NSObject
+@property(nonatomic,weak) GCControllerButtonInput *button;
+@property(nonatomic) unsigned role;
+@property(nonatomic) BOOL delivered;
+@property(nonatomic,weak) GCExtendedGamepad *profile;
+@property(nonatomic,copy) GCControllerButtonValueChangedHandler pressedHandler;
+@property(nonatomic,copy) GCControllerButtonValueChangedHandler valueHandler;
+@end
+@implementation VXMenuInput
+@end
+static NSMapTable *g_menu_inputs;
+static _Atomic unsigned g_menu_pulse;
+static const void *kMenuProfileHandler=&kMenuProfileHandler;
+static VXMenuInput *mode_button(id button,unsigned role,int create) {
+    if(!button)return nil;
+    @synchronized(g_right_pads) {
+        VXMenuInput *input=[g_menu_inputs objectForKey:button];
+        if(!input && create) {
+            input=[VXMenuInput new];input.button=button;input.role=role;
+            [g_menu_inputs setObject:input forKey:button];[g_mode_buttons addObject:button];
+        }
+        return input;
+    }
+}
+static unsigned mode_button_role(GCControllerButtonInput *button) {
+    VXMenuInput *input=mode_button(button,0,0);if(input)return input.role;
+    // Captured controller profiles contain distinct button objects.
+    if([button.aliases containsObject:GCInputButtonOptions])return 2;
+    if([button.aliases containsObject:GCInputButtonMenu])return 1;
+    return 0;
+}
+static void mode_deliver(unsigned mask) {
+    atomic_store(&g_menu_pulse,mask);
+    NSArray *inputs;@synchronized(g_right_pads){inputs=g_menu_inputs.objectEnumerator.allObjects;}
+    for(VXMenuInput *input in inputs) {
+        BOOL down=!!(mask&input.role);GCControllerButtonInput *button=input.button;
+        if(!button || down==input.delivered)continue;
+        input.delivered=down;
+        if(input.pressedHandler)input.pressedHandler(button,down?1:0,down);
+        if(input.valueHandler)input.valueHandler(button,down?1:0,down);
+        GCExtendedGamepad *profile=input.profile;
+        GCExtendedGamepadValueChangedHandler handler=objc_getAssociatedObject(profile,kMenuProfileHandler);
+        if(handler)handler(profile,button);
+    }
+}
 static _Atomic unsigned long g_stick_y_zeroed;   // (reads of the right stick's y answered 0, for the stats)
 static int stick_pitch_blocked(void) {
     static int keep = -1; if (keep < 0) { const char *e = getenv("VXMAC_STICK_PITCH"); keep = e && !strcmp(e, "1"); }
@@ -482,6 +529,11 @@ static void note_controller(GCController *c) {
     GCMicroGamepad *m = c.microGamepad;
     @synchronized (g_right_pads) {
         if (g) {
+            GCControllerButtonInput *plus=nil,*minus=nil;vx_mode_inputs(c,&plus,&minus);
+            VXMenuInput *p=mode_button(plus,1,1),*m=mode_button(minus,2,1);
+            p.role=1;p.profile=g;m.role=2;m.profile=g;
+            jlog("control_buttons","\"plus\":%d,\"minus\":%d,\"plus_system\":%d,\"minus_system\":%d",plus!=nil,minus!=nil,
+                 plus?(int)plus.preferredSystemGestureState:-1,minus?(int)minus.preferredSystemGestureState:-1);
             if (g.leftTrigger) [g_joy_triggers addObject:g.leftTrigger];
             if (g.rightTrigger) [g_joy_triggers addObject:g.rightTrigger];
             [g_right_pads addObject:g.rightThumbstick]; [g_right_y addObject:g.rightThumbstick.yAxis];
@@ -502,6 +554,7 @@ typedef void (*btn_handler_imp)(id, SEL, id);
 static btn_pressed_imp o_btn_pressed;
 static btn_value_imp o_btn_value;
 static btn_handler_imp o_set_btn_pressed_handler, o_set_btn_value_handler;
+static btn_handler_imp o_set_gamepad_handler;
 #include "vxrawinput.h"
 static int vr_buttons_blocked(void) {
     static int block = -1; if (block < 0) { const char *e = getenv("VXMAC_BLOCK_PAD_BTNS"); block = e && !strcmp(e, "1"); }
@@ -512,7 +565,13 @@ static int vr_axes_blocked(void) {
     return block && vx_xros_vr_driving();
 }
 static BOOL blocked_btn(id b) {
-    if (vx_raw_button_depth || vx_xros_vr_vehicle_active()) return NO;
+    if (vx_raw_button_depth) return NO;
+    if(mode_button_role(b))return YES;
+    if(vx_xros_vr_vehicle_active())return NO;
+    if(!vx_xros_vr_tracking_enabled() || vx_xros_vr_control_neutral_required()) {
+        BOOL gameplay; @synchronized(g_right_pads) {gameplay=[g_vr_btns containsObject:b];}
+        return gameplay && vx_xros_vr_control_neutral_required();
+    }
     static int joy_hold = -1;
     if (joy_hold < 0) { const char *e = getenv("VXMAC_JOY_HOLD"); joy_hold = e && !strcmp(e, "1"); }
     BOOL blocked; @synchronized (g_right_pads) {
@@ -536,18 +595,39 @@ static BOOL game_input_caller(void *address) {
 // Returning zero to those callers can swallow the release of a masked button.
 #define INPUT_CALLER __builtin_extract_return_addr(__builtin_return_address(0))
 static BOOL h_btn_pressed(id self, SEL s) {
+    if(!vx_raw_button_depth && game_input_caller(INPUT_CALLER)) {
+        unsigned role=mode_button_role(self);if(role)return !!(atomic_load(&g_menu_pulse)&role);
+    }
     return blocked_btn(self) && game_input_caller(INPUT_CALLER) ? NO : o_btn_pressed(self, s);
 }
 static float h_btn_value(id self, SEL s) {
+    if(!vx_raw_button_depth && game_input_caller(INPUT_CALLER)) {
+        unsigned role=mode_button_role(self);if(role)return (atomic_load(&g_menu_pulse)&role)?1:0;
+    }
     return blocked_btn(self) && game_input_caller(INPUT_CALLER) ? 0 : o_btn_value(self, s);
 }
 static void h_set_btn_pressed_handler(id self, SEL s, GCControllerButtonValueChangedHandler h) {
-    if (!h || !game_input_caller(INPUT_CALLER)) { o_set_btn_pressed_handler(self, s, h); return; }
+    if (!game_input_caller(INPUT_CALLER)) { o_set_btn_pressed_handler(self, s, h); return; }
+    unsigned role=mode_button_role(self);
+    if(role) {mode_button(self,role,1).pressedHandler=h;o_set_btn_pressed_handler(self,s,nil);return;}
+    if(!h){o_set_btn_pressed_handler(self,s,nil);return;}
     o_set_btn_pressed_handler(self, s, ^(GCControllerButtonInput *b, float v, BOOL p) { BOOL z = blocked_btn(b); h(b, z ? 0 : v, z ? NO : p); });
 }
 static void h_set_btn_value_handler(id self, SEL s, GCControllerButtonValueChangedHandler h) {
-    if (!h || !game_input_caller(INPUT_CALLER)) { o_set_btn_value_handler(self, s, h); return; }
+    if (!game_input_caller(INPUT_CALLER)) { o_set_btn_value_handler(self, s, h); return; }
+    unsigned role=mode_button_role(self);
+    if(role) {mode_button(self,role,1).valueHandler=h;o_set_btn_value_handler(self,s,nil);return;}
+    if(!h){o_set_btn_value_handler(self,s,nil);return;}
     o_set_btn_value_handler(self, s, ^(GCControllerButtonInput *b, float v, BOOL p) { BOOL z = blocked_btn(b); h(b, z ? 0 : v, z ? NO : p); });
+}
+static void h_set_gamepad_handler(GCExtendedGamepad *self,SEL s,GCExtendedGamepadValueChangedHandler h) {
+    if(!game_input_caller(INPUT_CALLER)) {o_set_gamepad_handler(self,s,h);return;}
+    objc_setAssociatedObject(self,kMenuProfileHandler,h,OBJC_ASSOCIATION_COPY);
+    mode_button(self.buttonMenu,1,1).profile=self;mode_button(self.buttonOptions,2,1).profile=self;
+    if(!h){o_set_gamepad_handler(self,s,nil);return;}
+    o_set_gamepad_handler(self,s,^(GCExtendedGamepad *pad,GCControllerElement *element) {
+        if(!mode_button_role((id)element))h(pad,element);
+    });
 }
 #undef INPUT_CALLER
 typedef float (*axis_imp)(id, SEL);
@@ -589,11 +669,13 @@ static void h_set_axis_handler(id self, SEL s, GCControllerAxisValueChangedHandl
 static void stick_pitch_setup(void) {
     o_set_axis_handler = (sethandler_imp)method_setImplementation(class_getInstanceMethod([GCControllerAxisInput class], @selector(setValueChangedHandler:)), (IMP)h_set_axis_handler);
     g_vr_axes = [NSHashTable weakObjectsHashTable]; g_vr_pads = [NSHashTable weakObjectsHashTable];
-    g_right_y = [NSHashTable weakObjectsHashTable]; g_right_pads = [NSHashTable weakObjectsHashTable]; g_vr_btns = [NSHashTable weakObjectsHashTable]; g_joy_triggers = [NSHashTable weakObjectsHashTable];
+    g_menu_inputs=[NSMapTable weakToStrongObjectsMapTable];
+    g_right_y = [NSHashTable weakObjectsHashTable]; g_right_pads = [NSHashTable weakObjectsHashTable]; g_vr_btns = [NSHashTable weakObjectsHashTable]; g_joy_triggers = [NSHashTable weakObjectsHashTable];g_mode_buttons=[NSHashTable weakObjectsHashTable];
     o_btn_pressed = (btn_pressed_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(isPressed)), (IMP)h_btn_pressed);
     o_btn_value = (btn_value_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(value)), (IMP)h_btn_value);
     o_set_btn_pressed_handler = (btn_handler_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(setPressedChangedHandler:)), (IMP)h_set_btn_pressed_handler);
     o_set_btn_value_handler = (btn_handler_imp)method_setImplementation(class_getInstanceMethod([GCControllerButtonInput class], @selector(setValueChangedHandler:)), (IMP)h_set_btn_value_handler);
+    o_set_gamepad_handler=(btn_handler_imp)method_setImplementation(class_getInstanceMethod(GCExtendedGamepad.class,@selector(setValueChangedHandler:)),(IMP)h_set_gamepad_handler);
     o_axis_value = (axis_imp)method_setImplementation(class_getInstanceMethod([GCControllerAxisInput class], @selector(value)), (IMP)h_axis_value);
     o_set_pad_handler = (sethandler_imp)method_setImplementation(class_getInstanceMethod([GCControllerDirectionPad class], @selector(setValueChangedHandler:)), (IMP)h_set_pad_handler);
     for (GCController *c in GCController.controllers) note_controller(c);
@@ -614,11 +696,13 @@ static void warp_mode_poll_start(void) {
         double poll_at = CACurrentMediaTime();
         int report = input_diag && input_diag_count < 40 && poll_at - input_diag_at >= 3.0;
         if (report) { input_diag_at = poll_at; input_diag_count++; }
-        int both = 0; unsigned hbtns = 0; int active = 0;
+        int both = 0,plus=0,minus=0; unsigned hbtns = 0; int active = 0;
         for (GCController *c in GCController.controllers) {
             GCExtendedGamepad *g = c.extendedGamepad;
             if (g && g.buttonHome && g.buttonHome.pressed) both = 1;
             if (g) {
+                GCControllerButtonInput *p=nil,*m=nil;vx_mode_inputs(c,&p,&m);
+                plus |= raw_btn_pressed(p);minus |= raw_btn_pressed(m);
                 if (report) jlog("joy_raw", "\"pad_class\":\"%s\",\"left_class\":\"%s\",\"right_class\":\"%s\",\"zl\":[%d,%.3f],\"zr\":[%d,%.3f],\"x\":[%d,%.3f]",
                                   object_getClassName(g), g.leftTrigger ? object_getClassName(g.leftTrigger) : "none",
                                   g.rightTrigger ? object_getClassName(g.rightTrigger) : "none",
@@ -652,6 +736,19 @@ static void warp_mode_poll_start(void) {
                       g.dpad.left.pressed || g.dpad.right.pressed)) { void vx_xros_vr_controller_touch(void); vx_xros_vr_controller_touch(); }
         }
         double now = CACurrentMediaTime();
+        static vx_control_chord control_chord;
+        static double menu_until;
+        static unsigned mode_raw;
+        unsigned raw=(plus?1u:0)|(minus?2u:0);
+        if(raw!=mode_raw) {mode_raw=raw;jlog("control_chord","\"plus\":%d,\"minus\":%d",plus,minus);}
+        if(!GCController.controllers.count) {memset(&control_chord,0,sizeof control_chord);menu_until=0;mode_deliver(0);}
+        else {
+            if(vx_control_chord_update(&control_chord,plus,minus,now)) {
+                vx_xros_vr_toggle_tracking();jlog("control_chord","\"toggle\":1");
+            }
+            if(control_chord.taps) {mode_deliver(control_chord.taps);menu_until=now+.10;}
+            else if(now>=menu_until)mode_deliver(0);
+        }
         previous_triggers = hbtns & (HW_BTN_L_TRIG | HW_BTN_R_TRIG);
         static double ctrl_last_active;
         if (active || hbtns) ctrl_last_active = now;

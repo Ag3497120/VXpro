@@ -1,5 +1,28 @@
 # Hand/weapon session redesign
 
+## Live control switch (integrated 2026-11-10)
+
+Hold Joy-Con **+ and − together for one second** to switch between tracked-hand
+weapon interaction and the game's native controller weapon handling. Release both
+buttons before switching again. VR head tracking stays enabled in both modes.
+Single +/− presses retain their native behavior; Home retains the warp-mode shortcut.
+
+The game-thread handoff releases all synthetic held keys/buttons, waits for held
+gameplay buttons to be released and for the weapon script to acknowledge the new
+owner, cancels pending manual commands, and starts a fresh tracked-pose epoch. Native
+ammunition and inventory are not rewritten by switching. Controller mode restores
+native palette bindings and native reload handling; tracked mode resumes the existing
+hand/weapon adapter. Menu presentation follows both live menu state and the selected
+image's menu state, using one screen plane instead of a separate HUD/menu overlay.
+
+Actual presenter/menu GPU checks, native-binding switch/back checks, input-release
+and script-acknowledgement checks pass locally. The player subsequently confirmed
+the physical mode switch and melee swing attacks work. This checkpoint integrates
+the accumulated source into `main`; no new FPS measurement or universal weapon compatibility is claimed.
+See [the current release notes](docs/RELEASE_2026_11_10.md) for remaining visual issues.
+
+## Original design scope
+
 Status: foundation and read-only native binding probe. **The engine pose writer is not connected.**
 This is not a claim that the reference videos' handling now works on Vision Pro.
 
@@ -16,10 +39,11 @@ magazine insertion, automatic chambering and ZL-held support/ADS as requested.
 
 ## Planned integration gate
 
-The user plans to integrate `hand-tracking` into `main` only after stabilization. That integration
+The original plan was to integrate `hand-tracking` into `main` after stabilization. That integration
 must add immediate in-game switching between standard controller input and tracked-hand input,
 without restarting the app, reloading the save or disabling VR head tracking. No merge or runtime
-mode switch is implemented by this checkpoint.
+mode switch had been implemented at the original checkpoint. The update above
+adds the switch, and the user requested the current source be published to `main` on November 10.
 
 The switch must use one authoritative mode/epoch for input and pose publication, release held
 attack/ADS/grip actions from the old mode, and prevent duplicate input. Preserve weapon identity,
@@ -218,7 +242,7 @@ a functioning pose writer. The small status file can be retrieved while the game
 log is no longer necessary for this handshake check.
 
 No game executable instruction, original game asset, save or original script bundle was edited. All overlay
-outputs and header-only local test images live under ignored `VXMac/build/hand-session-v2/`. No Windows DLL,
+outputs and header-only local test images live under ignored `build/hand-session-v2/`. No Windows DLL,
 MinHook, GPL implementation or third-party game asset was copied into the implementation. The SDK's reflection
 descriptions were consulted as layout clues; Mac vtable/layout verification is still required before use.
 
@@ -227,11 +251,11 @@ descriptions were consulted as layout clues; Mac vtable/layout verification is s
 Run from the repository root:
 
 ```
-sh VXMac/tools/check_hand_session.sh
+sh tools/check_hand_session.sh
 make -C VXRuntime check
 ```
 
-After `make -C VXMac/shims mac`, setting `VXMAC_TEST_METAL_SHIM` to the absolute Mac `libvxmtl.dylib`
+After `make -C shims mac`, setting `VXMAC_TEST_METAL_SHIM` to the absolute Mac `libvxmtl.dylib`
 path also runs the real-hook resource lifetime test in `check_hand_session.sh`.
 
 The optional first argument to `check_hand_session.sh` is a private local macOS-header copy of the player's 2.5.0

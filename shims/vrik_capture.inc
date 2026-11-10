@@ -20,7 +20,9 @@ static NSDictionary *vrik_capture_snapshot(void) {
         NSArray *original=vrik_capture_floats(p->orig[0].m,p->nb*12);
         NSArray *posed=vrik_capture_floats(p->posed[0].m,p->nb*12);
         if (!original || !posed) continue;
-        [palettes addObject:@{@"indices":@(p->count),@"list":@(p->L),@"rig":@(p->rig),
+        NSMutableArray *names=[NSMutableArray array];
+        if(p->body_profile)for(unsigned k=0;k<p->nb;k++)[names addObject:@(p->body_profile->body_names[k])];
+        [palettes addObject:@{@"indices":@(p->count),@"list":@(p->L<VRIK_NLISTS?p->L:-3),@"rig":@(p->rig),@"named_bones":names,
             @"bones":@(p->nb),@"asset":@(p->asset ? p->asset->asset : 0),@"applied":@(p->applied),
             @"support_connected":@(p->support_connected),
             @"object":vrik_capture_floats(p->obj.m,12),@"view":vrik_capture_floats(p->view.m,12),

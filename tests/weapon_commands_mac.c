@@ -15,9 +15,8 @@ static void ordinary(void *o, void *f, void *r, const void *t) {
     (void)o; (void)f; (void)r; (void)t; delegated++;
 }
 static void report(const char *s) { read_report(s, strlen(s)); }
-static void poll_packet(void) {
+static void poll_literal(uint32_t literal) {
     unsigned char frame[0x70] = {0}, bytes[6] = {0x06,0,0,0,0,0x26};
-    uint32_t literal = POLL_LITERAL;
     memcpy(bytes + 1, &literal, 4);
     *(const unsigned char **)frame = bytes;
     memset(frame + 0x30, 0xff, 16);
@@ -26,6 +25,7 @@ static void poll_packet(void) {
     assert(*(const unsigned char **)frame == bytes + 6 && frame[0x62] == 1);
     for (int i = 0x30; i < 0x40; i++) assert(!frame[i]);
 }
+static void poll_packet(void) {poll_literal(POLL_LITERAL);}
 static void ack(uint64_t serial, int kind, int rejected) {
     char text[128];
     snprintf(text, sizeof text, "VXW2|A|9|42|%llu|%d|%d", (unsigned long long)serial, kind, rejected);
@@ -117,10 +117,25 @@ int main(void) {
     uint64_t chamber=vx_weapon_bridge_command(VX_WEAPON_CHAMBER);
     assert(chamber);
     poll_packet();assert(strstr(answer,"|3"));
-    ack(chamber,VX_WEAPON_CHAMBER,0);
+    char chamber_reply[128];
+    snprintf(chamber_reply,sizeof chamber_reply,"VXW2|A|10|43|%llu|3|0",(unsigned long long)chamber);
+    report(chamber_reply);
+    assert(vx_weapon_bridge_snapshot().command_status==VX_COMMAND_ACCEPTED);
     assert(vx_weapon_bridge_snapshot().ammo==0 && vx_weapon_bridge_snapshot().reload_phase==5);
     report("VXW1|R|10|43|1|0|8|8|2");
     assert(vx_weapon_bridge_snapshot().ammo==8 && vx_weapon_bridge_snapshot().reload_phase==0);
+    // Runtime ownership cancels only pending synthetic commands, never ammo.
+    uint64_t before_generation=vx_weapon_bridge_snapshot().generation;
+    assert(vx_weapon_bridge_command(VX_WEAPON_EJECT));
+    poll_literal(MODE_LITERAL);assert(!strcmp(answer,"1"));
+    vx_weapon_bridge_set_tracking(0);poll_literal(MODE_LITERAL);assert(!strcmp(answer,"0"));
+    assert(!pending.serial && !vx_weapon_bridge_command(VX_WEAPON_INSERT));
+    assert(vx_weapon_bridge_snapshot().ammo==8 && vx_weapon_bridge_snapshot().generation==before_generation);
+    ack(next_serial,VX_WEAPON_EJECT,0);assert(vx_weapon_bridge_snapshot().command_status==VX_COMMAND_REJECTED);
+    report("VXW1|D|0");assert(vx_weapon_bridge_context().control_known && !vx_weapon_bridge_context().control_tracking);
+    report("VXW1|D|2");assert(!vx_weapon_bridge_context().control_tracking);
+    vx_weapon_bridge_set_tracking(1);poll_literal(MODE_LITERAL);assert(!strcmp(answer,"1"));
+    report("VXW1|D|1");assert(vx_weapon_bridge_context().control_tracking);
     report("VXW1|U"); poll_packet();
     assert(!vx_weapon_bridge_commands_ready());
     munmap(base, size);

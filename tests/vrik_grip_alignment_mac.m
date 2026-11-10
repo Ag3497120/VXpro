@@ -2,8 +2,14 @@
 // Exercise the actual palette transform with a stale grip captured on equip.
 // Uses Metal allocations and a small offline-compiled shader for palette
 // indirection. This does not run the game or its shaders/animation system.
+static int fixture_tracking = 1;
+int vx_xros_vr_tracking_enabled(void) { return fixture_tracking; }
 #include "../shims/vxpipe.m"
 #include <assert.h>
+
+static int fixture_ranged;
+vx_weapon_snapshot vx_weapon_bridge_snapshot(void) {return (vx_weapon_snapshot){.known=1,.entity=1,.ranged=fixture_ranged};}
+vx_game_context vx_weapon_bridge_context(void) {return (vx_game_context){.known=1,.scene_tier=1};}
 
 void vxmac_log(const char *format, ...) { (void)format; }
 void vxmtl_enc_stats(char *out, unsigned n) { if (n) out[0] = 0; }
@@ -84,7 +90,7 @@ static id<MTLBuffer> fixture_registered(id<MTLDevice> device, size_t size) {
     assert(buffer); memset(buffer.contents, 0, size); vxpipe_buf_add(buffer); return buffer;
 }
 
-static void test_render_dispatch(void) {
+static void test_render_dispatch(NSUInteger base) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     id<MTLCommandQueue> queue = [device newCommandQueue];
     PoseEncoderFixture *encoder = [PoseEncoderFixture new];
@@ -123,7 +129,6 @@ static void test_render_dispatch(void) {
     id<MTLBuffer> top = fixture_registered(device, 72);
     address = descriptor.gpuAddress; memcpy(top.contents, &address, 8);
     address = table.gpuAddress; memcpy((uint8_t *)top.contents + 48, &address, 8);
-    const NSUInteger base = 4096;
     id<MTLBuffer> instances = fixture_registered(device, (base + 1) * 80);
     uint32_t *skin = (uint32_t *)((uint8_t *)instances.contents + base * 80);
     skin[0] = skin[2] = 96; skin[1] = 48;
@@ -155,8 +160,9 @@ static void test_render_dispatch(void) {
     NSArray *constant_layout = @[@4,@0,@0,@(MTLVertexStepFunctionConstant),@0,@(MTLVertexFormatUInt4),@16,@80];
     objc_setAssociatedObject(constant_pipeline, kISD, constant_layout, OBJC_ASSOCIATION_RETAIN);
     objc_setAssociatedObject(constant_pipeline, kSkinSpan, @256, OBJC_ASSOCIATION_RETAIN);
-    id<MTLTexture> textures[4];
-    for (int pass = 0; pass < 4; pass++) {
+    id<MTLTexture> textures[6];
+    for (int pass = 0; pass < 6; pass++) {
+        fixture_tracking = pass != 4;
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
         td.storageMode = MTLStorageModeShared; td.usage = MTLTextureUsageRenderTarget;
         textures[pass] = [device newTextureWithDescriptor:td];
@@ -170,24 +176,152 @@ static void test_render_dispatch(void) {
         [encoder.actual setVertexBuffer:instances offset:vm->voff[4] atIndex:4];
         [encoder.actual useResource:bones usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
         [encoder.actual useResource:table usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
-        fixture_expected_pose = pass != 1; fixture_expected_base = pass == 1 || pass == 3 ? base : 0;
+        fixture_expected_pose = pass != 1 && pass != 4;
+        fixture_expected_base = !fixture_expected_pose || pass == 3 ? base : 0;
         vm->pipe = pass == 1 ? nil : pass == 3 ? constant_pipeline : pipeline; vm->vp_fg = pass != 1;
         if (pass != 1) wh_dxib(encoder, NULL, MTLPrimitiveTypeTriangle, 3, MTLIndexTypeUInt16, indices, 0, 1, 0, base);
         else wh_dpib(encoder, NULL, MTLPrimitiveTypeTriangle, 0, 3, 1, base);
-        if (pass != 1) assert(encoder.instance.length == 80);
+        if (fixture_expected_pose) assert(encoder.instance.length == 80);
         [encoder.actual endEncoding]; encoder.actual = nil;
     }
     vxpipe_pose_seal_command_buffer(encoder.command);
     [encoder.command commit]; [encoder.command waitUntilCompleted];
     assert(encoder.command.status == MTLCommandBufferStatusCompleted && !encoder.command.error);
-    for (int pass = 0; pass < 4; pass++) {
+    for (int pass = 0; pass < 6; pass++) {
         uint8_t pixel[4]; [textures[pass] getBytes:pixel bytesPerRow:4 fromRegion:MTLRegionMake2D(2,2,1,1) mipmapLevel:0];
-        assert(abs(pixel[0] - (pass == 1 ? 0 : 204)) <= 1 && pixel[1] == 255 && abs(pixel[2] - 230) <= 1);
+        assert(abs(pixel[0] - (pass == 1 || pass == 4 ? 0 : 204)) <= 1 && pixel[1] == 255 && abs(pixel[2] - 230) <= 1);
     }
     assert(native[0].m[3] == 0 && skin[0] == 96 && skin[2] == 96);
     objc_setAssociatedObject(encoder, kEncVM, nil, OBJC_ASSOCIATION_RETAIN);
     g_pose_buffers = nil; memset(&g_vk, 0, sizeof g_vk);
-    puts("render dispatch: posed indexed GPU draw before encode; native primitive restored; constant and instanced inputs; base 4096 uses one 80-byte record: ok");
+    printf("render dispatch: GPU pose and native controller restoration; base %lu uses one 80-byte record: ok\n",(unsigned long)base);
+}
+
+static void test_rigid_attachment(void) {
+    id<MTLDevice> device=MTLCreateSystemDefaultDevice();id<MTLCommandQueue> queue=[device newCommandQueue];
+    PoseEncoderFixture *encoder=[PoseEncoderFixture new];encoder.device=device;encoder.command=[queue commandBuffer];
+    encoder.retained=[NSMutableArray array];encoder.restored=[NSMutableDictionary dictionary];
+    id<MTLLibrary> library=[device newLibraryWithURL:[NSURL fileURLWithPath:@(getenv("VXMAC_TEST_POSE_LIBRARY"))] error:nil];
+    MTLRenderPipelineDescriptor *pd=[MTLRenderPipelineDescriptor new];
+    pd.vertexFunction=[library newFunctionWithName:@"pose_rigid_vertex"];pd.fragmentFunction=[library newFunctionWithName:@"pose_copy_color"];
+    pd.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;pd.vertexDescriptor=[MTLVertexDescriptor vertexDescriptor];
+    for(int i=0;i<3;i++) {pd.vertexDescriptor.attributes[i].format=MTLVertexFormatFloat4;
+        pd.vertexDescriptor.attributes[i].bufferIndex=4;pd.vertexDescriptor.attributes[i].offset=i*16;}
+    pd.vertexDescriptor.layouts[4].stride=48;pd.vertexDescriptor.layouts[4].stepFunction=MTLVertexStepFunctionPerInstance;
+    pd.vertexDescriptor.layouts[4].stepRate=1;
+    id<MTLRenderPipelineState> pipeline=[device newRenderPipelineStateWithDescriptor:pd error:nil];assert(pipeline);
+    objc_setAssociatedObject(pipeline,kRigidInstance,@[@4,@0,@48,@(MTLVertexStepFunctionPerInstance),@1,@48],OBJC_ASSOCIATION_RETAIN);
+    id<MTLBuffer> instance=fixture_registered(device,48);aff identity=aff_id();memcpy(instance.contents,&identity,48);
+    id<MTLBuffer> view=fixture_registered(device,640);memcpy((uint8_t *)view.contents+384,&identity,48);
+    id<MTLBuffer> descriptor=fixture_registered(device,64);uint64_t address=view.gpuAddress;memcpy((uint8_t *)descriptor.contents+24,&address,8);
+    id<MTLBuffer> top=fixture_registered(device,72);address=descriptor.gpuAddress;memcpy(top.contents,&address,8);
+    VXEncVM *vm=[VXEncVM new];vm->original=top;vm->vbuf[4]=instance;vm->pipe=pipeline;vm->vp_fg=1;
+    objc_setAssociatedObject(encoder,kEncVM,vm,OBJC_ASSOCIATION_RETAIN);
+    memset(&g_vk,0,sizeof g_vk);atomic_store(&g_frame,888);g_vk.capture_frame=888;g_vk.capture_body=1;g_vk.held.owner=1;
+    g_vk.weapon_frame.valid=1;g_vk.weapon_frame.frame=888;g_vk.weapon_frame.epoch=g_vk.held.epoch;
+    g_vk.weapon_frame.world_delta=aff_id();g_vk.weapon_frame.world_delta.m[3]=.8f;
+    g_vk.npals=1;g_vk.pals[0].frame=888;g_vk.pals[0].receiver=VRIK_RECEIVER;g_vk.pals[0].obj=aff_id();
+    id<MTLTexture> textures[4];
+    for(int pass=0;pass<4;pass++) {
+        MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+        td.storageMode=MTLStorageModeShared;td.usage=MTLTextureUsageRenderTarget;textures[pass]=[device newTextureWithDescriptor:td];
+        MTLRenderPassDescriptor *rp=[MTLRenderPassDescriptor new];rp.colorAttachments[0].texture=textures[pass];
+        rp.colorAttachments[0].loadAction=MTLLoadActionClear;rp.colorAttachments[0].storeAction=MTLStoreActionStore;
+        encoder.actual=[encoder.command renderCommandEncoderWithDescriptor:rp];[encoder.actual setRenderPipelineState:pipeline];
+        [encoder.actual setVertexBuffer:instance offset:0 atIndex:4];
+        fixture_tracking=pass!=1;
+        if(pass==2)g_vk.pals[0].obj.m[3]=2; // Nearby scenery is not the mounted receiver's instance.
+        if(pass==3) {
+            g_vk.pals[0].obj=aff_id();
+            // Skinning exists, but there is no verified compact-copy contract
+            // for this material. Its reflected instance still follows the gun.
+            objc_setAssociatedObject(pipeline,kISD,@[@4,@48,@64,@(MTLVertexStepFunctionPerInstance),@1,@(MTLVertexFormatUInt4),@0,@64],OBJC_ASSOCIATION_RETAIN);
+        }
+        vrik_apply(encoder,3,1,0,nil,0,MTLIndexTypeUInt16);
+        assert(!!vm->pose_bound==(pass==0 || pass==3));
+        [encoder.actual drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder.actual endEncoding];encoder.actual=nil;
+    }
+    [encoder.command commit];[encoder.command waitUntilCompleted];assert(encoder.command.status==MTLCommandBufferStatusCompleted);
+    for(int pass=0;pass<4;pass++) {uint8_t pixel[4];[textures[pass] getBytes:pixel bytesPerRow:4 fromRegion:MTLRegionMake2D(2,2,1,1) mipmapLevel:0];
+        assert(abs(pixel[0]-((pass==0 || pass==3)?204:0))<=1 && pixel[1]==255 && pixel[2]==255);}
+    assert(!memcmp(instance.contents,&identity,48));fixture_tracking=1;
+    puts("rigid scope attachment: GPU instance follows receiver, source unchanged; controller mode and unrelated objects stay native: ok");
+}
+
+static void test_full_range_melee(void) {
+    const char *file=getenv("VXMAC_TEST_CROWBAR_INDICES");if(!file)return;
+    NSData *triangles=[NSData dataWithContentsOfFile:@(file)];assert(triangles.length==4476*2);
+    id<MTLDevice> device=MTLCreateSystemDefaultDevice();id<MTLCommandQueue> queue=[device newCommandQueue];
+    PoseEncoderFixture *encoder=[PoseEncoderFixture new];encoder.device=device;encoder.command=[queue commandBuffer];
+    encoder.retained=[NSMutableArray array];encoder.restored=[NSMutableDictionary dictionary];
+    id<MTLLibrary> lib=[device newLibraryWithURL:[NSURL fileURLWithPath:@(getenv("VXMAC_TEST_POSE_LIBRARY"))] error:nil];
+    MTLRenderPipelineDescriptor *pd=[MTLRenderPipelineDescriptor new];
+    pd.vertexFunction=[lib newFunctionWithName:@"pose_copy_vertex"];pd.fragmentFunction=[lib newFunctionWithName:@"pose_copy_color"];
+    pd.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;pd.vertexDescriptor=[MTLVertexDescriptor vertexDescriptor];
+    pd.vertexDescriptor.attributes[0].format=MTLVertexFormatUInt4;pd.vertexDescriptor.attributes[0].bufferIndex=4;
+    pd.vertexDescriptor.layouts[4].stride=80;pd.vertexDescriptor.layouts[4].stepFunction=MTLVertexStepFunctionPerInstance;
+    pd.vertexDescriptor.layouts[4].stepRate=1;
+    id<MTLRenderPipelineState> pipe=[device newRenderPipelineStateWithDescriptor:pd error:nil];assert(pipe);
+    NSArray *layout=@[@4,@0,@80,@(MTLVertexStepFunctionPerInstance),@1,@(MTLVertexFormatUInt4),@16,@64];
+    objc_setAssociatedObject(pipe,kISD,layout,OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(pipe,kSkinSpan,@256,OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(pipe,kInstanceRebase,@1,OBJC_ASSOCIATION_RETAIN);
+    id<MTLBuffer> bones=fixture_registered(device,258*48);aff *native=(aff *)((uint8_t *)bones.contents+96);
+    for(unsigned k=0;k<256;k++)native[k]=aff_id();native[255].m[3]=.9f;
+    aff identity=aff_id();id<MTLBuffer> view=fixture_registered(device,640);memcpy((uint8_t *)view.contents+384,&identity,48);
+    id<MTLBuffer> descriptor=fixture_registered(device,64);uint64_t address=view.gpuAddress;memcpy((uint8_t *)descriptor.contents+24,&address,8);
+    id<MTLBuffer> table=fixture_registered(device,72);address=bones.gpuAddress;memcpy((uint8_t *)table.contents+48,&address,8);
+    id<MTLBuffer> top=fixture_registered(device,72);address=descriptor.gpuAddress;memcpy(top.contents,&address,8);
+    address=table.gpuAddress;memcpy((uint8_t *)top.contents+48,&address,8);
+    id<MTLBuffer> records=fixture_registered(device,240);uint32_t *skin=(uint32_t *)((uint8_t *)records.contents+160);
+    skin[0]=skin[2]=96;skin[1]=48;memcpy((uint8_t *)skin+16,&identity,48);
+    id<MTLBuffer> ib=fixture_registered(device,triangles.length);memcpy(ib.contents,triangles.bytes,triangles.length);
+    VXEncVM *vm=[VXEncVM new];vm->pipe=pipe;vm->original=top;vm->vbuf[4]=records;vm->vp_fg=0;
+    objc_setAssociatedObject(encoder,kEncVM,vm,OBJC_ASSOCIATION_RETAIN);
+    o_svb2=fixture_bind;o_svbs=fixture_bind_dynamic;o_svy2=fixture_bytes;
+    memset(&g_vk,0,sizeof g_vk);atomic_store(&g_frame,901);g_vk.capture_started=1;g_vk.capture_frame=901;
+    g_vk.held.owner=-1;fixture_ranged=0;fixture_tracking=1;
+    id<MTLTexture> textures[4];
+    for(int pass=0;pass<4;pass++) {
+        MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+        td.storageMode=MTLStorageModeShared;td.usage=MTLTextureUsageRenderTarget;textures[pass]=[device newTextureWithDescriptor:td];
+        MTLRenderPassDescriptor *rp=[MTLRenderPassDescriptor new];rp.colorAttachments[0].texture=textures[pass];
+        rp.colorAttachments[0].loadAction=MTLLoadActionClear;rp.colorAttachments[0].storeAction=MTLStoreActionStore;
+        encoder.actual=[encoder.command renderCommandEncoderWithDescriptor:rp];[encoder.actual setRenderPipelineState:pipe];
+        [encoder.actual setVertexBuffer:top offset:0 atIndex:2];[encoder.actual setVertexBuffer:records offset:0 atIndex:4];
+        [encoder.actual useResource:table usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+        [encoder.actual useResource:bones usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+        if(pass==1) {
+            // Material variant: retain the actual base instance and every
+            // unrelated field when no verified rebasing contract is present.
+            objc_setAssociatedObject(pipe,kSkinSpan,nil,OBJC_ASSOCIATION_RETAIN);
+            objc_setAssociatedObject(pipe,kInstanceRebase,nil,OBJC_ASSOCIATION_RETAIN);
+            objc_setAssociatedObject(pipe,kSkinByteInputs,@256,OBJC_ASSOCIATION_RETAIN);
+        }
+        if(pass==2)fixture_tracking=0;
+        if(pass==3) {fixture_tracking=1;fixture_ranged=1;}
+        vrik_apply(encoder,4476,1,2,ib,0,MTLIndexTypeUInt16);
+        assert(!!vm->pose_bound==(pass<2));
+        if(pass<2)assert(encoder.instance.length==(pass==0?80:240));
+        [encoder.actual drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:1 baseInstance:vm->pose_rebase?0:2];
+        [encoder.actual endEncoding];encoder.actual=nil;
+        if(pass==0) {
+            assert(g_vk.npals==1 && !g_vk.pals[0].applied); // Body arrives after this encoded draw.
+            g_vk.capture_body=g_vk.have_h[1]=g_vk.weapon_origin_valid=g_vk.held.right_grip_valid=1;
+            g_vk.solve_frame=g_vk.held.right_grip_frame=901;g_vk.held.owner=1;g_vk.held.wrists=2;
+            g_vk.held.at=CACurrentMediaTime();g_vk.obj=g_vk.vcam=g_vk.held.room_from_view=aff_id();
+            g_vk.native_item_grip=(vrik_grip_pose){{0,0,0},{1,0,0},{0,1,0}};
+            g_vk.held.right_grip_view=aff_id();g_vk.held.right_grip_view.m[3]=.8f;
+            vrik_apply_pal(&g_vk.pals[0]);assert(g_vk.pals[0].applied);
+        }
+    }
+    vxpipe_pose_seal_command_buffer(encoder.command);[encoder.command commit];[encoder.command waitUntilCompleted];
+    assert(encoder.command.status==MTLCommandBufferStatusCompleted);
+    for(int pass=0;pass<4;pass++) {uint8_t pixel[4];[textures[pass] getBytes:pixel bytesPerRow:4 fromRegion:MTLRegionMake2D(2,2,1,1) mipmapLevel:0];
+        assert(abs(pixel[0]-(pass<2?204:0))<=1);}
+    assert(native[0].m[3]==0 && skin[0]==96 && skin[2]==96);fixture_ranged=0;fixture_tracking=1;
+    puts("full-range crowbar: early scene-depth draw receives the later palm pose on GPU; reflected material preserves baseInstance; controller and wrong equipment stay native: ok");
 }
 
 static void test_saved_shader_profiles(void) {
@@ -241,8 +375,37 @@ static void test_saved_shader_profiles(void) {
         assert(!objc_getAssociatedObject(pipeline, kSkinSpan));
         checked++;
     }
-    assert(checked == 21);
-    puts("saved shader reflection: 21 skinning libraries, 8-bit bounds, wider/unknown variants refused: ok");
+    unsigned expected=getenv("VXMAC_TEST_GAME_VS_COUNT")?(unsigned)atoi(getenv("VXMAC_TEST_GAME_VS_COUNT")):21;
+    assert(checked == expected);
+    printf("saved shader reflection: %u skinning libraries, 8-bit bounds, wider/unknown variants refused: ok\n",checked);
+}
+
+static void test_index_readback_priority(void) {
+    const char *path=getenv("VXMAC_TEST_CROWBAR_INDICES");if(!path)return;
+    NSData *data=[NSData dataWithContentsOfFile:@(path)];assert(data.length==4476*2);
+    id<MTLDevice> device=MTLCreateSystemDefaultDevice();
+    id<MTLBuffer> upload=[device newBufferWithBytes:data.bytes length:data.length options:MTLResourceStorageModeShared];
+    id<MTLBuffer> indices[2];id<MTLCommandQueue> queue=[device newCommandQueue];
+    id<MTLCommandBuffer> cb=[queue commandBuffer];id<MTLBlitCommandEncoder> bl=[cb blitCommandEncoder];
+    for(int i=0;i<2;i++) {
+        indices[i]=[device newBufferWithLength:data.length options:MTLResourceStorageModePrivate];
+        [bl copyFromBuffer:upload sourceOffset:0 toBuffer:indices[i] destinationOffset:0 size:data.length];
+    }
+    [bl endEncoding];[cb commit];[cb waitUntilCompleted];assert(cb.status==MTLCommandBufferStatusCompleted);
+    atomic_store(&g_frame,99001);
+    pthread_mutex_lock(&g_vk_l);
+    assert(!vrik_magazine_mesh(indices[0],0,4476,MTLIndexTypeUInt16,0));
+    assert(!vrik_magazine_mesh(indices[1],0,4476,MTLIndexTypeUInt16,1));
+    pthread_mutex_unlock(&g_vk_l);
+    int found[2]={0};
+    for(int retry=0;retry<1000 && (!found[0] || !found[1]);retry++) {
+        usleep(1000);
+        pthread_mutex_lock(&g_vk_l);
+        for(int i=0;i<2;i++)found[i]=vrik_magazine_mesh(indices[i],0,4476,MTLIndexTypeUInt16,i);
+        pthread_mutex_unlock(&g_vk_l);
+    }
+    assert(found[0]>=VRIK_ASSET_BASE && found[0]==found[1]);
+    puts("private index readback: scene work cannot starve a visible hand/weapon in the same frame; two pending copies maximum: ok");
 }
 
 static void test_palette_isolation(void) {
@@ -474,6 +637,62 @@ static void test_body_space(void) {
         assert(vrik_trigger_grip(1, aff_mul(shifted.obj,shifted.posed[k]), &palm));
         assert_grip(palm,target);
     }
+}
+
+static void test_holding_consumers(void) {
+    test_body_space();
+    g_vk.held.epoch = 7;
+    g_vk.hand_shape[1].ready = 1;
+    int list = -1, wrist = -1, digit = -1;
+    for (int i=0;i<VRIK_NLISTS && list<0;i++) {
+        unsigned n=vrik_list_off[i+1]-vrik_list_off[i];
+        if(n>128)continue;
+        int w=-1,d=-1;
+        for(unsigned k=0;k<n;k++) {
+            int name=vrik_list[vrik_list_off[i]+k];
+            if(name==VRIK_RIGHTHAND)w=k;
+            if(name==VRIK_RIGHTHANDINDEX1)d=k;
+        }
+        if(w>=0 && d>=0) {list=i;wrist=w;digit=d;}
+    }
+    assert(list>=0);
+    vrik_pal first={.L=list,.rig=0,.frame=42,.cap_b=128,.indices=(const void *)1,.count=111};
+    first.nb=vrik_list_off[list+1]-vrik_list_off[list];
+    first.obj=g_vk.obj;first.view=aff_id();first.P=(uint8_t *)first.posed;
+    for(unsigned k=0;k<first.nb;k++)first.orig[k]=first.posed[k]=aff_id();
+    vrik_pal second=first;second.P=(uint8_t *)second.posed;second.indices=(const void *)2;second.count=222;
+    // Two meshes can name the same joint but use different inverse binds.
+    // The second's bind vertex compensates its own skin translation.
+    second.orig[digit].m[3]=.043f;second.orig[digit].m[7]=-.019f;
+    vrik_apply_pal_pose(&first);vrik_apply_pal_pose(&second);
+    assert(first.applied && second.applied);
+    float vertex[3]={.11f,.02f,.09f},other[3]={vertex[0]-.043f,vertex[1]+.019f,vertex[2]};
+    float a[3],b[3];aff_pt(first.posed[digit].m,vertex,a);aff_pt(second.posed[digit].m,other,b);
+    assert(vrik_distance(a,b)<.00001f);
+    aff retained=second.posed[digit];
+    first.applied=second.applied=0;
+    vrik_apply_pal_pose(&second);vrik_apply_pal_pose(&first);
+    for(int j=0;j<12;j++)assert(fabsf(retained.m[j]-second.posed[digit].m[j])<.00001f);
+    (void)wrist;
+    puts("holding fingers: consumer-specific inverse binds, draw order and repeated passes: ok");
+}
+
+static void test_named_partial_skin(void) {
+    memset(&g_vk,0,sizeof g_vk);g_vk.solve_frame=g_vk.capture_frame=43;g_vk.have_af[1]=1;g_vk.held.owner=-1;
+    g_vk.obj=aff_id();g_vk.rigv=0;
+    for(int i=0;i<7;i++)g_vk.D[i]=aff_id();g_vk.D[6].m[3]=.25f;
+    const uint16_t names[]={VRIK_RIGHTHANDINDEX1,VRIK_RIGHTHANDMIDDLE1,VRIK_RIGHTHANDPINKY1};
+    vrik_asset_profile profile={.kind=128,.bones=3,.body_list=VRIK_NLISTS,.body_names=names};
+    vrik_pal pal={.L=VRIK_NLISTS,.rig=0,.frame=43,.cap_b=128,.nb=3,.body_profile=&profile};
+    pal.obj=pal.view=aff_id();pal.P=(uint8_t *)pal.posed;
+    for(int i=0;i<128;i++) {pal.orig[i]=pal.posed[i]=aff_id();pal.orig[i].m[7]=1.4f;}
+    pal.orig[2].m[0]=.01f;pal.orig[2].m[1]=.8f;
+    assert(!vrik_is_bone(pal.orig[2].m) && vrik_named_skin_valid(&pal));
+    aff tail=pal.posed[3];vrik_apply_pal_pose(&pal);assert(pal.applied);
+    for(int i=0;i<3;i++)assert(fabsf(pal.posed[i].m[3]-.25f)<.00001f);
+    assert(!memcmp(&tail,&pal.posed[3],sizeof tail));
+    pal.orig[2].m[1]=NAN;assert(!vrik_named_skin_valid(&pal));
+    puts("named partial skin: exact small bone list poses fingers without reading arena tail or a guessed full-body list: ok");
 }
 
 static void test_palm_contacts(void) {
@@ -718,6 +937,32 @@ static void test_asset_adapter(void) {
     puts("asset adapter: root-bound trigger, native animation/camera changes, surface support, finger clearance, real-magazine ejection and cylinder isolation: ok");
 }
 
+static void test_melee_asset(void) {
+    const vrik_asset_profile *asset=NULL;
+    for(unsigned i=0;i<VRIK_ASSET_COUNT;i++)if(vrik_assets[i].count==4476 && (vrik_assets[i].kind&64))asset=&vrik_assets[i];
+    if(!asset){puts("crowbar adapter: private owned asset not present; skipped");return;}
+    memset(&g_vk,0,sizeof g_vk);g_vk.held.owner=1;g_vk.held.wrists=2;g_vk.held.epoch=9;
+    g_vk.capture_body=1;g_vk.have_h[1]=1;g_vk.vcam=g_vk.obj=g_vk.held.room_from_view=aff_id();
+    g_vk.native_item_grip=(vrik_grip_pose){{.12f,-.22f,.44f},{0,0,1},{0,1,0}};
+    vrik_pal item={.L=-1,.asset=asset,.nb=1,.cap_b=1,.indices=(void *)1,.count=4476};
+    item.obj=item.view=aff_id();item.P=(uint8_t *)item.posed;
+    aff in_root={0};
+    for(unsigned frame=1;frame<8;frame++) {
+        g_vk.solve_frame=g_vk.capture_frame=item.frame=frame;g_vk.held.right_grip_frame=frame;g_vk.held.right_grip_valid=1;
+        vrik_grip_pose target={{.25f+.015f*frame,-.35f,.48f},{0,0,1},{0,1,0}};
+        g_vk.held.right_grip_view=vrik_grip_basis(&target);
+        item.orig[0]=aff_rot((float[3]){0,1,0},.13f*frame,(float[3]){0,0,0});item.orig[0].m[11]=.2f;
+        item.applied=0;g_vk.weapon_frame.valid=0;
+        vrik_apply_pal_pose(&item);assert(item.applied && g_vk.asset_grip.valid && !g_vk.trigger_source.valid);
+        if(frame==1)in_root=g_vk.asset_grip.in_root;
+        else assert(!memcmp(&in_root,&g_vk.asset_grip.in_root,sizeof in_root));
+        aff actual=aff_mul(item.obj,aff_mul(item.posed[0],g_vk.asset_grip.in_root));
+        aff expected=vrik_grip_basis(&target);
+        for(int j=0;j<12;j++)assert(fabsf(actual.m[j]-expected.m[j])<.00002f);
+    }
+    puts("owned crowbar adapter: no trigger joint required, root grip retained through native animation, tracked palm stays attached: ok");
+}
+
 static void test_geometry_cache(void) {
     g_vk_nmesh=0;memset(g_vk_mesh,0,sizeof g_vk_mesh);
     aff bones[128];
@@ -808,6 +1053,35 @@ static aff test_json_aff(NSArray *values,unsigned offset) {
     assert(values.count>=offset+12);aff result;
     for(int k=0;k<12;k++)result.m[k]=[values[offset+k] floatValue];
     return result;
+}
+
+static void test_device_appearance(void) {
+    const char *directory=getenv("VXMAC_TEST_APPEARANCE_DIR");if(!directory)return;
+    NSData *bytes=[NSData dataWithContentsOfFile:[@(directory) stringByAppendingPathComponent:@"e13-s0.json"]];
+    assert(bytes);
+    NSDictionary *record=[NSJSONSerialization JSONObjectWithData:bytes options:0 error:nil];
+    memset(&g_vk,0,sizeof g_vk);
+    vrik_pal sleeve={.L=-2,.cap_b=128,.count=3126};sleeve.frame=[record[@"frame"] unsignedIntValue];
+    for(unsigned k=0;k<128;k++)sleeve.orig[k]=aff_id();
+    int found=0;
+    for(NSDictionary *p in record[@"palettes"]) {
+        int list=[p[@"list"] intValue],count=[p[@"bones"] unsignedIntValue];
+        vrik_pal *target=NULL;
+        if([p[@"indices"] intValue]==3126 && count>=10) {target=&sleeve;found=1;}
+        else if(list>=0)target=&g_vk.pals[g_vk.npals++];
+        if(!target)continue;
+        target->L=list;target->nb=count;target->cap_b=128;target->frame=sleeve.frame;
+        target->obj=test_json_aff(p[@"object"],0);target->view=test_json_aff(p[@"view"],0);
+        for(unsigned k=0;k<count;k++)target->orig[k]=test_json_aff(p[@"original"],k*12);
+    }
+    const vrik_asset_profile *identity=vrik_asset_match(3126,UINT64_C(0xfb1cf43e99da8f8d));
+    assert(found && identity && (identity->kind&128));
+    const vrik_asset_profile *selected=vrik_body_select(&sleeve,identity);
+    assert(selected && selected->bones==12 && selected->body_names[7]==VRIK_RIGHTFOREARM);
+    // Removing the frame's anatomical references must refuse the ambiguous
+    // layout, even though the arena contains 128 readable matrices.
+    g_vk.npals=0;assert(!vrik_body_select(&sleeve,identity));
+    puts("device appearance: actual sleeve fingerprint resolves 12 versus 16 bones from named current joints; missing references refused: ok");
 }
 
 static void test_device_replays(void) {
@@ -1094,16 +1368,25 @@ static void test_support_consumers(void) {
 int main(void) { @autoreleasepool {
     setenv("VXMAC_JOY_HOLD", "1", 1);
     test_saved_shader_profiles();
+    test_index_readback_priority();
     test_palette_isolation();
-    test_render_dispatch();
+    test_render_dispatch(4096);
+    test_render_dispatch(12599);
+    test_render_dispatch(13594);
+    test_rigid_attachment();
+    test_full_range_melee();
     test_body_space();
+    test_holding_consumers();
+    test_named_partial_skin();
     test_palm_contacts();
     test_ammunition_parts();
     test_manual_slide_visual();
     test_asset_adapter();
+    test_melee_asset();
     test_geometry_cache();
     test_view_handedness();
     test_device_replays();
+    test_device_appearance();
     test_support_source_spaces();
     test_independent_support_sources();
     test_support_consumers();

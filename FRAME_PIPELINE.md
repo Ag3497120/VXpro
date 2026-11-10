@@ -86,7 +86,7 @@ xcodebuild -project VXMac/build/frame-pipeline-app/VXFramePipeline.xcodeproj -sc
   -configuration Release -destination generic/platform=visionOS -derivedDataPath VXMac/build/frame-pipeline-dd build
 ```
 
-Vision Pro検証アプリは `marimokodai.VXFramePipeline`（Frame Pipeline Test）。
+Vision Pro検証アプリは `com.example.VXFramePipeline`（Frame Pipeline Test）。
 ゲームと別のアプリで、結果を自分のDocumentsの `frame-pipeline-result-v1.json` へ保存する。
 結果は `tools/frame_pipeline_report.py` で検証する。実機試験の有無は取得済みの結果で区別する。
 MacのAddressSanitizerは本体のmainへ入る前の初期化で停止したため、ASan成功とは扱わない。
@@ -138,7 +138,7 @@ bash VXMac/tools/check_presenter_pipeline.sh
 ```
 
 実際の経路を使うM2検査用アプリの仕様は `tests/presenter_pipeline_app/project.yml`。
-これもゲームとは別のアプリで、既存の `marimokodai.VXFramePipeline` を更新する。
+これもゲームとは別のアプリで、既存の `com.example.VXFramePipeline` を更新する。
 実機結果のファイル名は `Documents/presenter-pipeline-result-v1.json`。
 
 新しいゲーム用ホストもビルドできた。画像描画ライブラリのコード・定数などのMach-O各セクションを

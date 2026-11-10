@@ -17,3 +17,14 @@ vertex PoseOutput pose_copy_vertex(PoseInput input [[stage_in]], uint vertex_ind
     return output;
 }
 fragment float4 pose_copy_color(PoseOutput input [[stage_in]]) { return input.color; }
+struct RigidInput {
+    float4 row0 [[attribute(0)]];
+    float4 row1 [[attribute(1)]];
+    float4 row2 [[attribute(2)]];
+};
+vertex PoseOutput pose_rigid_vertex(RigidInput input [[stage_in]],uint index [[vertex_id]]) {
+    const float2 triangle[3]={float2(-1,-1),float2(3,-1),float2(-1,3)};
+    PoseOutput output;output.position=float4(triangle[index],0,1);
+    output.color=float4(float(as_type<int>(input.row0.w))/131072.f,input.row1.y,input.row2.z,1);
+    return output;
+}

@@ -131,7 +131,12 @@ static int vrik_held_pose(vrik_pose_memory *memory, aff room_from_view, unsigned
 }
 
 static int vrik_weapon(void) { static int on = -1; if (on < 0) { const char *v = getenv("VXMAC_VRIK_WEAPON"); on = !(v && !strcmp(v, "0")); } return on; }
-static int vrik_on(void) { static int on = -1; if (on < 0) { const char *v = getenv("VXMAC_VRIK"); on = !(v && !strcmp(v, "0")); if (on) vxmac_log("VRIK: V's arms follow the hands (bone buffer, two-bone IK; VXMAC_VRIK=0 off)"); } return on; }
+static int vrik_on(void) {
+    static int on=-1;static int (*tracking)(void);static dispatch_once_t once;
+    if(on<0) {const char *v=getenv("VXMAC_VRIK");on=!(v && !strcmp(v,"0"));}
+    dispatch_once(&once,^{tracking=dlsym(RTLD_DEFAULT,"vx_xros_vr_tracking_enabled");});
+    return on && (!tracking || tracking());
+}
 static int vrik_joy_hold(void) {
     static int on = -1;
     if (on < 0) {
@@ -292,6 +297,7 @@ static int vrik_identify(const void *ib, NSUInteger io, NSUInteger count, uint32
 }
 
 // ---- persistent state: cross-palette arm/hand/finger solver + multi-pass safe palette cache -------------------------
+#include "../app/Sources/weapon_bridge.h"
 typedef struct { aff orig, mod; int seg; } vrik_known_bone;
 typedef struct { float at[3], fwd[3], up[3]; } vrik_grip_pose;
 enum { VRIK_SATARA_SHELL = 6, VRIK_SARATOGA_MAG, VRIK_CATALOG_AMMO, VRIK_RECEIVER = 32, VRIK_ASSET_BASE = 128 };
@@ -320,13 +326,31 @@ typedef struct {
     uint32_t cap_b, max_b, strict_rot, nb;
     const void *indices;
     NSUInteger index_offset, count;
-    int L, rig, applied, mod_k1, mod_k2, magazine, receiver, support_connected;
+    int L, rig, applied, mod_k1, mod_k2, magazine, receiver, support_connected, needs_held_identity;
     const vrik_asset_profile *asset;
+    const vrik_asset_profile *body_profile;
+    const vrik_asset_profile *body_identity;
     unsigned stamp, frame;
     aff obj, view, mod1, mod2;
     aff orig[128];
     aff posed[128];
 } vrik_pal;
+static int vrik_pal_name(const vrik_pal *pal,unsigned k) {
+    return pal->body_profile?pal->body_profile->body_names[k]:vrik_list[vrik_list_off[pal->L]+k];
+}
+static int vrik_named_skin_valid(const vrik_pal *pal) {
+    if(!pal->body_profile || pal->body_profile->bones>pal->cap_b)return 0;
+    int translated=0;
+    for(unsigned k=0;k<pal->body_profile->bones;k++) {
+        const float *m=pal->orig[k].m;
+        // An exact mesh identity supplies the length. Muscle/volume helper
+        // matrices may legitimately shear or collapse; they are not evidence
+        // that this palette ended after its first few rotational matrices.
+        for(int i=0;i<12;i++)if(!isfinite(m[i]) || fabsf(m[i])>32)return 0;
+        translated|=m[3]*m[3]+m[7]*m[7]+m[11]*m[11]>.12f;
+    }
+    return translated;
+}
 
 // Skin matrices include the mesh's own inverse bind transform. A bone name
 // alone cannot share a frozen matrix between the hand and its cyberware.
@@ -345,7 +369,9 @@ extern id vxmtl_command_buffer_for_encoder(id encoder);
 @public uint64_t capture_id;
     aff object;
     unsigned frame;
-    int sealed;
+    int sealed, posed, late;
+    NSUInteger indices;
+    unsigned kind;
     __weak id<MTLCommandBuffer> command;
     id<MTLBuffer> buffer;
 }
@@ -373,12 +399,22 @@ static void vrik_publish_palette(const vrik_pal *pal) {
     if (g_pose_buffers_frame != pal->frame) return;
     for (VXPoseCopy *entry in g_pose_buffers.allValues) {
         id<MTLCommandBuffer> cb = entry->command;
-        if (entry->capture_id != pal->capture_id || memcmp(&entry->object, &pal->obj, sizeof(aff)) || entry->frame != pal->frame ||
-            entry->sealed || !cb || cb.status >= MTLCommandBufferStatusCommitted) continue;
+        if (entry->capture_id != pal->capture_id || memcmp(&entry->object, &pal->obj, sizeof(aff)) || entry->frame != pal->frame) continue;
         size_t offset = (size_t)pal->mod_k1 * 48;
         size_t bytes = (size_t)(pal->mod_k2 - pal->mod_k1 + 1) * 48;
         if (offset > entry->buffer.length || bytes > entry->buffer.length - offset) continue;
+        if(entry->sealed || !cb || cb.status>=MTLCommandBufferStatusCommitted) {
+            static unsigned reports;
+            if(vrik_replay_enabled() && reports<24 && !entry->late &&
+               memcmp((uint8_t *)entry->buffer.contents+offset,pal->P+offset,bytes)) {
+                entry->late=1;reports++;
+                vxmac_log("VRIK late pose: frame=%u indices=%lu kind=%u submitted_pose=%d status=%lu",
+                          entry->frame,(unsigned long)entry->indices,entry->kind,entry->posed,(unsigned long)cb.status);
+            }
+            continue;
+        }
         memcpy((uint8_t *)entry->buffer.contents + offset, pal->P + (size_t)pal->mod_k1 * 48, bytes);
+        entry->posed=1;
     }
 }
 
@@ -463,6 +499,7 @@ static int vrik_bind_palette(id encoder, VXEncVM *vm, const uint8_t *top, size_t
         entry = [VXPoseCopy new];
         entry->capture_id = pal->capture_id; entry->object = pal->obj;
         entry->frame = frame; entry->command = cb; entry->buffer = copy;
+        entry->indices=pal->count;entry->kind=pal->asset?pal->asset->kind:pal->body_identity?128:0;
         g_pose_buffers[key] = entry;
         vrik_publish_palette(pal);
         atomic_fetch_add(&g_pose_copy_bytes, bone_bytes);
@@ -503,7 +540,7 @@ static int vrik_bind_palette(id encoder, VXEncVM *vm, const uint8_t *top, size_t
 
 static struct {
     unsigned solve_frame, capture_frame;
-    int capture_started, capture_body;
+    int capture_started, capture_body, hands_started;
     int have_af[2];   // 1 = true LeftArm/RightArm (SA) + LeftForeArm/RightForeArm (SF) captured in cur_frame
     int have_h[2];    // 1 = true LeftHand/RightHand (SH) captured in cur_frame
     aff SA[2], SF[2], SH[2], hand_ref[2];
@@ -575,7 +612,7 @@ static struct {
     } asset_grip;
     struct { int ready, count; float points[32][3]; } hand_shape[2];
     struct { int valid; aff hand, finger; } trigger_source;
-    struct { unsigned epoch; int valid[VRIK_NNAMES]; aff bone[VRIK_NNAMES]; } holding_pose;
+    struct { unsigned epoch, clock; vrik_support_shape shapes[32]; } holding_pose;
     unsigned reload_frame;
     int reload_priority;
     vrik_mag_drop dropped_mag;
@@ -605,6 +642,108 @@ static struct {
     int npals;
 } g_vk;
 static atomic_uint g_vk_supported_at;
+
+static int vrik_equipment_allows(const vrik_asset_profile *asset) {
+    static vx_weapon_snapshot (*snapshot)(void);
+    static vx_game_context (*context)(void);
+    static dispatch_once_t once;
+    dispatch_once(&once,^{snapshot=dlsym(RTLD_DEFAULT,"vx_weapon_bridge_snapshot");context=dlsym(RTLD_DEFAULT,"vx_weapon_bridge_context");});
+    if(!snapshot || !context)return 0;
+    vx_weapon_snapshot item=snapshot();vx_game_context game=context();
+    if(!item.known || !item.entity || !game.known || game.mounted || game.menu_open || game.scene_tier>1)return 0;
+    return (asset->kind&128) || ((asset->kind&64)?!item.ranged:item.ranged);
+}
+
+static int vrik_held_consumer(const vrik_pal *pal) {
+    if(!pal->needs_held_identity)return 1;
+    if(!g_vk.capture_body || g_vk.solve_frame!=pal->frame || g_vk.held.owner!=1)return 0;
+    if(pal->body_identity) {
+        float d[3]={pal->obj.m[3]-g_vk.obj.m[3],pal->obj.m[7]-g_vk.obj.m[7],pal->obj.m[11]-g_vk.obj.m[11]};
+        return v3len(d)<.04f && v3dot(pal->obj.m,g_vk.obj.m)>.995f && v3dot(pal->obj.m+4,g_vk.obj.m+4)>.995f;
+    }
+    if(!pal->asset || !g_vk.weapon_origin_valid || !vrik_equipment_allows(pal->asset))return 0;
+    const vrik_asset_profile *asset=pal->asset;
+    if(asset->root<0 || asset->root>=pal->nb)return 0;
+    aff root=aff_mul(pal->obj,pal->orig[asset->root]);
+    float point[3],hand[3],d[3];aff_pt(root.m,asset->root_at,point);
+    aff_pt(aff_inv(g_vk.vcam).m,g_vk.native_item_grip.at,hand);
+    for(int i=0;i<3;i++)d[i]=point[i]-hand[i];
+    return v3len(d)<.6f;
+}
+
+static unsigned vrik_consumer_span(VXEncVM *vm,const vrik_pal *pal) {
+    unsigned span=[objc_getAssociatedObject(vm->pipe,kSkinSpan) unsignedIntValue];
+    if(!span && (pal->body_identity || pal->asset))
+        span=[objc_getAssociatedObject(vm->pipe,kSkinByteInputs) unsignedIntValue];
+    return span;
+}
+
+static void vrik_binding_note(VXEncVM *vm,const vrik_pal *pal,NSUInteger bi,int bound) {
+    if(!vrik_replay_enabled() || (!pal->body_identity && !pal->asset))return;
+    static NSMutableSet *seen;
+    if(!seen)seen=[NSMutableSet set];
+    NSString *hash=objc_getAssociatedObject(vm->pipe,kHash) ?: @"unknown";
+    NSString *key=[NSString stringWithFormat:@"%@:%lu:%d:%d:%d",hash,(unsigned long)pal->count,
+                   vm->vp_fg,bound,pal->applied];
+    if(seen.count>=96 || [seen containsObject:key])return;
+    [seen addObject:key];
+    vxmac_log("VRIK consumer: shader=%s indices=%lu foreground=%d kind=%u named=%d span=%u base=%lu posed=%d bound=%d",
+              hash.UTF8String,(unsigned long)pal->count,vm->vp_fg,
+              pal->asset?pal->asset->kind:128,pal->body_profile!=NULL,
+              vrik_consumer_span(vm,pal),(unsigned long)bi,pal->applied,bound);
+}
+
+// Triangle identity does not distinguish clothing variants with different
+// skin layouts. Compare named source joints against other body consumers in
+// this frame. Do not interpret the unused tail of the skinning allocation.
+static const vrik_asset_profile *vrik_body_select(const vrik_pal *pal,const vrik_asset_profile *identity) {
+    const vrik_asset_profile *best=NULL;
+    unsigned first=vrik_asset_first(identity->count),variants=0;
+    for(unsigned i=first;i<VRIK_ASSET_COUNT && vrik_assets[i].count==identity->count;i++)
+        if(vrik_assets[i].hash==identity->hash && (vrik_assets[i].kind&128)) {variants++;best=&vrik_assets[i];}
+    if(variants==1) {
+        vrik_pal test=*pal;test.body_profile=best;
+        return vrik_named_skin_valid(&test)?best:NULL;
+    }
+    int best_score=-1,runner=-1,best_anchor=0;best=NULL;
+    for(unsigned i=first;i<VRIK_ASSET_COUNT && vrik_assets[i].count==identity->count;i++) {
+        const vrik_asset_profile *candidate=&vrik_assets[i];
+        if(candidate->hash!=identity->hash || !(candidate->kind&128))continue;
+        vrik_pal test=*pal;test.body_profile=candidate;
+        if(!vrik_named_skin_valid(&test))continue;
+        uint8_t matched[128]={0};int score=0,anchor=0;
+        for(int p=0;p<g_vk.npals;p++) {
+            const vrik_pal *reference=&g_vk.pals[p];
+            if(reference==pal || reference->frame!=pal->frame || reference->L<0 || !reference->nb || reference->body_identity)continue;
+            aff relative=aff_mul(aff_inv(reference->obj),pal->obj);
+            for(unsigned k=0;k<candidate->bones;k++)if(!matched[k]) {
+                aff source=aff_mul(relative,pal->orig[k]);
+                for(unsigned j=0;j<reference->nb;j++)if(vrik_pal_name(reference,j)==candidate->body_names[k]) {
+                    float error=0;
+                    for(int n=0;n<12;n++)error=fmaxf(error,fabsf(source.m[n]-reference->orig[j].m[n]));
+                    if(error<.025f) {
+                        matched[k]=1;score++;
+                        int name=candidate->body_names[k];
+                        if(error<.005f && (name==VRIK_LEFTFOREARM || name==VRIK_RIGHTFOREARM))anchor=1;
+                    }
+                    break;
+                }
+            }
+        }
+        if(score>best_score) {runner=best_score;best_score=score;best_anchor=anchor;best=candidate;}
+        else runner=MAX(runner,score);
+    }
+    return (best_score>=2 || best_anchor) && best_score>runner ? best : NULL;
+}
+
+static int vrik_body_resolve(vrik_pal *pal) {
+    if(!pal->body_identity)return 0;
+    const vrik_asset_profile *profile=vrik_body_select(pal,pal->body_identity);
+    if(!profile)return 0;
+    pal->body_profile=profile;pal->L=profile->body_list;pal->nb=profile->bones;
+    pal->rig=g_vk.rigv;pal->applied=0;
+    return 1;
+}
 
 // The commit hook closes publication under the same lock as the pose writer.
 // Checking MTLCommandBuffer.status alone leaves a check-to-commit race.
@@ -699,7 +838,7 @@ static void vrik_held_begin_frame(aff camera) {
         memset(g_vk.authored_grip, 0, sizeof g_vk.authored_grip);
         memset(&g_vk.asset_grip, 0, sizeof g_vk.asset_grip);
         memset(g_vk.hand_shape, 0, sizeof g_vk.hand_shape);
-        memset(g_vk.holding_pose.valid, 0, sizeof g_vk.holding_pose.valid);
+        memset(g_vk.holding_pose.shapes, 0, sizeof g_vk.holding_pose.shapes);
         g_vk.holding_pose.epoch = epoch;
         g_vk.trigger_source.valid = 0;
         g_vk.item_target_valid = 0;
@@ -1632,7 +1771,7 @@ static void vrik_capture_right_fingers(const vrik_pal *pal, uint32_t list) {
     if (!g_vk.have_h[1] || g_vk.gun_hand != 1 || g_vk.weap[6] != 2.f) return;
     int bH = -1;
     for (uint32_t k = 0; k < pal->nb; k++)
-        if (vrik_list[list + k] == VRIK_RIGHTHAND) { bH = (int)k; break; }
+        if (vrik_pal_name(pal,k) == VRIK_RIGHTHAND) { bH = (int)k; break; }
     aff hand = bH >= 0 ? pal->orig[bH] : g_vk.SH[1];
     const float *w = vrik_bindpos(g_vk.rigv, VRIK_RIGHTHAND);
     if (!w) return;
@@ -1644,7 +1783,7 @@ static void vrik_capture_right_fingers(const vrik_pal *pal, uint32_t list) {
     if (g_vk.right_grip_finger_rig != g_vk.rigv) g_vk.right_grip_fingers_valid = 0;
     g_vk.right_grip_finger_rig = g_vk.rigv;
     for (uint32_t k = 0; k < pal->nb; k++) {
-        int digit = vrik_grip_digit(1, vrik_list[list + k]);
+        int digit = vrik_grip_digit(1, vrik_pal_name(pal,k));
         if (digit < 0) continue;
         g_vk.right_grip_fingers[digit] = aff_mul(inverse, pal->orig[k]);
         g_vk.right_grip_fingers_valid |= 1u << digit;
@@ -1689,7 +1828,7 @@ static void vrik_finger_deltas(int side, const vrik_pal *pal, uint32_t o, const 
     int rigv = g_vk.rigv;
     int nH = side ? VRIK_RIGHTHAND : VRIK_LEFTHAND;
     int bH = -1;
-    for (uint32_t k = 0; k < pal->nb; k++) if (vrik_list[o + k] == nH) { bH = (int)k; break; }
+    for (uint32_t k = 0; k < pal->nb; k++) if (vrik_pal_name(pal,k) == nH) { bH = (int)k; break; }
     if (bH < 0 && !rest) return;
     const aff *hand = rest ? rest : &pal->orig[bH];
 
@@ -1720,7 +1859,7 @@ static void vrik_finger_deltas(int side, const vrik_pal *pal, uint32_t o, const 
     for (int f = 0; f < (trigger_only ? 1 : 4); f++) {
         int b1 = -1, b2 = -1, b3 = -1, m1a = -1, m1b = -1, m2a = -1;
         for (uint32_t k = 0; k < pal->nb; k++) {
-            int nm = vrik_list[o + k];
+            int nm = vrik_pal_name(pal,k);
             if      (nm == vrik_finger_bones[side][f][0]) b1  = (int)k;
             else if (nm == vrik_finger_bones[side][f][1]) b2  = (int)k;
             else if (nm == vrik_finger_bones[side][f][2]) b3  = (int)k;
@@ -1779,7 +1918,7 @@ static void vrik_finger_deltas(int side, const vrik_pal *pal, uint32_t o, const 
     const int *t_jnt = vrik_thumb_bones[side];
     int tb1 = -1, tb2 = -1, tm1 = -1, tm2 = -1, tm3 = -1;
     for (uint32_t k = 0; k < pal->nb; k++) {
-        int nm = vrik_list[o + k];
+        int nm = vrik_pal_name(pal,k);
         if      (nm == t_jnt[0]) tb1 = (int)k;
         else if (nm == t_jnt[1]) tb2 = (int)k;
         else if (nm == t_jnt[2]) tm1 = (int)k;
@@ -1886,7 +2025,7 @@ static void vrik_capture_hand_shape(int side, const vrik_pal *pal, uint32_t list
                                      const aff finger_delta[128]) {
     int wrist = -1;
     for (unsigned k = 0; k < pal->nb; k++)
-        if (vrik_list[list+k] == (side ? VRIK_RIGHTHAND : VRIK_LEFTHAND)) wrist = (int)k;
+        if (vrik_pal_name(pal,k) == (side ? VRIK_RIGHTHAND : VRIK_LEFTHAND)) wrist = (int)k;
     if (wrist < 0 || !g_vk.have_h[side]) return;
     vrik_grip_pose palm;
     if (!vrik_trigger_grip(side, pal->orig[wrist], &palm)) return;
@@ -1896,7 +2035,7 @@ static void vrik_capture_hand_shape(int side, const vrik_pal *pal, uint32_t list
     if (frozen && shape->ready) return;
     shape->count = 0;
     for (unsigned k = 0; k < pal->nb; k++) {
-        int name = vrik_list[list+k], digit = vrik_grip_digit(side,name);
+        int name = vrik_pal_name(pal,k), digit = vrik_grip_digit(side,name);
         if (digit < 0 || (digit < 24 ? digit % 6 >= 3 : digit >= 26)) continue;
         const float *bind = vrik_bindpos(g_vk.rigv,name);
         if (!bind || shape->count >= 32) continue;
@@ -1906,7 +2045,7 @@ static void vrik_capture_hand_shape(int side, const vrik_pal *pal, uint32_t list
     }
     shape->ready = shape->count >= 12;
     if (side && shape->ready && !g_vk.trigger_source.valid) {
-        for (unsigned k = 0; k < pal->nb; k++) if (vrik_list[list+k] == vrik_finger_bones[1][0][2]) {
+        for (unsigned k = 0; k < pal->nb; k++) if (vrik_pal_name(pal,k) == vrik_finger_bones[1][0][2]) {
             g_vk.trigger_source.hand = vrik_grip_basis(&palm);
             g_vk.trigger_source.finger = aff_mul(finger_delta[k],pal->orig[k]);
             g_vk.trigger_source.valid = 1;
@@ -1971,8 +2110,9 @@ static void vrik_asset_support(const vrik_asset_profile *asset, aff root, const 
 // rather than a newly animated body wrist, determines the native source grip.
 static int vrik_asset_latch(const vrik_pal *pal) {
     const vrik_asset_profile *asset = pal->asset;
-    if (!asset || !(asset->kind & 1) || asset->root < 0 || asset->trigger < 0 ||
-        asset->root >= pal->nb || asset->trigger >= pal->nb || !g_vk.trigger_source.valid ||
+    int melee=asset && (asset->kind&64);
+    if (!asset || !(asset->kind & (1|64)) || asset->root < 0 || (!melee && asset->trigger < 0) ||
+        asset->root >= pal->nb || (!melee && (asset->trigger >= pal->nb || !g_vk.trigger_source.valid)) ||
         g_vk.held.owner != 1 || !g_vk.held.right_grip_valid || !g_vk.capture_body ||
         g_vk.solve_frame != pal->frame) return 0;
     __typeof__(g_vk.weapon_frame) *frame = &g_vk.weapon_frame;
@@ -1989,6 +2129,7 @@ static int vrik_asset_latch(const vrik_pal *pal) {
     if (!vrik_is_rot(root_basis.m)) return 0;
     if (!binding->valid || binding->epoch != g_vk.held.epoch || binding->asset != asset->asset) {
         vrik_grip_pose authored = vrik_grip_in(aff_inv(g_vk.vcam),&g_vk.native_item_grip);
+        if(!melee) {
         const float *tip = vrik_bindpos(g_vk.rigv,vrik_finger_bones[1][0][2]);
         if (!tip) return 0;
         float finger[3], local[3], target_finger[3], trigger[3];
@@ -1997,6 +2138,7 @@ static int vrik_asset_latch(const vrik_pal *pal) {
         aff_pt(vrik_grip_basis(&authored).m,local,target_finger);
         aff_pt(aff_mul(pal->obj,pal->orig[asset->root]).m,asset->trigger_at,trigger);
         for (int i=0;i<3;i++) authored.at[i] += trigger[i]-target_finger[i];
+        }
         binding->in_root = aff_mul(aff_inv(root_basis),vrik_grip_basis(&authored));
         binding->asset = asset->asset; binding->epoch = g_vk.held.epoch;
         binding->count = (unsigned)pal->count; binding->valid = 1;
@@ -2016,7 +2158,7 @@ static int vrik_asset_latch(const vrik_pal *pal) {
     for (int i=0;i<3;i++) {frame->native_world.at[i]=native.m[4*i+3];frame->native_world.fwd[i]=native.m[4*i];frame->native_world.up[i]=native.m[4*i+1];}
     frame->frame = pal->frame;frame->epoch=g_vk.held.epoch;frame->valid=1;frame->asset=1;frame->count=(unsigned)pal->count;
     frame->support_valid=0;
-    vrik_asset_support(asset,root,&frame->native_world);
+    if(!melee)vrik_asset_support(asset,root,&frame->native_world);
     binding->revision++;
     return 1;
 }
@@ -2125,7 +2267,7 @@ static int vrik_magazine_match(const uint8_t *bytes, NSUInteger count, size_t wi
         static struct { uint64_t hash; NSUInteger count; } seen[96];static unsigned used;
         pthread_mutex_lock(&lock);
         unsigned i=0;while(i<used && (seen[i].hash!=hash || seen[i].count!=count))i++;
-        if(i==used && used<96) {
+        if(i==used && used<96 && (asset || used<16)) {
             seen[used].hash=hash;seen[used++].count=count;
             vxmac_log("VRIK fingerprint: indices=%lu hash=%016llx asset=%u width=%zu",(unsigned long)count,
                       (unsigned long long)hash,asset?asset->asset:0,width);
@@ -2142,7 +2284,7 @@ static int vrik_magazine_match(const uint8_t *bytes, NSUInteger count, size_t wi
 
 // Resolve private index buffers with an asynchronous, bounded Metal copy.
 // Draw encoding never waits for this lookup and unknown geometry is unchanged.
-static int vrik_magazine_mesh(id<MTLBuffer> indices, NSUInteger offset, NSUInteger count, MTLIndexType type) {
+static int vrik_magazine_mesh(id<MTLBuffer> indices, NSUInteger offset, NSUInteger count, MTLIndexType type,int foreground) {
     unsigned first = vrik_asset_first(count);
     int candidate = first < VRIK_ASSET_COUNT && vrik_assets[first].count == count;
     for (unsigned i = 0; i < sizeof vrik_magazines / sizeof vrik_magazines[0]; i++)
@@ -2159,7 +2301,7 @@ static int vrik_magazine_mesh(id<MTLBuffer> indices, NSUInteger offset, NSUInteg
     } lookup;
     static lookup cache[256];
     static id<MTLCommandQueue> queue;
-    static unsigned last_copy_frame = UINT32_MAX, pending_copies;
+    static unsigned last_copy_frame[2] = {UINT32_MAX,UINT32_MAX}, pending_copies;
     unsigned frame = atomic_load(&g_frame);
     uint64_t address = indices.gpuAddress;
     lookup *slot = NULL;
@@ -2179,7 +2321,12 @@ static int vrik_magazine_mesh(id<MTLBuffer> indices, NSUInteger offset, NSUInteg
         *slot = (lookup){address, offset, count, width, frame, frame, 2, mesh, 0};
         return mesh;
     }
-    if (indices.storageMode != MTLStorageModePrivate || last_copy_frame == frame || pending_copies >= 2) return 0;
+    // Early scenery must not consume the only readback slot before the
+    // visible hands/sleeves reach this encoder. Keep a foreground budget and
+    // one pending slot available without increasing the total in-flight cap.
+    unsigned priority=!!foreground;
+    if (indices.storageMode != MTLStorageModePrivate || last_copy_frame[priority] == frame ||
+        pending_copies >= 2 || (!foreground && pending_copies)) return 0;
     NSUInteger copy_start = offset & ~(NSUInteger)3;
     NSUInteger skip = offset - copy_start;
     NSUInteger copy_size = (skip + count * width + 3) & ~(NSUInteger)3;
@@ -2193,7 +2340,7 @@ static int vrik_magazine_mesh(id<MTLBuffer> indices, NSUInteger offset, NSUInteg
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
     if (!blit) return 0;
-    last_copy_frame = frame;
+    last_copy_frame[priority] = frame;
     pending_copies++;
     unsigned attempts = slot->address == address && slot->offset == offset && slot->count == count ? slot->attempts : 0;
     *slot = (lookup){address, offset, count, width, frame, frame, attempts + 1, 0, 1};
@@ -2454,11 +2601,10 @@ static int vrik_support_arm(const vrik_pal *pal, const aff *hand,
     const aff *upper=g_vk.have_af[0] ? &g_vk.SA[0] : NULL;
     const aff *fore=g_vk.have_af[0] ? &g_vk.SF[0] : NULL;
     int own_upper=0;
-    unsigned offset=vrik_list_off[pal->L];
     for (unsigned k=0;k<pal->nb;k++) {
-        if (vrik_list[offset+k]==VRIK_LEFTARM) {upper=&pal->orig[k];own_upper=2;}
-        else if (vrik_list[offset+k]==VRIK_L_SHL_0_JNT && own_upper<2) {upper=&pal->orig[k];own_upper=1;}
-        if (vrik_list[offset+k]==VRIK_LEFTFOREARM) fore=&pal->orig[k];
+        if (vrik_pal_name(pal,k)==VRIK_LEFTARM) {upper=&pal->orig[k];own_upper=2;}
+        else if (vrik_pal_name(pal,k)==VRIK_L_SHL_0_JNT && own_upper<2) {upper=&pal->orig[k];own_upper=1;}
+        if (vrik_pal_name(pal,k)==VRIK_LEFTFOREARM) fore=&pal->orig[k];
     }
     if (!upper || !fore || !vrik_is_rot(upper->m) || !vrik_is_rot(fore->m) || !vrik_is_rot(hand->m)) return 0;
     float S[3],E[3],W[3],end[3],wrist[3];
@@ -2495,28 +2641,32 @@ static int vrik_support_arm(const vrik_pal *pal, const aff *hand,
     return 1;
 }
 
-static vrik_support_shape *vrik_support_shape_for(const vrik_pal *pal) {
-    vrik_support_shape *oldest=&g_vk.support_pose.shapes[0];
-    unsigned clock=++g_vk.support_pose.clock;
+static vrik_support_shape *vrik_consumer_shape(vrik_support_shape shapes[32],unsigned generation,
+                                              unsigned clock,const vrik_pal *pal) {
+    vrik_support_shape *oldest=&shapes[0];
     for (unsigned i=0;i<32;i++) {
-        vrik_support_shape *shape=&g_vk.support_pose.shapes[i];
-        if (shape->bones && shape->generation==g_vk.support_pose.generation &&
+        vrik_support_shape *shape=&shapes[i];
+        if (shape->bones && shape->generation==generation &&
             shape->indices==pal->indices && shape->offset==pal->index_offset &&
             shape->count==pal->count && shape->list==pal->L && shape->rig==pal->rig && shape->bones==pal->nb) {
             shape->touch=clock;return shape;
         }
-        if (!shape->bones || shape->generation!=g_vk.support_pose.generation) oldest=shape;
-        else if (oldest->bones && oldest->generation==g_vk.support_pose.generation && shape->touch<oldest->touch) oldest=shape;
+        if (!shape->bones || shape->generation!=generation) oldest=shape;
+        else if (oldest->bones && oldest->generation==generation && shape->touch<oldest->touch) oldest=shape;
     }
     oldest->indices=pal->indices;oldest->offset=pal->index_offset;oldest->count=pal->count;
     oldest->list=pal->L;oldest->rig=pal->rig;oldest->bones=0;
-    oldest->generation=g_vk.support_pose.generation;oldest->touch=clock;
+    oldest->generation=generation;oldest->touch=clock;
     memset(oldest->valid,0,sizeof oldest->valid);
     return oldest;
+}
+static vrik_support_shape *vrik_support_shape_for(const vrik_pal *pal) {
+    return vrik_consumer_shape(g_vk.support_pose.shapes,g_vk.support_pose.generation,++g_vk.support_pose.clock,pal);
 }
 
 static void vrik_apply_pal_pose(vrik_pal *pal) {
     if (pal->nb == 0 || pal->nb > pal->cap_b) return;
+    if(!vrik_held_consumer(pal))return;
     pal->support_connected=0;
     if (pal->L >= 0 && g_vk.capture_body && pal->rig == g_vk.rigv &&
         memcmp(&pal->obj, &g_vk.obj, sizeof(aff))) {
@@ -2553,10 +2703,10 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
             arm_from_room = aff_inv(room_from_arm);
             if (target_valid) room_grip = aff_mul(g_vk.held.room_from_view, vrik_grip_basis(&target));
         }
-        uint32_t o = vrik_list_off[pal->L];
+        uint32_t o = pal->L<VRIK_NLISTS?vrik_list_off[pal->L]:0;
         int has_l_fng = 0, has_r_fng = 0, left_wrist = -1, right_wrist = -1, held_wrist = -1;
         for (uint32_t k = 0; k < pal->nb; k++) {
-            int nm = vrik_list[o + k];
+            int nm = vrik_pal_name(pal,k);
             if (nm == VRIK_LEFTHANDINDEX1)  has_l_fng = 1;
             if (nm == VRIK_RIGHTHANDINDEX1) has_r_fng = 1;
             if (nm == VRIK_LEFTHAND) left_wrist = (int)k;
@@ -2642,6 +2792,11 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
             if (has_r_fng) vrik_capture_hand_shape(1,pal,o,M_fng_r);
         }
         vrik_support_shape *support_shape=NULL;
+        vrik_support_shape *holding_shape=NULL;
+        if(place_hand && held_owner==1 && g_vk.hand_shape[1].ready) {
+            holding_shape=vrik_consumer_shape(g_vk.holding_pose.shapes,g_vk.held.epoch,++g_vk.holding_pose.clock,pal);
+            holding_shape->bones=pal->nb;
+        }
         if (keep_support_pose) {
             support_shape=vrik_support_shape_for(pal);
             if (!support_shape->bones) {
@@ -2657,7 +2812,7 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
         }
         int k1 = -1, k2 = -1;
         for (uint32_t k = 0; k < pal->nb; k++) {
-            int nm = vrik_list[o + k], s = vrik_seg[nm];
+            int nm = vrik_pal_name(pal,k), s = vrik_seg[nm];
             aff *dst = (aff *)(pal->P + (size_t)k * 48);
             int hold_bone = hold_arm && vrik_held_bone(held_owner, nm, s);
             int support_bone=place_support && vrik_held_bone(0,nm,s);
@@ -2711,18 +2866,20 @@ static void vrik_apply_pal_pose(vrik_pal *pal) {
                         aff original = pal->orig[k];
                         if (live_arm && s == 6 && has_r_fng) original = aff_mul(M_fng_r[k], original);
                         else if (live_arm && s == 3 && has_l_fng) original = aff_mul(M_fng_l[k], original);
-                        if (held_owner == 1 && g_vk.hand_shape[1].ready) {
-                            if (!g_vk.holding_pose.valid[nm]) {
-                                g_vk.holding_pose.bone[nm] = aff_mul(aff_inv(vrik_grip_basis(&source_grip)),original);
-                                g_vk.holding_pose.valid[nm] = 1;
+                        if (holding_shape) {
+                            if (!holding_shape->valid[k]) {
+                                holding_shape->in_hand[k] = aff_mul(aff_inv(vrik_grip_basis(&source_grip)),original);
+                                holding_shape->valid[k] = 1;
                             }
                             aff target_basis = aff_mul(grip_delta,vrik_grip_basis(&source_grip));
-                            posed = aff_mul(target_basis,g_vk.holding_pose.bone[nm]);
+                            posed = aff_mul(target_basis,holding_shape->in_hand[k]);
                             int digit = vrik_grip_digit(1,nm);
+                            int index_bone=-1;
+                            for(unsigned j=0;j<pal->nb;j++)if(vrik_pal_name(pal,j)==VRIK_RIGHTHANDINDEX1)index_bone=(int)j;
                             if (digit >= 0 && digit < 6 && ((unsigned)g_vk.weap[5] & VRIK_BTN_R_TRIG) &&
-                                g_vk.holding_pose.valid[VRIK_RIGHTHANDINDEX1]) {
+                                index_bone>=0 && holding_shape->valid[index_bone]) {
                                 float pivot[3],axis[3];
-                                aff index = aff_mul(target_basis,g_vk.holding_pose.bone[VRIK_RIGHTHANDINDEX1]);
+                                aff index = aff_mul(target_basis,holding_shape->in_hand[index_bone]);
                                 aff_pt(index.m,vrik_bindpos(g_vk.rigv,VRIK_RIGHTHANDINDEX1),pivot);
                                 for (int i=0;i<3;i++) axis[i]=target_basis.m[4*i+1];
                                 posed=aff_mul(aff_rot(axis,.12f,pivot),posed);
@@ -2975,6 +3132,118 @@ static int vrik_instance(VXEncVM *vm, NSArray *isd_i, NSUInteger bi, uint32_t is
     return 1;
 }
 
+static void vrik_route_note(VXEncVM *vm,NSUInteger count,NSUInteger bi) {
+    if(!vrik_replay_enabled())return;
+    NSArray *skin=objc_getAssociatedObject(vm->pipe,kISD);
+    unsigned span=[objc_getAssociatedObject(vm->pipe,kSkinSpan) unsignedIntValue];
+    int melee=0;
+    for(unsigned i=vrik_asset_first(count);i<VRIK_ASSET_COUNT && vrik_assets[i].count==count;i++)
+        if(vrik_assets[i].kind&64) {melee=1;break;}
+    if(!melee && !(vm->vp_fg && skin && !span))return;
+    NSString *hash=objc_getAssociatedObject(vm->pipe,kHash) ?: @"unknown";
+    static NSMutableSet *seen;static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+    NSString *key=[NSString stringWithFormat:@"%@:%lu:%d",hash,count,vm->vp_fg];
+    pthread_mutex_lock(&lock);
+    if(!seen)seen=[NSMutableSet set];
+    int fresh=seen.count<128 && ![seen containsObject:key];
+    if(fresh)[seen addObject:key];
+    pthread_mutex_unlock(&lock);
+    if(!fresh)return;
+    uint32_t isd[4]={0};float transform[12]={0};
+    int valid=skin && vrik_instance(vm,skin,bi,isd,transform);
+    float scales[3]={0};for(int r=0;r<3;r++)for(int c=0;c<3;c++)scales[r]+=transform[r*4+c]*transform[r*4+c];
+    vxmac_log("VRIK route: shader=%s indices=%lu foreground=%d melee_count=%d skin=%d stride=%u span=%u instance=%d rigid_layout=%d scales=%.5f/%.5f/%.5f",
+              hash.UTF8String,(unsigned long)count,vm->vp_fg,melee,!!skin,isd[1],span,valid,
+              objc_getAssociatedObject(vm->pipe,kRigidInstance)!=nil,scales[0],scales[1],scales[2]);
+    // Keep only a few private shader contracts for offline inspection. No
+    // vertex/index data or complete allocation arenas are exported.
+    NSData *library=objc_getAssociatedObject(vm->pipe,kLibData);
+    static unsigned saved;static NSUInteger bytes;
+    pthread_mutex_lock(&lock);
+    int keep=library.length && library.length<=2*1024*1024 && saved<16 && bytes+library.length<=8*1024*1024;
+    if(keep){saved++;bytes+=library.length;}
+    pthread_mutex_unlock(&lock);
+    if(keep)dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{@autoreleasepool{
+        NSString *docs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
+        NSString *dir=[docs stringByAppendingPathComponent:@"vxvs_routes"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        [library writeToFile:[dir stringByAppendingPathComponent:[hash stringByAppendingString:@".metallib"]] atomically:YES];
+    }});
+}
+
+static int vrik_rigid_transform(id e,VXEncVM *vm,NSUInteger count,NSUInteger bi,id ib,NSUInteger io,MTLIndexType it) {
+    NSArray *layout=objc_getAssociatedObject(vm->pipe,kRigidInstance);
+    if(!layout || !vm->vp_fg || !vrik_joy_hold())return 0;
+    NSUInteger binding=[layout[0] unsignedIntegerValue],offset=[layout[1] unsignedIntegerValue];
+    NSUInteger stride=[layout[2] unsignedIntegerValue],step=[layout[3] unsignedIntegerValue],rate=[layout[4] unsignedIntegerValue];
+    int dynamic=stride==MTLBufferLayoutStrideDynamic;if(binding>=31 || binding==2)return 0;
+    if(dynamic)stride=vm->vst[binding];
+    if(step!=MTLVertexStepFunctionPerInstance && step!=MTLVertexStepFunctionConstant)return 0;
+    NSUInteger extent=MAX(offset+48,[layout[5] unsignedIntegerValue]);
+    if(step==MTLVertexStepFunctionConstant)stride=MAX(stride,extent);
+    if(!stride || extent>stride)return 0;
+    NSUInteger element=step==MTLVertexStepFunctionConstant?0:bi/(rate?rate:1);
+    if(element>=256*1024/stride)return 0;
+    size_t bytes=(element+1)*stride;
+    NSData *data=vm->vbytes[@(binding)];const uint8_t *source=data.bytes;size_t size=data.length;
+    id<MTLBuffer> vertex=vm->vbuf[binding];
+    if(!source && vertex && vertex.storageMode==MTLStorageModeShared && vm->voff[binding]<vertex.length) {
+        source=(const uint8_t *)vertex.contents+vm->voff[binding];size=vertex.length-vm->voff[binding];
+    }
+    const uint8_t *top=vm->bytes.bytes;size_t top_size=vm->bytes.length;
+    if(!top && vm->original && vm->original.storageMode==MTLStorageModeShared && vm->offset<vm->original.length) {
+        top=(const uint8_t *)vm->original.contents+vm->offset;top_size=vm->original.length-vm->offset;
+    }
+    if(!source || bytes>size || !top || top_size<8)return 0;
+    const uint8_t *view=NULL;uint64_t address,available,base;
+    pthread_mutex_lock(&g_brl);
+    memcpy(&address,top,8);const uint8_t *descriptor=buf_at(address,&available,&base);
+    if(descriptor && available>=32) {
+        memcpy(&address,descriptor+24,8);const uint8_t *v=buf_at(address,&available,&base);
+        if(v && available>=640)view=v;
+    }
+    pthread_mutex_unlock(&g_brl);
+    aff object;if(!view || !vrik_object((const float *)(source+element*stride+offset),view,&object))return 0;
+    pthread_mutex_lock(&g_vk_l);
+    unsigned frame=atomic_load(&g_frame);
+    int attached=0;
+    if(g_vk.held.owner==1 && g_vk.capture_frame==frame && vrik_latch_weapon_frame()) {
+        int part=vrik_magazine_mesh(ib,io,count,it,vm->vp_fg);
+        // A known attachment, or an exact instance shared with an identified
+        // receiver, is necessary. Nearby scenery never inherits the gun pose.
+        attached=part>=VRIK_ASSET_BASE && !(vrik_assets[part-VRIK_ASSET_BASE].kind&128);
+        if(attached && (vrik_assets[part-VRIK_ASSET_BASE].kind&64)) {
+            // Rigid melee LODs have no palette; bind their object root using
+            // the same authored-hand relation as a one-bone melee model.
+            vrik_asset_profile asset=vrik_assets[part-VRIK_ASSET_BASE];asset.root=0;
+            vrik_pal item={.asset=&asset,.nb=1,.obj=object,.view=g_vk.vcam,.frame=frame,.count=count};
+            item.orig[0]=aff_id();vrik_asset_latch(&item);
+        }
+        for(int i=0;!attached && i<g_vk.npals;i++) {
+            const vrik_pal *pal=&g_vk.pals[i];
+            if(pal->frame==frame && (pal->receiver || (pal->asset && (pal->asset->kind&1))) &&
+               !memcmp(&object,&pal->obj,sizeof object))attached=1;
+        }
+    }
+    aff posed=attached?aff_mul(g_vk.weapon_frame.world_delta,object):object;
+    pthread_mutex_unlock(&g_vk_l);
+    if(!attached)return 0;
+    float encoded[12];int32_t camera[3];memcpy(camera,view+608,12);
+    for(int r=0;r<3;r++) {
+        for(int c=0;c<3;c++)encoded[r*4+c]=posed.m[r*4+c];
+        double position=round((double)posed.m[r*4+3]*131072.0)+(double)camera[r];
+        if(!isfinite(position) || position<INT32_MIN || position>INT32_MAX)return 0;
+        int32_t fixed=(int32_t)position;memcpy(encoded+r*4+3,&fixed,4);
+    }
+    id<MTLBuffer> copy=[[e device] newBufferWithBytes:source length:bytes options:MTLResourceStorageModeShared];
+    if(!copy || !vxmtl_retain_for_encoder(e,copy))return 0;
+    memcpy((uint8_t *)copy.contents+element*stride+offset,encoded,48);
+    if(dynamic)o_svbs(e,@selector(setVertexBuffer:offset:attributeStride:atIndex:),copy,0,vm->vst[binding],binding);
+    else o_svb2(e,@selector(setVertexBuffer:offset:atIndex:),copy,0,binding);
+    vm->pose_bound=1;vm->pose_instance=binding;vm->pose_instance_dynamic=dynamic;vm->pose_rebase=0;
+    return 1;
+}
+
 static void vrik_apply(id e, NSUInteger count, NSUInteger instances, NSUInteger bi, id ib, NSUInteger io, MTLIndexType it) {
     VXEncVM *vm = objc_getAssociatedObject(e, kEncVM);
     if (vm && vm->pose_bound) {
@@ -2989,13 +3258,26 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger instances, NSUInteger 
         else o_svb2(e, @selector(setVertexBuffer:offset:atIndex:), vm->vbuf[binding], vm->voff[binding], binding);
         vm->pose_bound = vm->pose_rebase = 0;
     }
-    if (!vrik_on() || !vm || !vm->vp_fg || !vm->pipe) return;
+    if (!vrik_on() || !vm || !vm->pipe) return;
+    vrik_route_note(vm,count,bi);
     if (instances != 1) { atomic_fetch_add(&g_pose_skipped, 1); return; }
+    int outside_part=0;
+    if(!vm->vp_fg) {
+        // The actual crowbar colour/depth draws use the full scene depth
+        // range. Viewport compression is not a first-person identity.
+        int candidate=0;
+        for(unsigned i=vrik_asset_first(count);i<VRIK_ASSET_COUNT && vrik_assets[i].count==count;i++)
+            if(vrik_assets[i].kind&(1|32|64|128)){candidate=1;break;}
+        if(!candidate)return;
+    }
     NSArray *isd_i = objc_getAssociatedObject(vm->pipe, kISD);
+    if(isd_i && !objc_getAssociatedObject(vm->pipe,kSkinSpan) && !objc_getAssociatedObject(vm->pipe,kSkinByteInputs) &&
+       vrik_rigid_transform(e,vm,count,bi,ib,io,it))return;
     if (!isd_i) {
+        if(vrik_rigid_transform(e,vm,count,bi,ib,io,it))return;
         if (vrik_replay_enabled()) {
             pthread_mutex_lock(&g_vk_l);
-            int part=vrik_magazine_mesh(ib,io,count,it);
+            int part=vrik_magazine_mesh(ib,io,count,it,vm->vp_fg);
             static NSMutableSet *seen;
             if (!seen) seen=[NSMutableSet set];
             NSString *key=[NSString stringWithFormat:@"%@:%lu",objc_getAssociatedObject(vm->pipe,kHash),(unsigned long)count];
@@ -3009,7 +3291,13 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger instances, NSUInteger 
         return;
     }
     uint32_t isd[4]; float itf[12];
-    if (!vrik_instance(vm, isd_i, bi, isd, itf) || isd[1] != 48) return;
+    if (!vrik_instance(vm, isd_i, bi, isd, itf)) return;
+    if(isd[1]!=48) {
+        // Single-joint/rigid material variants need no palette rebasing. Use
+        // the reflected object transform only for an identified held part.
+        vrik_rigid_transform(e,vm,count,bi,ib,io,it);
+        return;
+    }
     const uint8_t *tl = NULL; size_t n = 0;
     if (vm->bytes) { tl = vm->bytes.bytes; n = vm->bytes.length; }
     else if (vm->original && vm->original.storageMode == MTLStorageModeShared && vm->offset < vm->original.length) { tl = (const uint8_t *)vm->original.contents + vm->offset; n = vm->original.length - vm->offset; }
@@ -3029,19 +3317,36 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger instances, NSUInteger 
     aff obj; if (!vrik_object(itf, viewc, &obj)) return;
     aff vcam = *(const aff *)(viewc + 384);
     if (!vrik_is_rot(vcam.m)) return;
+    if(!vm->vp_fg) {
+        aff local=aff_mul(vcam,obj);
+        if(v3len((float[3]){local.m[3],local.m[7],local.m[11]})>2.f)return;
+    }
 
     pthread_mutex_lock(&g_vk_l);
+    if(!vm->vp_fg) {
+        // Only read back an outside-depth identity after the instance has
+        // passed the near-player source-space check above.
+        outside_part=vrik_magazine_mesh(ib,io,count,it,0);
+        if(outside_part<VRIK_ASSET_BASE || !vrik_equipment_allows(&vrik_assets[outside_part-VRIK_ASSET_BASE])) {
+            pthread_mutex_unlock(&g_vk_l);return;
+        }
+    }
     unsigned seq = ++g_vk.call_seq;
     unsigned cur_frame = atomic_load(&g_frame);
     if (!g_vk.capture_started || g_vk.capture_frame != cur_frame) {
         // Never combine a new frame's arm with a wrist from a previous animation or loading screen.
-        g_vk.capture_started = 1; g_vk.capture_frame = cur_frame; g_vk.capture_body = 0;
+        g_vk.capture_started = 1; g_vk.capture_frame = cur_frame; g_vk.capture_body = 0;g_vk.hands_started=0;
         memset(g_vk.have_af, 0, sizeof g_vk.have_af);
         memset(g_vk.have_h, 0, sizeof g_vk.have_h);
         g_vk.hand_ref_mask = 0;
         g_vk.weapon_frame.valid = 0;
         g_vk.nknown = 0;
-        vrik_held_begin_frame(vcam);
+        g_vk.held.owner=-1;
+    }
+    // A world/shadow pass cannot establish the headset's reference camera.
+    // Known early consumers wait in private copies for this foreground solve.
+    if(vm->vp_fg && !g_vk.hands_started && !g_vk.capture_body) {
+        vrik_held_begin_frame(vcam);g_vk.hands_started=1;
     }
 
     // Geometry identity is part of the key: different meshes can share a
@@ -3074,27 +3379,47 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger instances, NSUInteger 
     pal->indices = (__bridge const void *)ib;
     pal->index_offset = io;
     pal->count = count;
-    int part = vrik_joy_hold() ? vrik_magazine_mesh(ib, io, count, it) : 0;
-    pal->asset = part >= VRIK_ASSET_BASE ? &vrik_assets[part - VRIK_ASSET_BASE] : NULL;
+    pal->needs_held_identity=!vm->vp_fg;
+    int part = outside_part ? outside_part : vrik_joy_hold() ? vrik_magazine_mesh(ib, io, count, it,vm->vp_fg) : 0;
+    const vrik_asset_profile *identified=part>=VRIK_ASSET_BASE?&vrik_assets[part-VRIK_ASSET_BASE]:NULL;
+    pal->body_identity=identified && (identified->kind&128)?identified:NULL;
+    pal->body_profile=pal->body_identity?vrik_body_select(pal,pal->body_identity):NULL;
+    pal->asset = pal->body_identity?NULL:identified;
     pal->magazine = pal->asset ? ((pal->asset->kind & 2) ? VRIK_CATALOG_AMMO : 0) : part < VRIK_RECEIVER ? part : 0;
-    pal->receiver = !pal->asset && part >= VRIK_RECEIVER ? part : 0;
+    pal->receiver = !identified && part >= VRIK_RECEIVER ? part : 0;
 
     // Identify using the guaranteed-unmodified pal->orig matrices
     const vrik_item_grip *known_weapon = g_vk.held.owner >= 0 ? vrik_item_slot(pal, 0) : NULL;
     int held_weapon = known_weapon && known_weapon->samples >= 3;
-    int rigv = 0, L = pal->asset || pal->magazine || pal->receiver || held_weapon ? -1 :
+    int rigv = 0, L = pal->body_identity ? -2 : pal->asset || pal->magazine || pal->receiver || held_weapon ? -1 :
         vrik_identify((__bridge const void *)ib, io, count, isd[0], (const uint8_t *)pal->orig, pal->cap_b, pal->max_b, pal->strict_rot, &rigv);
+    if(pal->body_profile && pal->body_profile->bones<=pal->cap_b) {
+        if(vrik_named_skin_valid(pal)) {L=pal->body_profile->body_list;rigv=g_vk.capture_body?g_vk.rigv:g_vk.held.rig;}
+        else L=-2;
+    }
+    if(pal->body_identity && L<0) {
+        // Reserve this draw's private binding now. A later body draw can
+        // resolve its named layout and publish into the unsubmitted copy.
+        pal->L=-2;pal->nb=0;
+        int bound=vrik_bind_palette(e,vm,tl,n,t,table_bytes,pal,isd_i,bi,
+                                    vrik_consumer_span(vm,pal));
+        vrik_binding_note(vm,pal,bi,bound);
+        pthread_mutex_unlock(&g_vk_l);return;
+    }
 
     int pose_changed = 0;
-    if (L >= 0) {
-        uint32_t o = vrik_list_off[L], nb = vrik_list_off[L + 1] - o;
+    if(L>=0 && !vm->vp_fg) {
+        pal->L=L;pal->nb=pal->body_profile->bones;pal->rig=rigv;pal->applied=0;
+    } else if (L >= 0) {
+        uint32_t o = L<VRIK_NLISTS?vrik_list_off[L]:0;
+        uint32_t nb=pal->body_profile?pal->body_profile->bones:vrik_list_off[L+1]-o;
         if (nb > 128) nb = 128;
         if (nb <= pal->cap_b) {
             if (pal->max_b < nb) pal->max_b = nb;
             aff o2v = aff_mul(vcam, obj);
             int near_cam = 0;
             for (uint32_t k = 0; k < nb; k++) {
-                int nm = vrik_list[o + k]; if (vrik_seg[nm] <= 0) continue;
+                int nm = pal->body_profile?pal->body_profile->body_names[k]:vrik_list[o+k]; if (vrik_seg[nm] <= 0) continue;
                 const float *c = vrik_bindpos(rigv, nm); if (!c) continue;
                 float pt[3], pv[3]; aff_pt(pal->orig[k].m, c, pt); aff_pt(o2v.m, pt, pv);
                 if (v3len(pv) < 1.0f) { near_cam = 1; break; }
@@ -3111,7 +3436,7 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger instances, NSUInteger 
                 aff canonical[128];
                 aff body_from_pal = g_vk.capture_body ? aff_mul(aff_inv(g_vk.obj), obj) : aff_id();
                 for (unsigned k = 0; k < nb; k++) canonical[k] = aff_mul(body_from_pal, pal->orig[k]);
-                #define BONE(nm) ({ int _b = -1; for (uint32_t _k = 0; _k < nb; _k++) if (vrik_list[o + _k] == (nm)) { _b = (int)_k; break; } _b; })
+                #define BONE(nm) ({ int _b = -1; for (uint32_t _k = 0; _k < nb; _k++) if (vrik_pal_name(pal,_k) == (nm)) { _b = (int)_k; break; } _b; })
                 for (int side = 0; side < 2; side++) {
                     int bA = BONE(side ? VRIK_RIGHTARM : VRIK_LEFTARM);
                     if (bA < 0) bA = BONE(side ? VRIK_R_SHL_0_JNT : VRIK_L_SHL_0_JNT);
@@ -3209,6 +3534,7 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger instances, NSUInteger 
         // Only revisit palettes observed in this frame. Old shared storage may already be reused.
         for (int i = 0; i < g_vk.npals; i++) {
             vrik_pal *p = &g_vk.pals[i];
+            if(p->frame==cur_frame && p->body_identity)vrik_body_resolve(p);
             if (p->L >= 0 && p->frame == cur_frame) vrik_apply_pal(p);
         }
         for (int i = 0; i < g_vk.npals; i++) {
@@ -3228,9 +3554,17 @@ static void vrik_apply(id e, NSUInteger count, NSUInteger instances, NSUInteger 
     }
     if (pal->L != -2) {
         if (!pal->applied) atomic_fetch_add(&g_pose_unposed, 1);
-        else if (vrik_bind_palette(e, vm, tl, n, t, table_bytes, pal, isd_i, bi,
-                                  [objc_getAssociatedObject(vm->pipe, kSkinSpan) unsignedIntValue])) atomic_fetch_add(&g_pose_bound, 1);
-        else atomic_fetch_add(&g_pose_skipped, 1);
+        int reserve=pal->L>=0 || pal->body_identity || pal->asset;
+        if(pal->applied || reserve) {
+            int bound=vrik_bind_palette(e,vm,tl,n,t,table_bytes,pal,isd_i,bi,vrik_consumer_span(vm,pal));
+            vrik_binding_note(vm,pal,bi,bound);
+            if(bound)
+                atomic_fetch_add(&g_pose_bound,1);
+            else {
+                atomic_fetch_add(&g_pose_skipped,1);
+                if(pal->asset)vrik_rigid_transform(e,vm,count,bi,ib,io,it);
+            }
+        }
     }
     vrik_capture_replay();
     pthread_mutex_unlock(&g_vk_l);

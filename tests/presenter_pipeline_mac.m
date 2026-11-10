@@ -7,14 +7,22 @@
 #endif
 #include <assert.h>
 #include <stdarg.h>
-#include "../vr/xros_vr.m"
+#ifndef VX_MENU_PRESENTER_SOURCE
+#define VX_MENU_PRESENTER_SOURCE "../vr/xros_vr.m"
+#endif
+#include VX_MENU_PRESENTER_SOURCE
 
 void (*vx_host_jlog)(const char *, const char *);
 int vx_xros_display_w = 16, vx_xros_display_h = 16;
-void vx_log(const char *fmt, ...) { (void)fmt; }
+static int fixture_log;
+void vx_log(const char *fmt, ...) {
+    if (fixture_log) { va_list ap;va_start(ap,fmt);vfprintf(stderr,fmt,ap);va_end(ap);fputc('\n',stderr); }
+}
 void vx_xros_pace_tick(void) {}
 void vx_input_chords_poll(void) {}
-int vx_game_mouse_look(void) { return 0; }
+static int fixture_look, fixture_menu_cursor;
+int vx_game_mouse_look(void) { return fixture_look; }
+int vxmtl_ui_menu(void) { return fixture_menu_cursor; }
 unsigned long vx_head_consumed(void) { return 0; }
 int vxmtl_game_tan(float *x, float *y) { (void)x; (void)y; return 0; }
 int vxmac_combat_input(void) { return 0; }

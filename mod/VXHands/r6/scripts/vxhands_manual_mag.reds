@@ -17,6 +17,12 @@ class VXHandsFinishReload extends Event {
     public let attempt: Int32;
 }
 
+// Ordinary IntToString on an older host returns the literal number: retain
+// tracked interaction there. The host's reserved query changes ownership only.
+public func VXHandsTrackingEnabled() -> Bool {
+    return NotEquals(IntToString(1448627506), "0");
+}
+
 // The game consumes commands on its own thread. The native side keeps each
 // request until this script acknowledges its exact weapon and serial number.
 class VXHandsPollCommands extends Event {}
@@ -180,7 +186,7 @@ public func VXHandsPublishContext() {
     if NotEquals(report, this.vxHandsLastContext) || this.vxHandsContextTick >= 5 {
         this.vxHandsLastContext = report;
         this.vxHandsContextTick = 0;
-        ResourceMetricsReportGenerator.WriteReportToFile("VXW1|V|5");
+        ResourceMetricsReportGenerator.WriteReportToFile("VXW1|V|6");
         ResourceMetricsReportGenerator.WriteReportToFile(report);
         let ui = GameInstance.GetBlackboardSystem(this.GetGame()).Get(GetAllBlackboardDefs().UI_System);
         if IsDefined(ui) { this.OnVXHandsMenuChanged(ui.GetBool(GetAllBlackboardDefs().UI_System.IsInMenu)); }
@@ -207,6 +213,35 @@ public func VXHandsStartCommands() {
     GameInstance.GetDelaySystem(this.GetGame()).DelayEvent(this, new VXHandsPollCommands(), 0.02, false);
 }
 
+@addField(PlayerPuppet)
+private let vxHandsModeKnown: Bool;
+@addField(PlayerPuppet)
+private let vxHandsModeTracking: Bool;
+@addMethod(PlayerPuppet)
+private func VXHandsUpdateControlMode() {
+    let tracking = VXHandsTrackingEnabled();
+    if this.vxHandsModeKnown && tracking != this.vxHandsModeTracking {
+        let weapon = this.VXHandsEquippedWeapon();
+        if IsDefined(weapon) {
+            // Cancel only our delayed completion. Native ammo/inventory and
+            // native controller reloads remain owned by the game.
+            weapon.vxHandsReloadSequence += 1;
+            if weapon.vxHandsMagazinePhase == 3 || weapon.vxHandsMagazinePhase == 4 {
+                weapon.StopReload(gameweaponReloadStatus.Interrupted);
+                weapon.vxHandsMagazinePhase = 1;
+            }
+            if !weapon.IsMagazineEmpty() {
+                weapon.vxHandsMagazinePhase = 0;
+                weapon.vxHandsNeedsRack = false;
+            }
+            this.VXHandsReportReload(weapon);
+        }
+    }
+    this.vxHandsModeKnown = true;
+    this.vxHandsModeTracking = tracking;
+    ResourceMetricsReportGenerator.WriteReportToFile("VXW1|D|" + (tracking ? "1" : "0"));
+}
+
 @addMethod(PlayerPuppet)
 protected cb func OnVXHandsPollCommands(event: ref<VXHandsPollCommands>) -> Bool {
     if this != GetPlayer(this.GetGame()) {
@@ -219,6 +254,7 @@ protected cb func OnVXHandsPollCommands(event: ref<VXHandsPollCommands>) -> Bool
         return true;
     }
     let parts = StrSplit(packet, "|");
+    this.VXHandsUpdateControlMode();
     this.VXHandsPublishContext();
     if ArraySize(parts) == 5 {
         if Equals(packet, this.vxHandsLastCommand) {
@@ -324,7 +360,7 @@ private func VXHandsFillPistolAfterRack(weapon: wref<WeaponObject>) -> Bool {
 
 @wrapMethod(PlayerPuppet)
 protected cb func OnAction(action: ListenerAction, consumer: ListenerActionConsumer) -> Bool {
-    if VehicleComponent.IsMountedToVehicle(this.GetGame(), this) {
+    if !VXHandsTrackingEnabled() || VehicleComponent.IsMountedToVehicle(this.GetGame(), this) {
         return wrappedMethod(action, consumer);
     }
     let command = ListenerAction.GetName(action);
@@ -352,7 +388,7 @@ protected cb func OnAction(action: ListenerAction, consumer: ListenerActionConsu
 
 @addMethod(PlayerPuppet)
 private func VXHandsExecuteMagazineCommand(weapon: wref<WeaponObject>, command: Int32) -> Bool {
-    if !IsDefined(weapon) || !weapon.IsRanged() || WeaponObject.GetMagazineCapacity(weapon) == 0u { return false; }
+    if !VXHandsTrackingEnabled() || !IsDefined(weapon) || !weapon.IsRanged() || WeaponObject.GetMagazineCapacity(weapon) == 0u { return false; }
     if command == 1 {
         this.VXHandsEjectMagazine(weapon);
     } else if command == 2 && weapon.vxHandsMagazinePhase == 1 {
@@ -386,6 +422,7 @@ private func VXHandsExecuteMagazineCommand(weapon: wref<WeaponObject>, command: 
 @addMethod(PlayerPuppet)
 protected cb func OnVXHandsFinishReload(event: ref<VXHandsFinishReload>) -> Bool {
     let weapon = event.weapon;
+    if !VXHandsTrackingEnabled() { return true; }
     if !IsDefined(weapon) || weapon.vxHandsReloadSequence != event.sequence {
         return true;
     }
@@ -470,7 +507,7 @@ protected const final func HandleWeaponEquip(scriptInterface: StateGameScriptInt
     stateMachineInstanceData: StateMachineInstanceData, item: ItemID, isLeftWeapon: Bool) {
     let player = scriptInterface.executionOwner as PlayerPuppet;
     let record = TweakDBInterface.GetWeaponItemRecord(ItemID.GetTDBID(item));
-    if !IsDefined(player) || player != GetPlayer(scriptInterface.GetGame()) || isLeftWeapon ||
+    if !VXHandsTrackingEnabled() || !IsDefined(player) || player != GetPlayer(scriptInterface.GetGame()) || isLeftWeapon ||
         !IsDefined(record) || NotEquals(record.ItemCategory().Type(), gamedataItemCategory.Weapon) ||
         WeaponObject.IsMelee(item) {
         wrappedMethod(scriptInterface, stateContext, stateMachineInstanceData, item, isLeftWeapon);
@@ -492,7 +529,7 @@ protected const final func HandleWeaponEquip(scriptInterface: StateGameScriptInt
 private func VXHandsRackPending(scriptInterface: StateGameScriptInterface) -> Bool {
     let player = scriptInterface.executionOwner as PlayerPuppet;
     let weapon = scriptInterface.owner as WeaponObject;
-    return IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) &&
+    return VXHandsTrackingEnabled() && IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) &&
         !VehicleComponent.IsMountedToVehicle(player.GetGame(), player) && IsDefined(weapon) && weapon.vxHandsNeedsRack;
 }
 
@@ -510,7 +547,7 @@ protected const final func EnterCondition(const stateContext: StateContext, cons
 protected const func ToReload(const stateContext: StateContext, const scriptInterface: StateGameScriptInterface) -> Bool {
     let player = scriptInterface.executionOwner as PlayerPuppet;
     let weapon = scriptInterface.owner as WeaponObject;
-    if IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) &&
+    if VXHandsTrackingEnabled() && IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) &&
         !VehicleComponent.IsMountedToVehicle(player.GetGame(), player) && IsDefined(weapon) &&
         weapon.IsRanged() && WeaponObject.GetMagazineCapacity(weapon) > 0u {
         if scriptInterface.IsActionJustTapped(n"Reload") {
@@ -525,7 +562,7 @@ protected const func ToReload(const stateContext: StateContext, const scriptInte
 protected const func EnterCondition(const stateContext: StateContext, const scriptInterface: StateGameScriptInterface) -> Bool {
     let player = scriptInterface.executionOwner as PlayerPuppet;
     let weapon = scriptInterface.owner as WeaponObject;
-    if IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) &&
+    if VXHandsTrackingEnabled() && IsDefined(player) && player == GetPlayer(scriptInterface.GetGame()) &&
         !VehicleComponent.IsMountedToVehicle(player.GetGame(), player) && IsDefined(weapon) &&
         weapon.IsRanged() && WeaponObject.GetMagazineCapacity(weapon) > 0u {
         if scriptInterface.IsActionJustTapped(n"Reload") {

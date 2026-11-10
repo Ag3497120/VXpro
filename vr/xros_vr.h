@@ -18,6 +18,11 @@ void vx_xros_vr_enable(int on);
 int vx_xros_vr_on(void);
 // Native driving / drive-by controls own the pad while mounted, including transitions.
 int vx_xros_vr_vehicle_active(void);
+// 1 tracked hands, 0 native controller weapons; both retain VR head look.
+int vx_xros_vr_tracking_enabled(void);
+void vx_xros_vr_set_tracking(int enabled);
+void vx_xros_vr_toggle_tracking(void);
+int vx_xros_vr_control_neutral_required(void);
 
 // ---- the game's side (src/d3d12.m) ----
 // A render pass with a depth attachment ended (cb: its command buffer): as stereo.h's vx_stereo_depth_pass.

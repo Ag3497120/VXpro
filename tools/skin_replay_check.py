@@ -82,8 +82,13 @@ def read_mesh(path):
             return np.ndarray((n, width), dtype=dtype, buffer=buffer, offset=start + at,
                               strides=(stride, np.dtype(dtype).itemsize)).copy()
         vertices = np.maximum(-1, values("PS_Position", 0, "<i2", 4)[:, :3] / 32767.) * scale + offset
-        indices = np.concatenate([values("PS_SkinIndices", i, "u1", 4) for i in (0, 1)], axis=1)
-        weights = np.concatenate([values("PS_SkinWeights", i, "u1", 4) for i in (0, 1)], axis=1) / 255.
+        groups = [0]
+        if ("PS_SkinIndices", 1) in fields or ("PS_SkinWeights", 1) in fields:
+            if not all((usage, 1) in fields for usage in ("PS_SkinIndices", "PS_SkinWeights")):
+                raise ValueError("incomplete second skin influence group")
+            groups.append(1)
+        indices = np.concatenate([values("PS_SkinIndices", i, "u1", 4) for i in groups], axis=1)
+        weights = np.concatenate([values("PS_SkinWeights", i, "u1", 4) for i in groups], axis=1) / 255.
         if indices.max() >= len(names) or np.any(weights.sum(axis=1) < .9):
             raise ValueError("invalid skin indices/weights")
         count = chunk["numIndices"]

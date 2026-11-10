@@ -1,5 +1,7 @@
 # VXpro
 
+**2026-11-10 更新：** `main` 已整合手部追踪、控制器切换、性能、视角及云存档更新。同时按住 Joy-Con 的 **+ 和 − 一秒**即可切换。最新状态和剩余问题请参阅 [English](README.md) 或 [日本語](README_ja.md)。
+
 [English](README.md) · [日本語](README_ja.md) · [简体中文](README_zh-Hans.md) · [繁體中文](README_zh-Hant.md) · [한국어](README_ko.md)
 
 在 Apple Vision Pro 上以 VR 运行 Mac App Store 版游戏（Cyberpunk 2077）：头部转向、深度重投影、神经网络引擎注视点超分辨率。免费，MIT 许可。

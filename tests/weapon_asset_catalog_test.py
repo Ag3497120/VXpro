@@ -23,7 +23,7 @@ class CatalogTests(unittest.TestCase):
                 path = Path(temporary) / f"{i}.bin"
                 path.write_bytes(bytes([i]))
                 paths.append(path)
-                records[path] = {"bones": bones, "joints": [{"at": [0, 0, 0]} for _ in bones],
+                records[path] = {"bones": bones, "joints": [{"at": [0, i*.01, 0]} for _ in bones],
                                  "draws": [{"count": 426, "fnv64": "123456789abcdef0"}]}
             output = Path(temporary) / "catalog.h"
             with patch.object(catalog, "inspect", side_effect=lambda p: records[p]), \
@@ -62,6 +62,37 @@ class CatalogTests(unittest.TestCase):
             "vertexLayout": {"elements": raw}}}]}
         with patch.object(catalog, "unpacked_buffer", return_value=b""):
             self.assertIsNone(catalog.foregrip(reader, header, 1, [0, 0, 0]))
+
+    def test_crowbar_and_rigid_melee_are_not_discarded(self):
+        for bones in (["base"], []):
+            text, _ = self.build_fixtures([(bones, ["ml_w_club_1h__crowbar__grip1_01_masksset"])])
+            row = next(line for line in text.splitlines() if "0x123456789abcdef0" in line)
+            self.assertEqual(row.split(",")[10], "64")
+
+    def test_scope_without_trigger_is_a_mounted_part(self):
+        text, _ = self.build_fixtures([(["scope"], [])])
+        row = next(line for line in text.splitlines() if "0x123456789abcdef0" in line)
+        self.assertEqual(row.split(",")[10], "32")
+
+    def test_five_nail_bones_keep_their_exact_order(self):
+        bones=["RightHandThumb2", "RightHandIndex3", "RightHandMiddle3", "RightHandRing3", "RightHandPinky3"]
+        text, _ = self.build_fixtures([(bones, [])])
+        row = next(line for line in text.splitlines() if "0x123456789abcdef0" in line)
+        self.assertEqual(row.split(",")[10], "128")
+        self.assertIn("vrik_body_1[]", text)
+
+    def test_clothing_triangle_aliases_retain_both_skin_layouts(self):
+        text, status = self.build_fixtures([
+            (["LeftForeArm", "RightForeArm"], []),
+            (["LeftArm", "LeftForeArm", "RightArm", "RightForeArm"], [])])
+        self.assertEqual(text.count("0x123456789abcdef0"), 2)
+        self.assertIn("0 ambiguous identities refused", status)
+
+    def test_setup_nails_resolve_to_the_same_anatomy(self):
+        bones=["LeftHandThumb1", "LeftHandThumb2", "LeftHandIndex2", "LeftHandIndex3"]
+        text, status = self.build_fixtures([(bones, []), ([n+"_setup" for n in bones], [])])
+        self.assertEqual(text.count("0x123456789abcdef0"), 1)
+        self.assertIn("0 ambiguous identities refused", status)
 
 
 if __name__ == "__main__":
