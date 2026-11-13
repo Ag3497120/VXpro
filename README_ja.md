@@ -1,15 +1,29 @@
 # VXpro
 
-**コントローラー／ハンドトラッキング統合版 · 2026-11-10。**
-`main`に、これまでのハンドトラッキング、FPS、視点、直接クラウドセーブの更新を統合しました。
-ゲーム中に通常のコントローラー操作とJoy-Con併用のハンドトラッキングを切り替えられます。
-両モードともVRの頭追跡を維持します。引き続き実験的なプレビュー版です。
+**Mac App Store版『Cyberpunk 2077』を、Apple Vision Pro単体でVRプレイ。** Macは初回セットアップに使います。
 
-[English](README.md) · [日本語](README_ja.md)
+[Mac用ダウンロード · GitHub Releases](https://github.com/Ag3497120/VXpro/releases) · [実機デモ](https://youtu.be/Tn9hQm-S7Ho) · [Discord](https://discord.gg/h2znwYJt3) · [English](README.md)
 
-**コミュニティ：** セットアップの質問、不具合報告、開発方針の相談は [VeRantyx / VXpro Discord](https://discord.gg/h2znwYJt3) へ。
+<p><img src="docs/media/vision-pro-hand-tracking.gif" width="640" alt="Vision Proの実機収録。手の動きに合わせてハンドガンが動く"></p>
 
-## 現在の到達点
+ゲームのネイティブARM64コードをMach-O互換レイヤー経由で実行します。Metalで深度を取得し、ARKitで追跡した手をゲーム既存のボーンへ反映します。移動とボタン入力はJoy-Conで操作します。**＋と−を同時に1秒長押し**すると、プレイ中にコントローラー操作と手の追跡を切り替えられます。
+
+## Macからインストール
+
+<p><img src="docs/media/vxpro-installer.png" width="610" alt="ゲーム、Xcode、署名チーム、Vision Proを検出したVXproのMac用インストーラー"></p>
+
+インストーラーはプレビュー段階です。公開時にはDMGを[Releases](https://github.com/Ag3497120/VXpro/releases)に掲載します。[ソースからのセットアップ手順](docs/VISION_PRO_CYBERPUNK_MAC.md)は利用できます。
+
+1. Appleシリコン搭載Macに、購入したMac App Store版のゲームと、visionOS SDKを含むXcode 26以降を用意します。Xcodeで有料のApple Developer Programチームにサインインし、必要ならApple Development証明書を作成します。
+2. XcodeでVision Proをペアリングし、デベロッパモードを有効にします。ヘッドセットには2.5.0で約85GB、全音声を含む2.3.2で約160GBの空きを確保します。
+3. VXproでチームと端末を選択し、**Install to Vision Pro**を押します。ゲームの準備、VX Mac Hostの署名、1280×720ネイティブ・モーションブラーオフの適用、転送とファイルサイズ照合を行います。
+
+既存のインストールは自動検出されます。更新には従来のバンドルIDと署名チームを使ってください。更新前にゲームを保存し、VX Mac Hostを終了してください。
+
+<details>
+<summary>手の追跡と既知の問題</summary>
+
+### 現在の到達点
 
 ARKitの手・手首の追跡を、独自のMetal描画処理でゲーム既存の腕・手・銃のボーンへ反映します。
 移動、発射、その他のボタン操作にはJoy-Conを使います。武器ごとの互換性確認を続けている実験版です。
@@ -41,6 +55,8 @@ ARKitの手・手首の追跡を、独自のMetal描画処理でゲーム既存�
   解消したとの報告がありましたが、それ以外の表示問題を修正済みとはしていません。
   銃口方向への弾道接続は引き続き実験段階です。
 
+</details>
+
 ## FPSの到達点
 
 M2での**60秒間の計測で、新しいゲーム画像が平均37.1 FPS**でした。利用者によるとPhantom Liberty内のセッションです。
@@ -61,7 +77,10 @@ M2での**60秒間の計測で、新しいゲーム画像が平均37.1 FPS**で�
 追加のアカウント・クラウド接続：[DIRECT_CLOUD.md](DIRECT_CLOUD.md)。
 実験：[画像管理](FRAME_PIPELINE.md)、[NPUオフロード](NPU_OFFLOAD_RESULT.md)、[重み編集](NPU_WEIGHT_EDIT.md)。
 
-## 画質の劣化・頭を回したときに映像が流れる場合の復旧設定
+<details>
+<summary>画質が劣化した場合の復旧設定</summary>
+
+### 画質の劣化・頭を回したときに映像が流れる場合の復旧設定
 
 画質設定を変更した後に、映像がぼける、頭を回すと強く流れる、動作が重くなる場合は、ゲーム内の
 **「ビデオ／グラフィック」設定**も確認してください。アプリを更新・以前の版へ戻しても、
@@ -104,6 +123,8 @@ M2での**60秒間の計測で、新しいゲーム画像が平均37.1 FPS**で�
 開発時の確認記録：`20261108T125547Z-graphics-settings-audit-restore/o1,o2,o3,o5`、
 `20261108T214855Z-graphics-restored-vr-camera-preflight/d1`。生ログや個人の設定ファイルは配布しません。
 
+</details>
+
 ## プレイ中の操作切り替え
 
 **＋と−を同時に1秒長押し**します。アプリの再起動やセーブの再ロードは不要です。
@@ -114,7 +135,10 @@ M2での**60秒間の計測で、新しいゲーム画像が平均37.1 FPS**で�
 押下の解除、ゲームスクリプトとの引き継ぎ、通常の描画バッファへの復帰、繰り返し切り替えをローカル検証しています。
 すべての武器・装填状態・乗車場面の組み合わせは引き続き確認が必要です。
 
-## 最新版を取得する
+<details>
+<summary>ソースからの導入と開発用オプション</summary>
+
+### 最新版を取得する
 
 ```sh
 git clone https://github.com/Ag3497120/VXpro.git
@@ -126,7 +150,7 @@ cd VXpro
 ソース更新後はXcodeプロジェクトを再生成してください。
 
 実機で確認した武器別の接続には、**所有するゲームからローカル生成した数値カタログ**を使っています。
-ゲームのメッシュ、抽出メタデータ、コンパイル済みオーバーレイ、モデルの重み、録画、ビルド済みアプリは含みません。
+ゲームのメッシュ、抽出メタデータ、コンパイル済みオーバーレイ、モデルの重み、ビルド済みゲームホストはローカルに保存します。
 `tools/weapon_asset_catalog.py` は、外部バッファまで展開済みの自分のCR2Wメッシュから
 `build/hand-session-v2/weapon_asset_catalog.h` を生成できます。展開用の外部ツールは同梱しません。
 このカタログがなくてもソースは既存の汎用処理でビルドできますが、確認済み実機と同じ武器別の接続にはなりません。
@@ -134,7 +158,7 @@ cd VXpro
 
 > 以下のPreview 0.3の説明は元のコントローラー版の記録です。最新の操作・計測範囲は上記とリリースメモを参照してください。
 
-## 基本ランタイムとセットアップ
+### 基本ランタイムとセットアップ
 
 Apple Vision Pro で Mac App Store のゲーム（Cyberpunk 2077）を VR で動かします。頭の向きで視点操作、深度による再投影、
 Neural Engine による中心窩アップスケーリング。無料、MIT ライセンス。
@@ -150,7 +174,7 @@ arm64 の Metal コードなので、ネイティブに動きます（エミュ�
 **状態：Preview 0.3**（実験的、2026-11-01）。M2 の Vision Pro で、設定を下げた状態で、メインメニュー、キャラクター作成、
 ゲーム冒頭が動いています。ゲームは約 20〜30 fps、表示は 90 Hz の再投影です。
 
-## Preview 0.3 の変更点
+### Preview 0.3 の変更点
 
 - **長時間プレイでの落ちを修正。** オーディオ HAL の経路を既定でオフにしました（`VXMAC_AUDIO_HAL=1` で元に戻せます）。
   ヘッドセットでの比較では、修正前は 51 分でアプリが 8 GB のメモリ上限近くまで増えていましたが、修正後は約 5.8 GB で
@@ -164,7 +188,7 @@ arm64 の Metal コードなので、ネイティブに動きます（エミュ�
 VXpro は [VeRantyx](https://github.com/Ag3497120/VeRantyx) の Mac App Store ルートです（Windows / Steam ルートの
 VXRuntime は VeRantyx 側にあります）。
 
-## 必要なもの
+### 必要なもの
 
 > **ゲームの版について：** Cyberpunk 2077 **2.5.0**（Mac App Store の最新の更新。App Store ではバージョン **1.0.4** と表示されますが、これは App Store 独自の番号で、中のゲームは 2.5.0 です）と **2.3.2** に対応しています（どちらもヘッドセットで確認済み）。英語音声は含まれます。ほかの言語の音声にはその音声アーカイブが必要で、2.5.0 ではまだ対応していません（2.5.0 のほかの言語の音声は Apple がホストするダウンロードです）。字幕とメニューは全言語で動きます。
 
@@ -174,7 +198,7 @@ VXRuntime は VeRantyx 側にあります）。
   Addressing のエンタイトルメントが必要で、自分のチームで署名します）
 - **自分で購入した Mac App Store 版 Cyberpunk 2077 バージョン 2.5.0 または 2.3.2**（Mac にインストール済み）
 
-## はじめかた
+### はじめかた
 
 ```sh
 tools/vxmac_cyberpunk.py doctor  --game "/Applications/Cyberpunk2077.app"
@@ -195,7 +219,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 > **VX Mac Host をヘッドセットから削除しないでください**：ゲームデータの複製（約 80 GB）とセーブが消えます。
 > **こまめにセーブしてください**：ゲームは visionOS のメモリ上限近くで動いています。
 
-## VXpro がしないこと
+### VXpro がしないこと
 
 - **ゲームのファイルも、ゲームから作ったものも配布しません。** 自分のコピーを自分の Mac で準備し、自分のチームで署名し、
   自分のヘッドセットにだけ複製します。ビルドしたアプリにはゲームのコードが入っているので共有しないでください。
@@ -204,7 +228,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - **CD PROJEKT RED とも Apple とも無関係です。** Cyberpunk 2077 は CD PROJEKT S.A. の商標です。Apple Vision Pro、
   visionOS、Mac App Store は Apple Inc. の商標です。
 
-## 既知の問題（Preview 0.3）
+### 既知の問題（Preview 0.3）
 
 - 終了は両手ピンチ（3 秒＋もう一度）か、アプリのウインドウの **Quit game** ボタンで。アプリを直接閉じるとゲームは
   一時停止し、10 秒後に終了を求めますが、バックグラウンドでは終了しきれないことがあります。セーブ中に強制終了はしないでください。
@@ -215,7 +239,7 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
 - ゲームデータの最初の複製は大きく時間がかかる（2.5.0 で約 80 GB）。
 - App Store には提出しませんが、有料の Apple Developer Program が必要です。理由は 2 つのエンタイトルメントです。**Increased Memory Limit** がないと visionOS がアプリを約 5 GB に制限し、6〜8 GB 使うゲームはロード中に止められます。**Extended Virtual Addressing** は、ゲームが最初にとても広い仮想メモリの範囲を確保するために必要です。私たちの知る限り、無料（Personal Team）のアカウントではこの 2 つに署名できません（自分たちでは未確認なので、試した方はぜひ教えてください）。無料の署名は 7 日ごとに期限も切れます。
 
-## 既知の制限
+### 既知の制限
 
 - **フレームレート**：ゲームは約 20〜30 fps。頭の動きは 90 Hz の再投影で滑らかですが、速い振り向きや動く物体では低い
   フレームレートが見えます。
@@ -232,6 +256,8 @@ tools/vxmac_cyberpunk.py copy && tools/vxmac_cyberpunk.py launch
   `VXMAC_VR_VIGNETTE`、`VXMAC_VR_ZOOM`、`VXMAC_STICK_PITCH`（ガイドの「オプション」参照）。
 - **視線追跡フォービエーション（ETFR）は現在無効です。** 表示側の試作では現在の描画経路でFPS改善が得られず、
   ゲーム描画側への適用は今後の最適化課題です。ETFRやNPUでのFPS向上を達成済みとはしていません。
+
+</details>
 
 ## 安全について
 

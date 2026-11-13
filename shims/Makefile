@@ -7,8 +7,8 @@ OUT := ../build/xros
 MOUT := ../build/macshim
 CC := xcrun --sdk xros clang
 MCC := xcrun --sdk macosx clang
-CFLAGS := -target arm64-apple-xros26.0 -isysroot $(SDK) -O2 -Wall -Wno-unused-parameter -fobjc-arc -fvisibility=default
-MCFLAGS := -target arm64-apple-macos15.0 -isysroot $(MSDK) -O2 -Wall -Wno-unused-parameter -fobjc-arc
+CFLAGS := -target arm64-apple-xros26.0 -isysroot "$(SDK)" -O2 -Wall -Wno-unused-parameter -fobjc-arc -fvisibility=default
+MCFLAGS := -target arm64-apple-macos15.0 -isysroot "$(MSDK)" -O2 -Wall -Wno-unused-parameter -fobjc-arc
 DY = -dynamiclib -install_name @rpath/$(notdir $@) -Wl,-headerpad_max_install_names
 
 FXLINK := -Wl,-reexport_framework,MetalFX
@@ -57,7 +57,7 @@ $(MOUT)/libvxmtlfx.dylib: vxmtlfx.m $(MOUT)/libvxlog.dylib
 #  libvxmtlfx re-exports nothing there and the program's by-name lookups find no MetalFX classes)
 sim:
 	$(MAKE) FXLINK= OUT=../build/xrsim SDK=$$(xcrun --sdk xrsimulator --show-sdk-path) CC="xcrun --sdk xrsimulator clang" \
-	  CFLAGS="-target arm64-apple-xros26.0-simulator -isysroot $$(xcrun --sdk xrsimulator --show-sdk-path) -O2 -Wall -Wno-unused-parameter -fobjc-arc -fvisibility=default" all
+	  CFLAGS="-target arm64-apple-xros26.0-simulator -isysroot "$$(xcrun --sdk xrsimulator --show-sdk-path)" -O2 -Wall -Wno-unused-parameter -fobjc-arc -fvisibility=default" all
 
 clean:
 	rm -rf $(OUT) $(MOUT) ../build/xrsim

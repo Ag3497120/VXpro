@@ -1,45 +1,50 @@
 # VXpro
 
-**Controller / hand-tracking integration · 2026-11-10.** `main` now includes the accumulated hand-tracking,
-performance, camera and direct cloud-save changes. Switch between standard controller weapon handling and
-Joy-Con-assisted tracked hands during play; both modes keep VR head tracking. This remains an experimental preview.
+**Play the Mac App Store edition of Cyberpunk 2077 in VR on Apple Vision Pro.**
+The game runs on the headset. A Mac is used for initial setup.
 
-[English](README.md) · [日本語](README_ja.md)
+[Download for Mac · GitHub Releases](https://github.com/Ag3497120/VXpro/releases) · [Watch the demo](https://youtu.be/Tn9hQm-S7Ho) · [Discord](https://discord.gg/h2znwYJt3) · [日本語](README_ja.md)
 
-**Community:** [Join the VeRantyx / VXpro Discord](https://discord.gg/h2znwYJt3) for setup help, bug reports and development discussions.
+<p><img src="docs/media/vision-pro-hand-tracking.gif" width="640" alt="Vision Pro gameplay capture showing a handgun following the player's tracked hand"></p>
 
-## Current hand-tracking state
+VXpro loads the game's native ARM64 code through a Mach-O compatibility layer. Metal hooks capture scene depth
+and move the game's existing hand and weapon bones from ARKit tracking. Joy-Cons handle movement and button inputs.
+Hold **+ and − together for one second** to switch between tracked hands and standard controller handling during play.
 
-ARKit hand/wrist tracking drives the existing arm, hand and weapon bones through custom Metal rendering hooks.
-Joy-Con buttons provide movement, firing and other explicit actions. This is an experimental, controller-assisted
-hand-tracking implementation, with weapon-specific compatibility still being tested.
+## Install from your Mac
 
-- **Live mode switch:** hold Joy-Con **+ and − together for one second**, then release both before switching again.
-  Single presses keep their menu behavior. Switching releases synthetic held inputs and restores native weapon
-  rendering/reload handling in controller mode. The player confirmed that the physical mode switch works.
-- **Menu presentation:** the quick menu uses one presentation plane during transitions, as do load/save screens.
-- **Tracked melee:** swinging an equipped melee weapon sends an attack. Grip placement is still incomplete on some weapons.
+<p><img src="docs/media/vxpro-installer.png" width="610" alt="VXpro Mac installer with Cyberpunk 2077, Xcode, Apple Development signing and Vision Pro detected"></p>
 
-- The weapon stays in the right hand. ZR fires. On long guns, holding ZL requests left-hand support and ADS;
-  releasing it releases both. Reload interactions take priority over support.
-- X requests magazine ejection. The script/equipment bridge supports magazine pickup/insertion, manual pistol
-  slide interaction and automatic chambering for non-pistols. A signed app may embed a matching private reload overlay;
-  the source includes the compiler helper, not the compiled game cache.
-- Hand/weapon corrections use bounded independent GPU buffers and preserve the game's source palettes.
-- The accepted head-turn fix captures camera view and projection together on the owning Metal command buffer,
-  then uses that same snapshot when submitting the image. The user reported the walking head-turn rebound
-  completely resolved in the latest headset test.
-- Ordinary VR peripheral coverage has also been restored, with the user confirming the picture no longer has
-  the reported gaps and the head-turn rebound has not returned. The November 9 vehicle follow-up is described below.
-- The November 9 follow-up rejects invalid world-camera samples, and the user reports VR-only blackouts gone.
-  Vehicle peripheral coverage and steering handling were improved; VR vertical look now uses the head only,
-  with accelerator/brake/steering input paths retained. The user reported improvement after the installed update.
-- Opt-in direct CDPR sign-in and cloud-save download/load have been confirmed on the headset. Startup account
-  restoration is included; upload roundtrip and broader save compatibility still need verification.
-- **Known issues:** rectangular image borders may remain in story/constrained camera views; all vehicle scenes are unverified.
-  Individual weapons, support spacing, sight/scope attachment and reload/slide visuals still need polish and verification.
-  Detached sleeves, some melee grips and scope lenses remain reported issues. The extra handgun fingers were reported
-  resolved in the latest test; the other visual issues are not claimed fixed. Barrel-directed shot integration remains experimental.
+The Mac installer is in preview. Public DMG downloads will appear in [Releases](https://github.com/Ag3497120/VXpro/releases).
+The [source setup](docs/VISION_PRO_CYBERPUNK_MAC.md) is available today.
+
+1. On an Apple silicon Mac, install your purchased **Mac App Store** copy of Cyberpunk 2077 and **Xcode 26 or later** with the visionOS SDK.
+   Sign into a paid Apple Developer Program team in Xcode and create an Apple Development certificate if needed.
+2. Pair Vision Pro in Xcode and enable Developer Mode. Allow about **85 GB free** on the headset for game version 2.5.0,
+   or **160 GB** for 2.3.2 with all voice packs.
+3. In **VXpro**, choose the detected team and headset, then select **Install to Vision Pro**. VXpro prepares the game
+   locally, signs VX Mac Host with your team, applies the native 1280×720 profile with motion blur off and verifies
+   the transferred game files by size. Keep the headset awake during the first transfer.
+
+The installer detects existing installations. To update one, use its bundle ID and original signing team.
+Quit VX Mac Host before updating. The download includes the installer and VXpro source. It uses your game files locally.
+
+<details>
+<summary>Tracked hands, controls and current limitations</summary>
+
+
+
+- **Live mode switch:** Release both buttons after the shortcut. Single presses keep their menu behavior.
+- **Weapons:** The right hand holds the weapon. ZR fires. On long guns, holding ZL requests left-hand support and ADS.
+  Tracked melee can register a swing. Grip placement, scope attachments and some reload interactions still vary by weapon.
+- **Manual reload:** The experimental script bridge needs a matching, locally built reload overlay for the complete workflow.
+  The public source includes [a compiler helper](tools/vxhands_compile_overlay.py).
+- **Camera:** The walking head-turn rebound and VR-only blackouts were resolved in the tested builds. Rectangular borders may
+  remain during some constrained camera scenes. Vehicle coverage varies by scene.
+- **Cloud saves:** Opt-in CDPR sign-in and cloud save download/load were confirmed on a headset.
+  Upload roundtrip and broader save compatibility still need testing. See [direct cloud setup](DIRECT_CLOUD.md).
+
+</details>
 
 ## Performance checkpoint
 
@@ -63,7 +68,9 @@ Historical FPS evidence: [2026-11-08 release notes](docs/RELEASE_2026_11_08.md).
 Optional direct account/cloud setup: [DIRECT_CLOUD.md](DIRECT_CLOUD.md).
 Experiments: [frame pipeline](FRAME_PIPELINE.md), [NPU offload](NPU_OFFLOAD_RESULT.md), [weight editing](NPU_WEIGHT_EDIT.md).
 
-## Graphics recovery: blurred picture or smeared head turns
+<details>
+<summary>Graphics recovery for blur or smeared head turns</summary>
+
 
 Check the game's **Video / Graphics settings** if the picture becomes blurred, head turns leave a strong smear,
 or performance changes after adjusting graphics options. Replacing or rolling back the app does not necessarily
@@ -106,6 +113,8 @@ in the [November 9 checkpoint](docs/RELEASE_2026_11_09.md). Vehicle/story border
 Development evidence: `20261108T125547Z-graphics-settings-audit-restore/o1,o2,o3,o5` and
 `20261108T214855Z-graphics-restored-vr-camera-preflight/d1`; raw logs and personal settings are not distributed.
 
+</details>
+
 ## Switching controls during play
 
 Hold **+ and − together for one second**. No app restart or save reload is required. Release both buttons to
@@ -116,7 +125,10 @@ One mode owns gameplay input at a time. Switching preserves the equipped weapon 
 grant ammunition or reload a save. Local tests cover held-input release, script acknowledgement, native binding
 restoration and repeated switches. Broader weapon/reload/vehicle combinations still need testing.
 
-## Get the current version
+<details>
+<summary>Source installation and developer options</summary>
+
+### Get the current version
 
 ```sh
 git clone https://github.com/Ag3497120/VXpro.git
@@ -128,13 +140,13 @@ see the tracked-hand weapon section of the [design notes](docs/DESIGN.md) for th
 and matching manual-reload overlay. Regenerate the Xcode project after updating sources.
 
 Weapon-specific bindings on the tested installation use a **locally generated numeric catalog**.
-Game meshes, extracted metadata, compiled overlays, model weights, recordings and built apps are not included.
+Game meshes, extracted metadata, compiled overlays, model weights and built game hosts are kept local.
 `tools/weapon_asset_catalog.py` can generate `build/hand-session-v2/weapon_asset_catalog.h` from your own
 fully unpacked CR2W mesh resources; the external-buffer extraction utility is not bundled.
 Without that private catalog the source builds with the existing generic fallback, which does not reproduce
 all of the tested installation's weapon-specific contacts. Run `sh tools/check_hand_session.sh` for local checks.
 
-## Base runtime and setup
+### Base runtime and setup
 
 The Preview 0.3 notes below describe the original controller preview. The integrated controls and measured
 performance above are newer; historical rates and controls below are not a guarantee for this branch.
@@ -153,7 +165,7 @@ game's depth; menus, cutscenes and loading screens are on a panel fixed in your 
 **Status: Preview 0.3** (experimental, 2026-11-01). Main menu, character creation and the opening of the game run on an M2
 Vision Pro at reduced settings, about 20-30 fps from the game with 90 Hz reprojection.
 
-## What's new in Preview 0.3
+### What's new in Preview 0.3
 
 - **Long-session crash fixed.** The audio HAL path is now off by default (`VXMAC_AUDIO_HAL=1` restores it). In an A/B on
   the headset the app was near the 8 GB memory limit after 51 minutes before the fix; after it, memory stayed flat at
@@ -168,9 +180,9 @@ Vision Pro at reduced settings, about 20-30 fps from the game with 90 Hz reproje
 VXpro is the Mac App Store route of [VeRantyx](https://github.com/Ag3497120/VeRantyx), where the Windows/Steam route
 (VXRuntime) lives.
 
-## You need
+### You need
 
-> **Game versions:** Cyberpunk 2077 **2.5.0** (the latest Mac App Store update; the App Store lists it as version **1.0.4**, which is its own numbering — the game inside is 2.5.0) and **2.3.2**, both tested on the headset. English voice is included; other voice languages need their voice archives, which are not supported yet for 2.5.0 (its other voices are Apple-hosted downloads). Subtitles and menus work in every language.
+> **Game versions:** Cyberpunk 2077 **2.5.0** (the tested Mac App Store build; the App Store lists it as version **1.0.4**, which is its own numbering — the game inside is 2.5.0) and **2.3.2**, both tested on the headset. English voice is included; other voice languages need their voice archives, which are not supported yet for 2.5.0 (its other voices are Apple-hosted downloads). Subtitles and menus work in every language.
 
 - an **Apple Vision Pro** in Developer Mode, paired with your Mac, with **about 85 GB free** for 2.5.0 (its data is about 80 GB; 2.3.2 with all voice languages needs about 160 GB);
 - a **Mac with Apple silicon**, **Xcode 26** with the visionOS SDK, `xcodegen`, Python 3;
@@ -178,7 +190,7 @@ VXpro is the Mac App Store route of [VeRantyx](https://github.com/Ag3497120/VeRa
   Addressing entitlements; you sign it with your own team);
 - your **own, purchased copy of Cyberpunk 2077 from the Mac App Store, version 2.5.0 or 2.3.2**, installed on the Mac.
 
-## Get started
+### Get started
 
 ```sh
 tools/vxmac_cyberpunk.py doctor  --game "/Applications/Cyberpunk2077.app"
@@ -199,7 +211,7 @@ its own path (as Cmd+Q on a Mac) and the app closes. See "Controls in the headse
 > **Never delete VX Mac Host from the headset**: that deletes the copy of the game's data (about 80 GB) and your saves.
 > **Save often**: the game runs close to visionOS's memory limit.
 
-## What VXpro does not do
+### What VXpro does not do
 
 - It does **not distribute any game file** or anything made from one. Your copy is prepared on your Mac, signed with
   your team and copied to your headset only. Do not share the built app: it contains the game's code.
@@ -208,7 +220,7 @@ its own path (as Cmd+Q on a Mac) and the app closes. See "Controls in the headse
 - It is **not affiliated with CD PROJEKT RED or Apple**. Cyberpunk 2077 is a trademark of CD PROJEKT S.A.;
   Apple Vision Pro, visionOS and Mac App Store are trademarks of Apple Inc.
 
-## Known issues (Preview 0.3)
+### Known issues (Preview 0.3)
 
 - Quit with the both-hands pinch (3 s + again) or the app window's **Quit game** button. Closing the app instead pauses
   the game and asks it to quit after 10 s, which may not complete in the background; do not force-quit it while it saves.
@@ -218,7 +230,7 @@ its own path (as Cmd+Q on a Mac) and the app closes. See "Controls in the headse
 - The first copy of the game's data is large and slow (about 80 GB for 2.5.0).
 - A paid Apple Developer Program membership is required, even though nothing goes to the App Store. The reason is two entitlements: without **Increased Memory Limit**, visionOS caps the app at about 5 GB and the game (6-8 GB) is shut down while loading; **Extended Virtual Addressing** is needed because the game reserves a very large virtual address range up front. As far as we know, free (Personal Team) accounts can't sign these two (not tested ourselves; reports welcome). Free signing also expires every 7 days.
 
-## Known limitations
+### Known limitations
 
 - **Frame rate**: about 20-30 fps from the game. Head motion stays smooth (90 Hz reprojection), but fast turns and
   moving objects show the low rate.
@@ -235,6 +247,8 @@ its own path (as Cmd+Q on a Mac) and the app closes. See "Controls in the headse
   `VXMAC_VR_ZOOM`, `VXMAC_STICK_PITCH` (see the guide's "Options").
 - **Eye-tracked foveated rendering is not enabled.** The display-side experiment did not improve FPS with the current
   pipeline. Game-side foveation remains future optimization work; no ETFR or NPU performance gain is claimed.
+
+</details>
 
 ## Safety
 

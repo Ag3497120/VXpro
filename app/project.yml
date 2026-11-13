@@ -44,8 +44,9 @@ targets:
         SWIFT_VERSION: "5.0"
         SWIFT_OBJC_BRIDGING_HEADER: Sources/VXMacHost-Bridging-Header.h
         HEADER_SEARCH_PATHS: "$(SRCROOT)/../vr $(SRCROOT)/../shims"
-        OTHER_LDFLAGS: "-L$(SRCROOT)/../build/xros -lvxkit -lvxmtl -lvxmtlfx"
-        "OTHER_LDFLAGS[sdk=xrsimulator*]": "-L$(SRCROOT)/../build/xrsim -lvxkit -lvxmtl -lvxmtlfx"
+        LIBRARY_SEARCH_PATHS: '$(inherited) "$(SRCROOT)/../build/xros"'
+        "LIBRARY_SEARCH_PATHS[sdk=xrsimulator*]": '$(inherited) "$(SRCROOT)/../build/xrsim"'
+        OTHER_LDFLAGS: "$(inherited) -lvxkit -lvxmtl -lvxmtlfx"
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
         ENABLE_BITCODE: NO
         DEAD_CODE_STRIPPING: NO

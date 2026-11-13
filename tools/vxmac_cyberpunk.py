@@ -203,8 +203,9 @@ def cmd_prepare(a):
 
 
 # ---- build -----------------------------------------------------------------------------------------------------------
-def app_path():
-    return os.path.join(VXMAC, 'build', 'dd', 'Build', 'Products', 'Debug-xros', 'VXMacHost.app')
+def app_path(derived_data=None):
+    return os.path.join(VXMAC, 'app', derived_data or '../build/dd',
+                        'Build', 'Products', 'Debug-xros', 'VXMacHost.app')
 
 
 FSR_DIR = os.path.join(VXMAC, 'build', 'fsr')
@@ -233,16 +234,22 @@ def cmd_build(a):
     if a.unsigned: run([os.path.join(TOOLS, 'prepare_test.sh')])
     fsr_model()
     appdir = os.path.join(VXMAC, 'app')
-    run(['xcodegen'], cwd=appdir)
+    if a.generated_project:
+        if not os.path.isfile(os.path.join(appdir, 'VXMacHost.xcodeproj', 'project.pbxproj')):
+            sys.exit('the bundled Xcode project is missing')
+    else:
+        run(['xcodegen'], cwd=appdir)
     env = dict(os.environ, VXMAC_IMAGES=images)
     sign = (['CODE_SIGNING_ALLOWED=NO'] if a.unsigned else
             ['-allowProvisioningUpdates', 'DEVELOPMENT_TEAM=' + c['team']])
-    run(['xcodebuild', '-project', 'VXMacHost.xcodeproj', '-scheme', 'VXMacHost', '-destination', 'generic/platform=visionOS',
+    if a.destination and not a.unsigned:
+        sign.append('-allowProvisioningDeviceRegistration')
+    run(['xcodebuild', '-project', 'VXMacHost.xcodeproj', '-scheme', 'VXMacHost', '-destination', a.destination or 'generic/platform=visionOS',
          '-derivedDataPath', a.derived_data or '../build/dd', 'build', *sign,
          'PRODUCT_BUNDLE_IDENTIFIER=' + c['bundle_id'], 'VXMAC_IMAGES=' + images], cwd=appdir, env=env)
     if a.unsigned:
         say('built (unsigned check build, test program embedded)'); return
-    app = app_path()
+    app = app_path(a.derived_data)
     for _, d, _ in IMAGES:
         if not os.path.exists(os.path.join(app, 'Frameworks', d)): sys.exit('not embedded: Frameworks/%s' % d)
     r = subprocess.run(['codesign', '-d', '--entitlements', '-', '--xml', app], capture_output=True, text=True)
@@ -262,7 +269,7 @@ def cmd_install(a):
     app = app_path()
     if not a.dry_run and not os.path.exists(app): sys.exit('no app: run build')
     # (plain install: an update keeps the app's container, the game data and the saves)
-    devicectl(['device', 'install', 'app', '--device', dev, app], dry=a.dry_run)
+    devicectl(['device', 'install', 'app', '--device', dev, '--timeout', '600', app], dry=a.dry_run)
 
 
 # ---- copy ------------------------------------------------------------------------------------------------------------
@@ -271,13 +278,15 @@ def dst_of(rel):
     return DST_DATA + '/' + rel
 
 
-def device_files(c, dry):
+def device_files(c, dry, strict=False):
     if dry: return {}
     with tempfile.NamedTemporaryFile(suffix='.json') as t:
         r = subprocess.run(['xcrun', 'devicectl', 'device', 'info', 'files', '--device', c['device'], '--domain-type',
                             'appDataContainer', '--domain-identifier', c['bundle_id'], '--subdirectory', DST_DATA,
-                            '--json-output', t.name], capture_output=True, text=True)
-        if r.returncode: return {}
+                            '--timeout', '60', '--json-output', t.name], capture_output=True, text=True)
+        if r.returncode:
+            if strict: sys.exit('Could not read transferred files. Unlock Vision Pro and retry.')
+            return {}
         d = json.load(open(t.name))
     return {f['relativePath']: f['metadata']['size'] for f in d.get('result', {}).get('files', [])
             if not f['resources']['isDirectory']}
@@ -287,16 +296,34 @@ def cmd_copy(a):
     c = load_config(); dev = need_device(c)
     src = os.path.join(c['game'], 'Contents/Data')
     logd = os.path.join(WORK, 'copy'); os.makedirs(logd, exist_ok=True)
-    done_f = os.path.join(logd, 'done.txt')
+    done_f = a.checkpoint or os.path.join(logd, 'done.txt')
+    if a.checkpoint:
+        os.makedirs(os.path.dirname(done_f), exist_ok=True)
     done = set(open(done_f).read().split('\n')) if os.path.exists(done_f) else set()
     archives = []
     for root, ds, fs in os.walk(os.path.join(src, 'archive')):
         for name in fs:
             p = os.path.join(root, name); archives.append((os.path.getsize(p), os.path.relpath(p, src)))
     items = ['engine', 'r6'] + [r for _, r in sorted(archives)]
+    if a.strict and done:
+        # A cached checkpoint may outlive the device container or an interrupted file replacement.
+        remote = device_files(c, a.dry_run)
+        completed = set()
+        prefix = len(DST_DATA) + 1
+        for item in done & set(items):
+            path = os.path.join(src, item)
+            if os.path.isfile(path):
+                sources = [path]
+            else:
+                sources = [os.path.join(root, name) for root, _, names in os.walk(path) for name in names]
+            if sources and all(remote.get(dst_of(os.path.relpath(p, src))[prefix:]) == os.path.getsize(p)
+                               for p in sources):
+                completed.add(item)
+        done = completed
     say('%d items to copy (engine, r6, then each archive smallest first); done before: %d' % (len(items), len(done & set(items))))
-    for it in items:
+    for index, it in enumerate(items, 1):
         if it in done: continue
+        say('  copying %d/%d: %s' % (index, len(items), it))
         for attempt in range(1, a.tries + 1):
             r = devicectl(['device', 'copy', 'to', '--device', dev, '--domain-type', 'appDataContainer',
                            '--domain-identifier', c['bundle_id'], '--source', os.path.join(src, it),
@@ -305,14 +332,16 @@ def cmd_copy(a):
                 if not a.dry_run:
                     with open(done_f, 'a') as f: f.write(it + '\n')
                 break
-            say('  failed (try %d of %d): %s; waiting 60 s' % (attempt, a.tries, it)); time.sleep(60)
+            if attempt < a.tries:
+                say('  failed (try %d of %d): %s; waiting to retry' % (attempt, a.tries, it))
+                time.sleep(10 if a.strict else 60)
         else:
             sys.exit('stopped at %s: run copy again to resume (keep the headset awake, do not install meanwhile)' % it)
-    verify(c, src, a.dry_run)
+    verify(c, src, a.dry_run, done_f, a.strict)
 
 
-def verify(c, src, dry):
-    dev = device_files(c, dry)
+def verify(c, src, dry, done_f, strict=False):
+    dev = device_files(c, dry, strict)
     if dry: say('(dry run: no check)'); return
     n = b = bad = 0
     for root, ds, fs in os.walk(src):
@@ -325,8 +354,9 @@ def verify(c, src, dry):
     say('check: source %d files %.1f GB; headset %d files %.1f GB; mismatches %d -> %s'
         % (n, b / 1e9, len(dev), sum(dev.values()) / 1e9, bad, 'OK' if not bad else 'INCOMPLETE: run copy again'))
     if bad:
-        # (a mismatched item is copied again by the next copy)
-        done_f = os.path.join(WORK, 'copy', 'done.txt')
+        if strict:
+            sys.exit('Game data verification failed. Retry the installation to recopy the mismatches.')
+        # The CLI's older checkpoint has no per-file validation before transfer.
         if os.path.exists(done_f): os.replace(done_f, done_f + '.%d' % int(time.time()))
 
 
@@ -415,9 +445,13 @@ def main():
     p.add_argument('--bundle-id'); p.add_argument('--device')
     p = sp.add_parser('build'); p.add_argument('--unsigned', action='store_true', help='check build: no team, no game')
     p.add_argument('--derived-data')
+    p.add_argument('--generated-project', action='store_true')
+    p.add_argument('--destination')
     for name in ('install', 'copy', 'settings', 'fov', 'launch', 'pull'):
         p = sp.add_parser(name); p.add_argument('--dry-run', action='store_true')
-        if name == 'copy': p.add_argument('--tries', type=int, default=8)
+        if name == 'copy':
+            p.add_argument('--tries', type=int, default=8)
+            p.set_defaults(checkpoint=None, strict=False)
         if name == 'settings': p.add_argument('--profile', default='p720native'); p.add_argument('--set', action='append', default=[])
         if name == 'launch':
             p.add_argument('--restart', action='store_true', help='end a running instance first (unsaved progress is lost)')
