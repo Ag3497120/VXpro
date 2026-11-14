@@ -43,6 +43,10 @@
 #pragma once
 #include <stdint.h>
 
+// The standard warp's coarsest source colour sample. The model's fill can
+// sample beyond this level, depending on its output size.
+#define VXW_MAX_PLAIN_COLOR_MIP 4
+
 #ifdef __cplusplus
 extern "C" {
 #endif

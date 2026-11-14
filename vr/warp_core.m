@@ -6,6 +6,9 @@
 #include <string.h>
 #include "warp_core.h"
 
+#define VXW_STRING_IMPL(value) #value
+#define VXW_STRING(value) VXW_STRING_IMPL(value)
+
 int vxw_stereo_eye_offsets(const float left[16], const float right[16], float out[2][3]) {
     if (!left || !right || !out) return 0;
     const float *views[2] = {left, right};
@@ -315,7 +318,7 @@ static const char *g_vxw_msl =
     "    { float2 o = max(-su, su - 1); float dd = max(o.x, o.y);\n"
     "      if (dd > 0) { float r = 0.004f + min(dd * 0.6f, 0.12f);\n"
     "        constexpr sampler sm(filter::linear, mip_filter::linear, address::clamp_to_edge);\n"
-    "        float lod = min(log2(max(1.0f, r * float(max(p.w, p.h)))), 4.0f);\n"   // (h57e: at most level 4 - coarser ones smeared a coloured band (a rainbow at the frame's side))   // (h44: the mip level as wide as the blur; levels clamp)
+    "        float lod = min(log2(max(1.0f, r * float(max(p.w, p.h)))), " VXW_STRING(VXW_MAX_PLAIN_COLOR_MIP) ".0f);\n"
     "        c = b.sample(sm, saturate(su), level(lod)).rgb; } }\n"
     // (h30: the HUD rectangles drawn again as panels: their originals darkened to 25 % with a soft edge)
     "    for (uint k = 0; k < p.hn; k++) {\n"

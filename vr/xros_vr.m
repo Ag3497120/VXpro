@@ -1522,11 +1522,21 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     }
     vr_slot *S = &g_slot[s];
     id<MTLTexture> was = S->color;
-    {   // (VX Mac, h44: the slot's colour with a mip chain - outside the frame the warp reads its edge blurred by one
-        //  sample from a coarser level (24 samples a pixel cost 9 ms of the GPU in h44's first run))
+    {   // Preserve the same blurred periphery on every frame.
         id<MTLTexture> t = S->color;
-        if (!t || t.pixelFormat != back.pixelFormat || t.width != w || t.height != h || t.mipmapLevelCount < 2) {
-            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:back.pixelFormat width:w height:h mipmapped:YES];
+        // Edge fill and viewmodel repair sample only the first few levels.
+        // Model interpolation can sample a coarser level matching its fill.
+        static int limit_mips;
+        static dispatch_once_t mip_policy_once;
+        dispatch_once(&mip_policy_once, ^{
+            const char *e = getenv("VXMAC_COLOR_MIPS");
+            limit_mips = e && !strcmp(e, "used") && interp_mode() != 1;
+        });
+        NSUInteger levels = 32 - __builtin_clz(MAX(MAX(w, h), 1u));
+        if (limit_mips) levels = MIN(levels, VXW_MAX_PLAIN_COLOR_MIP + 1);
+        if (!t || t.pixelFormat != back.pixelFormat || t.width != w || t.height != h || t.mipmapLevelCount != levels) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:back.pixelFormat width:w height:h mipmapped:NO];
+            td.mipmapLevelCount = levels;
             td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView; td.storageMode = MTLStorageModePrivate;
             S->color = [dev newTextureWithDescriptor:td];
         }
@@ -1559,7 +1569,7 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     }
     [b copyFromTexture:back sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
              toTexture:S->color destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [b generateMipmapsForTexture:S->color];   // (h44: the blurred edge outside the frame, one sample)
+    if (S->color.mipmapLevelCount > 1) [b generateMipmapsForTexture:S->color];
     S->w = w; S->h = h;
     S->has_depth = S->has_mv = S->has_proj = 0;
     S->has_hud = 0;
