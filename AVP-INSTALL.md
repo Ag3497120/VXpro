@@ -8,7 +8,7 @@ The full guide is [docs/VISION_PRO_CYBERPUNK_MAC.md](docs/VISION_PRO_CYBERPUNK_M
 
 - An Apple-silicon Mac with Xcode 26 or later and the visionOS SDK, `xcodegen` (`brew install xcodegen`) and Python 3
 - Apple Vision Pro in Developer Mode, paired with Xcode, with about 85 GB free (game 2.5.0) or 160 GB (2.3.2 with all voice packs)
-- An Apple Developer Program team signed in to Xcode. The tested setup is a paid team (Increased Memory Limit and Extended Virtual Addressing); a free Personal Team hasn't been verified
+- A paid Apple Developer Program membership, signed in to Xcode. The app needs the Increased Memory Limit and Extended Virtual Addressing entitlements, which a free personal team cannot add
 - Your own Mac App Store copy of Cyberpunk 2077, installed on the Mac (builds 2.5.0 and 2.3.2 tested; Steam and GOG copies are untested)
 - A Joy-Con pair for the tracked-hand controls, or a game controller
 
